@@ -1,0 +1,159 @@
+(ns pretrained.anchors-test
+  "Model-gated integration anchors — each skips cleanly when its weights are not
+  on disk (set PRETRAINED_MODELS or use ~/Development/models). These reproduce
+  the port validations: Moonshine jfk transcript (character-exact vs HF torch),
+  Qwen3-ASR jfk transcript, Qwen3-Embedding retrieval structure.
+
+  Heavy: run individually, not in default CI. Each loads a full model."
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]))
+
+(defn- gpu-up? []
+  (try ((requiring-resolve 'raster.gpu.ze-runtime/init!)) true (catch Throwable _ false)))
+
+(def ^:private models-dir
+  (or (System/getenv "PRETRAINED_MODELS")
+      (str (System/getProperty "user.home") "/Development/models")))
+
+(defn- mdir [name*] (str models-dir "/" name*))
+(defn- have? [name*] (.exists (java.io.File. (mdir name*))))
+(def ^:private jfk (mdir "audio-samples/jfk.wav"))
+(def ^:private jfk-text
+  "And so my fellow Americans, ask not what your country can do for you, ask what you can do for your country.")
+
+(deftest ^:anchors moonshine-jfk-anchor
+  (if-not (and (have? "moonshine-streaming-medium") (.exists (java.io.File. jfk)))
+    (println "SKIP moonshine anchor (weights not present)")
+    (let [ms (requiring-resolve 'pretrained.asr.moonshine/load-model)
+          tr (requiring-resolve 'pretrained.asr.moonshine/transcribe)
+          m (ms (mdir "moonshine-streaming-medium"))]
+      (testing "character-exact vs HF torch reference"
+        (is (= jfk-text (tr m jfk))))
+      (testing "streaming final == batch"
+        (let [si (requiring-resolve 'pretrained.asr.moonshine/stream-init)
+              sp (requiring-resolve 'pretrained.asr.moonshine/stream-push!)
+              audio ((requiring-resolve 'pretrained.audio/load-wav) jfk)
+              chunks (mapv (fn [i] (java.util.Arrays/copyOfRange
+                                    ^floats (:samples audio) (* i 16000)
+                                    (min (alength ^floats (:samples audio)) (* (inc i) 16000))))
+                           (range 11))
+              fin (loop [st (si m) [c & r] chunks]
+                    (if c (recur (sp st c) r) (sp st (float-array 0) :final? true)))]
+          (is (= jfk-text (:text fin))))))))
+
+(deftest ^:anchors ^:gpu qwen3-asr-gpu-jfk-anchor
+  ;; GPU-resident transcription (Arc/Level-Zero). Gated on weights + a ze device.
+  ;; Q4K (GPU) vs Q8 (CPU) quant tiers may differ in punctuation; assert the
+  ;; word content, not the exact string.
+  (if-not (and (have? "Qwen3-ASR-0.6B") (.exists (java.io.File. jfk))
+               (try ((requiring-resolve 'raster.gpu.ze-runtime/init!)) true
+                    (catch Throwable _ false)))
+    (println "SKIP qwen3-asr GPU anchor (weights or GPU not present)")
+    (let [lm (requiring-resolve 'pretrained.asr.qwen3-asr/load-model)
+          tr (requiring-resolve 'pretrained.asr.qwen3-asr/transcribe-gpu)
+          m (lm (mdir "Qwen3-ASR-0.6B") {:gpu? true})
+          words #(-> ^String % (.toLowerCase) (clojure.string/replace #"[^a-z' ]" "") (clojure.string/split #"\s+"))]
+      (is (= (words jfk-text) (words (tr m jfk)))))))
+
+(deftest ^:anchors qwen3-asr-jfk-anchor
+  (if-not (and (have? "Qwen3-ASR-0.6B") (.exists (java.io.File. jfk)))
+    (println "SKIP qwen3-asr anchor (weights not present)")
+    (let [lm (requiring-resolve 'pretrained.asr.qwen3-asr/load-model)
+          tr (requiring-resolve 'pretrained.asr.qwen3-asr/transcribe)
+          m (lm (mdir "Qwen3-ASR-0.6B"))
+          txt (tr m jfk {})]
+      ;; gold: "And so, my fellow Americans, ask not what your country can do for
+      ;; you; ask what you can do for your country." (punctuation style differs
+      ;; from moonshine's — match content words)
+      (is (.contains ^String txt "fellow Americans"))
+      (is (.contains ^String txt "ask not what your country can do for you")))))
+
+(deftest ^:anchors qwen3-embedding-anchor
+  (if-not (have? "Qwen3-Embedding-0.6B")
+    (println "SKIP qwen3-embedding anchor (weights not present)")
+    (let [le (requiring-resolve 'pretrained.embed/load-embedder)
+          et (requiring-resolve 'pretrained.embed/embed-texts)
+          rows (requiring-resolve 'pretrained.embed/rows)
+          m (le :qwen3-embedding-0.6b (mdir "Qwen3-Embedding-0.6B"))
+          E (et m ["The capital of France is Paris."
+                   "Paris is the capital and largest city of France."
+                   "Gravitational waves are ripples in spacetime."])
+          [a b c] (rows E)
+          cos (fn [x y] (reduce + (map * x y)))]
+      (testing "retrieval structure (validated cos 0.999 vs torch f32 gold)"
+        (is (> (cos a b) 0.75) "related pair high")
+        (is (< (cos a c) 0.45) "unrelated pair low")
+        (is (> (- (cos a b) (cos a c)) 0.3) "clear margin")))))
+
+(deftest ^:anchors bert-encoder-anchor
+  ;; Self-contained BERT sentence-encoder: :engine :encoder -> pretrained.arch.bert
+  ;; (BERT block + mean-pool + L2 over raster.dl, WordPiece; no external dependency).
+  ;; CPU-only path (no device graph). Locate bge-small via the local models-dir or the
+  ;; HF hub cache (~/.cache/raster/models); skip cleanly when absent.
+  (let [hub-bge (str (System/getProperty "user.home")
+                     "/.cache/raster/models/BAAI--bge-small-en-v1.5")
+        le   (requiring-resolve 'pretrained.embed/load-embedder)
+        et   (requiring-resolve 'pretrained.embed/embed-texts)
+        rows (requiring-resolve 'pretrained.embed/rows)
+        m (cond
+            (have? "bge-small-en-v1.5")        (le :bge-small-en-v1.5 (mdir "bge-small-en-v1.5"))
+            (.exists (java.io.File. hub-bge))  (le :bge-small-en-v1.5)
+            :else nil)]
+    (if-not m
+      (println "SKIP bert-encoder anchor (bge-small weights not present)")
+      (let [[a b c] (rows (et m ["The capital of France is Paris."
+                                 "Paris is the capital and largest city of France."
+                                 "Gravitational waves are ripples in spacetime."]))
+            cos (fn [x y] (reduce + (map * x y)))]
+        (testing "self-contained BERT encoder retrieval structure (bge-small, mean-pool + L2)"
+          (is (= 384 (count a)) "384-d embeddings")
+          (is (every? #(Float/isFinite %) (seq a)) "finite, non-degenerate")
+          ;; measured: related 0.951, unrelated 0.397, margin 0.554 (thresholds have headroom)
+          (is (> (cos a b) 0.85) "related pair high")
+          (is (< (cos a c) 0.55) "unrelated pair low")
+          (is (> (- (cos a b) (cos a c)) 0.3) "clear margin"))))))
+
+(deftest ^:anchors ^:gpu gemma-gpu-decode-anchor
+  ;; Regression guard for the resident-decode empty-graph miscompile: bind-decode!
+  ;; once bound an EMPTY command graph (rms-style :fn -> nil program) -> all-zero
+  ;; logits -> argmax-tie garbage tokens near vocab-max. A non-empty program +
+  ;; correct greedy token would have caught it. Gated on weights + a ze device.
+  (if-not (and (have? "gemma-3-270m-it") (.exists (java.io.File. (mdir "gemma-3-270m-it")))
+               (gpu-up?))
+    (println "SKIP gemma GPU decode anchor (weights or GPU not present)")
+    (let [from (requiring-resolve 'pretrained.loader/from-pretrained)
+          bind (requiring-resolve 'pretrained.decoder-gpu/bind-decode!)
+          genr (requiring-resolve 'pretrained.decoder-gpu/generate-resident)
+          g    (from (mdir "gemma-3-270m-it"))
+          {:keys [tok encode decode]} (:tokenizer g)
+          pids (vec (encode tok "The capital of France is"))
+          out  (genr (bind g :maxpos 64) pids 4)]
+      (is (.contains ^String (decode tok out) "Paris")
+          "greedy GPU decode answers Paris (non-degenerate, non-zero logits)"))))
+
+(deftest ^:anchors ^:gpu gpu-embedder-anchor
+  ;; GPU prefill embedders (bind-embed!/embed-gpu — a DIFFERENT path than decode).
+  ;; Same retrieval structure the torch-validated CPU anchor asserts.
+  (let [le   (requiring-resolve 'pretrained.embed/load-embedder)
+        et   (requiring-resolve 'pretrained.embed/embed-texts)
+        rows (requiring-resolve 'pretrained.embed/rows)
+        cos  (fn [x y] (reduce + (map * x y)))
+        struct (fn [m]
+                 (let [[a b c] (rows (et m ["The capital of France is Paris."
+                                            "Paris is the capital and largest city of France."
+                                            "Gravitational waves are ripples in spacetime."]))]
+                   (is (every? #(Float/isFinite %) (seq a)) "finite, non-degenerate")
+                   (is (> (cos a b) 0.75) "related high")
+                   (is (< (cos a c) 0.45) "unrelated low")
+                   (is (> (- (cos a b) (cos a c)) 0.3) "clear margin")))]
+    (if-not (gpu-up?)
+      (println "SKIP gpu-embedder anchor (GPU not present)")
+      (do
+        (if (have? "Qwen3-Embedding-0.6B")
+          (testing "qwen3-embedding-0.6b GPU (last-token pool)"
+            (struct (le :qwen3-embedding-0.6b-gpu (mdir "Qwen3-Embedding-0.6B"))))
+          (println "SKIP qwen3-embedding-0.6b-gpu (weights absent)"))
+        (if (have? "embeddinggemma-300m")
+          (testing "embeddinggemma-300m GPU (mean pool + Dense)"
+            (struct (le :embeddinggemma-300m (mdir "embeddinggemma-300m"))))
+          (println "SKIP embeddinggemma-300m (weights absent)"))))))

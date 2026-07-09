@@ -1,0 +1,46 @@
+{:paths ["src"]
+ ;; pretrained-rstr: load & run pretrained HuggingFace decoder-LMs on raster.
+ ;; Depends on raster (the typed-dispatch tensor compiler + the dl block library:
+ ;; raster.dl.{nn,attention} + raster.quant.*). ALL model-loading (safetensors,
+ ;; tokenizers, HF descriptors/engine) lives HERE; the
+ ;; compilable blocks + quant kernels stay in raster.
+ ;;
+ ;; raster is released on Clojars (Maven-resolvable; its POM declares TypedClojure).
+ ;; 0.2.258 already ships the GPU decode stack (raster.gpu.*, quant.kernels-k,
+ ;; compiler.pipeline, dl.{nn,attention}) that the GPU paths call.
+ ;; The :dev alias overrides raster with the sibling checkout for local work.
+ :deps {org.replikativ/raster {:mvn/version "0.2.258"}
+        org.clojure/data.json {:mvn/version "2.5.0"}}
+
+ :aliases
+ {:dev {:extra-paths ["dev" "test"]
+        :extra-deps {org.replikativ/raster {:local/root "../raster"}
+                     ;; embedding e2e consumers (grid S4 smoke): vector index + umap
+                     io.replikativ/proximum {:local/root "../proximum"}
+                     io.github.replikativ/umap-rstr {:local/root "../umap-rstr"}
+                     criterium/criterium {:mvn/version "0.4.6"}}}
+
+  :valhalla {:jvm-opts ["-XX:ReservedCodeCacheSize=512m" "-Xmx8g" "--enable-preview"
+                        "--add-exports" "java.base/jdk.internal.vm.annotation=ALL-UNNAMED"
+                        "--add-exports" "java.base/jdk.internal.classfile.components=ALL-UNNAMED"
+                        "--add-exports" "java.base/jdk.internal.classfile.impl=ALL-UNNAMED"
+                        "--enable-native-access=ALL-UNNAMED"
+                        "--add-modules" "jdk.incubator.vector"]}
+
+  ;; Model-free unit tests. Model-gated tests are ^:anchors-tagged and excluded here
+  ;; (they need multi-GB weights and/or a GPU); CI runs exactly `clojure -M:test`.
+  :test {:extra-paths ["test"]
+         :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+         :jvm-opts ["--enable-native-access=ALL-UNNAMED"
+                    "--add-modules=jdk.incubator.vector"
+                    "-Xss8m"
+                    "-XX:ReservedCodeCacheSize=512m"]
+         :main-opts ["-m" "cognitect.test-runner" "-e" ":anchors"]}
+
+  :build {:deps {io.github.clojure/tools.build          {:mvn/version "0.10.6"}
+                 slipset/deps-deploy                    {:mvn/version "0.2.2"}
+                 io.github.borkdude/gh-release-artifact {:git/sha "b946558225a7839f6a0f644834e838e190dc2262"}
+                 babashka/babashka.curl                 {:mvn/version "0.1.2"}
+                 babashka/fs                            {:mvn/version "0.3.17"}
+                 cheshire/cheshire                      {:mvn/version "5.11.0"}}
+          :ns-default build}}}

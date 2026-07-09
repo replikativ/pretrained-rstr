@@ -1,0 +1,639 @@
+(ns pretrained.asr.moonshine
+  "Moonshine v2 streaming ASR (UsefulSensors/moonshine-streaming-*) — CPU f32 port.
+
+  Encoder-decoder over raw 16kHz PCM (no mel): per-frame CMVN + asinh compression
+  + linear + two causal stride-2 convs → 50Hz×768 features; 14-layer bidirectional
+  encoder with per-layer sliding windows and NO positional embeddings ('ergodic' —
+  what makes true streaming possible); adapter adds learned absolute positions and
+  projects 768→640; 14-layer causal decoder with partial-interleaved RoPE self-attn,
+  cross-attention to the adapter memory, and chunked SwiGLU. Greedy decode.
+
+  Port traps (validated against HF activations): encoder LayerNorm scale = γ+1.0;
+  SwiGLU gate = SECOND half of fc1; GELU is erf-exact; RoPE rotates only 32/64 dims
+  in GPT-J interleaved pairing; sliding window right=4 admits only 3 future frames.
+  See .internal/moonshine_port_checklist.md."
+  (:require [pretrained.safetensors :as st]
+            [pretrained.audio :as audio]
+            [raster.dl.nn :as nn]
+            [pretrained.decoder :as dec]
+            [raster.linalg.blas :as blas]
+            [raster.quant.op :as ql]
+            [raster.compiler.backend.cpu.quant :as cq]
+            [raster.sci.special :as special]
+            [clojure.string :as str]
+            [clojure.data.json :as json]))
+
+;; ---------------------------------------------------------------------------
+;; Loading
+;; ---------------------------------------------------------------------------
+
+(defn load-model [dir]
+  (let [cfg (json/read-str (slurp (str dir "/config.json")) :key-fn keyword)
+        w (st/load-safetensors (str dir "/model.safetensors"))
+        vocab (get (json/read-str (slurp (str dir "/tokenizer.json"))) "model")
+        id->tok (reduce-kv (fn [m t i] (assoc m (long i) t)) {} (get vocab "vocab"))
+        ;; added tokens (specials + ST_*) override
+        id->tok (reduce (fn [m at] (assoc m (long (get at "id")) (get at "content")))
+                        id->tok
+                        (get (json/read-str (slurp (str dir "/tokenizer.json"))) "added_tokens"))]
+    ;; decoder matvecs run int8 (Q8_0, transcription-lossless) on the spin-pool
+    ;; int8-MAC kernel — the same fast path as the decoder-LM engine. Encoder stays
+    ;; f32 GEMM (batched, compute-dense).
+    {:cfg cfg :w w :id->tok id->tok
+     :qw (let [src (java.io.File. (str dir "/model.safetensors"))
+               cf (java.io.File. (str dir "/.qstream-q8.bin"))]
+           (if (dec/stream-cache-valid? cf src)
+             (@#'dec/read-stream-cache cf)
+             (let [qw (into {} (pmap (fn [nm]
+                                       (let [{:keys [data shape]} (get w nm)
+                                             [out in] shape
+                                             {:keys [wq ws]} (cq/quantize-weight data cq/q8-0)]
+                                         [nm (assoc (cq/repack-stream wq ws (long out) (long in) cq/q8-0)
+                                                    :in (long in) :out (long out))]))
+                                     (concat ["proj_out.weight"]
+                                             (for [l (range 14)
+                                                   nm ["self_attn.q_proj.weight" "self_attn.k_proj.weight"
+                                                       "self_attn.v_proj.weight" "self_attn.o_proj.weight"
+                                                       "encoder_attn.q_proj.weight" "encoder_attn.o_proj.weight"
+                                                       "mlp.fc1.weight" "mlp.fc2.weight"]]
+                                               (str "model.decoder.layers." l "." nm)))))]
+               (@#'dec/write-stream-cache! cf src qw)
+               qw)))
+     :enc-layers (long (get-in cfg [:encoder_config :num_hidden_layers]))
+     :dec-layers (long (:num_hidden_layers cfg))
+     :d-enc (long (get-in cfg [:encoder_config :hidden_size]))
+     :d-dec (long (:hidden_size cfg))
+     :heads (long (:num_attention_heads cfg))
+     :hd (long (:head_dim cfg))
+     :windows (mapv (fn [[l r]] [(long l) (long r)])
+                    (get-in cfg [:encoder_config :sliding_windows]))}))
+
+(defn- t ^floats [m nm] (or (:data (get (:w m) nm)) (throw (ex-info (str "missing tensor " nm) {}))))
+
+;; ---------------------------------------------------------------------------
+;; Primitives (CPU f32 reference)
+;; ---------------------------------------------------------------------------
+
+(def ^:private ^floats zero640 (float-array 640))
+(def ^:private ^floats zero768 (float-array 768))
+(def ^:private ^floats zero1536 (float-array 1536))
+
+(defn- zeros ^floats [n] (case (int n) 640 zero640 768 zero768 1536 zero1536 (float-array n)))
+
+(defn- layer-norm!
+  "In-place-ish LayerNorm over rows: mean-centered, eps 1e-5, scale (+gain-offset w),
+  no bias. Returns a NEW array."
+  ^floats [^floats x ^floats w gain-offset rows d]
+  (let [gain-offset (double gain-offset) rows (long rows) d (long d)
+        out (float-array (* rows d))]
+    (dotimes [r rows]
+      (let [base (* r d)
+            mean (/ (loop [i 0 s 0.0] (if (< i d) (recur (inc i) (+ s (aget x (+ base i)))) s)) d)
+            var (/ (loop [i 0 s 0.0]
+                     (if (< i d)
+                       (recur (inc i) (let [v (- (aget x (+ base i)) mean)] (+ s (* v v))))
+                       s)) d)
+            inv (/ 1.0 (Math/sqrt (+ var 1e-5)))]
+        (dotimes [i d]
+          (aset out (+ base i)
+                (float (* (- (aget x (+ base i)) mean) inv (+ gain-offset (aget w i))))))))
+    out))
+
+(defn- silu! ^floats [^floats x]
+  (dotimes [i (alength x)]
+    (let [v (double (aget x i))]
+      (aset x i (float (/ v (+ 1.0 (Math/exp (- v))))))))
+  x)
+
+(defn- erf-as ^double [^double z]
+  ;; Abramowitz–Stegun 7.1.26: |abs err| <= 1.5e-7 (below f32 output resolution).
+  (let [x (Math/abs z)
+        t (/ 1.0 (+ 1.0 (* 0.3275911 x)))
+        y (- 1.0 (* t (+ 0.254829592
+                         (* t (+ -0.284496736
+                                 (* t (+ 1.421413741
+                                         (* t (+ -1.453152027 (* t 1.061405429))))))))
+              (Math/exp (- (* x x)))))]
+    (if (neg? z) (- y) y)))
+
+(defn- gelu-erf! ^floats [^floats x]
+  (let [inv-sqrt2 (/ 1.0 (Math/sqrt 2.0))]
+    (dotimes [i (alength x)]
+      (let [v (double (aget x i))]
+        (aset x i (float (* 0.5 v (+ 1.0 (erf-as (* v inv-sqrt2)))))))))
+  x)
+
+(defn- linear1
+  "Batch-1 linear y = W@x + b via sgemv (no GEMM thread-spawn overhead)."
+  ^floats [^floats x ^floats w ^floats b out in]
+  (let [y (java.util.Arrays/copyOf b (int out))]
+    (blas/dgemv! w x y (long out) (long in) (float 1.0) (float 1.0))
+    y))
+
+(defn- qlin
+  "Quantized decode matvec: y = W@x (+ b) via the int8-MAC spin-pool kernel."
+  ^floats [m nm ^floats x ^floats b]
+  (let [{:keys [wqi wsi in out]} (get (:qw m) nm)
+        ^floats y (ql/qlinear-i8-q8 x wqi wsi in out)]
+    (when b (dotimes [i (alength y)] (aset y i (float (+ (aget y i) (aget b i))))))
+    y))
+
+(defn- add! ^floats [^floats a ^floats b]
+  (dotimes [i (alength a)] (aset a i (float (+ (aget a i) (aget b i)))))
+  a)
+
+;; ---------------------------------------------------------------------------
+;; Frontend: raw PCM → 50Hz × 768
+;; ---------------------------------------------------------------------------
+
+(defn- causal-conv1d
+  "Causal conv via im2col + BLAS: x [T,cin] row-major, weight [cout,cin,k] (contiguous
+  = [cout, cin*k]), stride 2, left-pad (k-1). Output [T2,cout], T2=(T-1)/2+1."
+  ^floats [^floats x ^floats w ^floats b T cin cout k]
+  (let [T (long T) cin (long cin) cout (long cout) k (long k)
+        T2 (inc (quot (dec T) 2))
+        cols (float-array (* T2 cin k))]
+    (dotimes [ti T2]
+      (let [center (* 2 ti)]                       ;; input frames [center-(k-1) .. center]
+        (dotimes [c cin]
+          (dotimes [kk k]
+            (let [src (+ (- center (dec k)) kk)]
+              (when (>= src 0)
+                (aset cols (+ (* ti (* cin k)) (* c k) kk)
+                      (aget x (+ (* src cin) c)))))))))
+    (nn/linear cols w b T2 (* cin k) cout)))
+
+(defn frontend
+  "Raw float PCM (multiple of 80 samples) → features [T,768] row-major + T."
+  [m ^floats pcm]
+  (let [n80 (quot (alength pcm) 80)
+        framed (float-array (* n80 80))
+        log-k (aget ^floats (t m "model.encoder.embedder.comp.log_k") 0)
+        kk (Math/exp (double log-k))]
+    ;; per-frame CMVN + asinh(k*x)
+    (dotimes [f n80]
+      (let [base (* f 80)
+            mean (/ (loop [i 0 s 0.0] (if (< i 80) (recur (inc i) (+ s (aget pcm (+ base i)))) s)) 80.0)
+            var (/ (loop [i 0 s 0.0]
+                     (if (< i 80)
+                       (recur (inc i) (let [v (- (aget pcm (+ base i)) mean)] (+ s (* v v))))
+                       s)) 80.0)
+            inv (/ 1.0 (Math/sqrt (+ var 1e-6)))]
+        (dotimes [i 80]
+          (let [v (* (- (aget pcm (+ base i)) mean) inv)]
+            (aset framed (+ base i)
+                  (float (let [y (* kk v)] (Math/log (+ y (Math/sqrt (+ 1.0 (* y y))))))))))))
+    (let [h (silu! (nn/linear framed (t m "model.encoder.embedder.linear.weight")
+                              (zeros 768) n80 80 768))
+          c1 (silu! (causal-conv1d h (t m "model.encoder.embedder.conv1.weight")
+                                   (t m "model.encoder.embedder.conv1.bias") n80 768 1536 5))
+          T1 (inc (quot (dec n80) 2))
+          c2 (causal-conv1d c1 (t m "model.encoder.embedder.conv2.weight")
+                            (t m "model.encoder.embedder.conv2.bias") T1 1536 768 5)]
+      {:x c2 :T (inc (quot (dec T1) 2))})))
+
+;; ---------------------------------------------------------------------------
+;; Encoder: 14 layers, sliding-window bidirectional MHA, no positions
+;; ---------------------------------------------------------------------------
+
+(defn- windowed-attention
+  "MHA with sliding window [left right]: query i attends j where
+  (0 <= i-j < left) or (0 < j-i < right). q,k,v [T, heads*hd]; returns [T, heads*hd]."
+  ^floats [^floats q ^floats k ^floats v T heads hd left right]
+  (let [T (long T) heads (long heads) hd (long hd)
+        left (long left) right (long right)
+        dim (* heads hd)
+        scale (/ 1.0 (Math/sqrt (double hd)))
+        out (float-array (* T dim))
+        scores (float-array T)]
+    (dotimes [i T]
+      (let [j0 (max 0 (- i (dec left)))
+            j1 (min (dec T) (+ i (max 0 (dec right))))]     ;; inclusive range
+        (dotimes [h heads]
+          (let [qb (+ (* i dim) (* h hd))
+                mx (loop [j j0 mx -1.0e30]
+                     (if (<= j j1)
+                       (let [kb (+ (* j dim) (* h hd))
+                             s (* scale (loop [d 0 acc 0.0]
+                                          (if (< d hd)
+                                            (recur (inc d) (+ acc (* (aget q (+ qb d)) (aget k (+ kb d)))))
+                                            acc)))]
+                         (aset scores j (float s))
+                         (recur (inc j) (max mx s)))
+                       mx))
+                sum (loop [j j0 s 0.0]
+                      (if (<= j j1)
+                        (let [e (Math/exp (- (aget scores j) mx))]
+                          (aset scores j (float e))
+                          (recur (inc j) (+ s e)))
+                        s))]
+            (dotimes [d hd]
+              (aset out (+ (* i dim) (* h hd) d)
+                    (float (/ (loop [j j0 acc 0.0]
+                                (if (<= j j1)
+                                  (recur (inc j) (+ acc (* (aget scores j)
+                                                           (aget v (+ (* j dim) (* h hd) d)))))
+                                  acc))
+                              sum))))))))
+    out))
+
+(defn encode
+  "Frontend features [T,768] → encoder output [T,768] (final-normed)."
+  [m ^floats feats T]
+  (let [T (long T) d (long (:d-enc m)) heads (long (:heads m)) hd (long (:hd m))
+        adim (* heads hd)]
+    (loop [l 0 x feats]
+      (if (< l (:enc-layers m))
+        (let [p (str "model.encoder.layers." l ".")
+              [left right] (nth (:windows m) l)
+              h (layer-norm! x (t m (str p "input_layernorm.gamma")) 1.0 T d)
+              q (nn/linear h (t m (str p "self_attn.q_proj.weight")) (zeros adim) T d adim)
+              k (nn/linear h (t m (str p "self_attn.k_proj.weight")) (zeros adim) T d adim)
+              v (nn/linear h (t m (str p "self_attn.v_proj.weight")) (zeros adim) T d adim)
+              a (windowed-attention q k v T heads hd left right)
+              x (add! (nn/linear a (t m (str p "self_attn.o_proj.weight")) (zeros d) T adim d) x)
+              h2 (layer-norm! x (t m (str p "post_attention_layernorm.gamma")) 1.0 T d)
+              f1 (gelu-erf! (nn/linear h2 (t m (str p "mlp.fc1.weight"))
+                                       (t m (str p "mlp.fc1.bias")) T d 3072))
+              x (add! (nn/linear f1 (t m (str p "mlp.fc2.weight"))
+                                 (t m (str p "mlp.fc2.bias")) T 3072 d) x)]
+          (recur (inc l) x))
+        (layer-norm! x (t m "model.encoder.final_norm.gamma") 1.0 T d)))))
+
+;; ---------------------------------------------------------------------------
+;; Adapter: + learned abs positions, project 768→640
+;; ---------------------------------------------------------------------------
+
+(defn adapter
+  "Encoder output [T,768] (+pos offset) → memory [T,640]."
+  [m ^floats enc T pos-offset]
+  (let [T (long T) d (long (:d-enc m)) dd (long (:d-dec m))
+        pe (t m "model.decoder.pos_emb.weight")
+        xp (float-array (* T d))]
+    (dotimes [i (* T d)] (aset xp i (aget enc i)))
+    (dotimes [ti T]
+      (let [pb (* (+ (long pos-offset) ti) d)]
+        (dotimes [j d]
+          (aset xp (+ (* ti d) j) (float (+ (aget xp (+ (* ti d) j)) (aget pe (+ pb j))))))))
+    (nn/linear xp (t m "model.decoder.proj.weight") (zeros dd) T d dd)))
+
+;; ---------------------------------------------------------------------------
+;; Decoder: causal self-attn (partial interleaved RoPE) + cross-attn + SwiGLU
+;; ---------------------------------------------------------------------------
+
+(defn- rope-partial!
+  "GPT-J interleaved partial RoPE in place: rotate first 32 of each 64-dim head.
+  x [heads*64] for one position `pos`."
+  [^floats x heads pos]
+  (let [pos (double pos)]
+    (dotimes [h (long heads)]
+      (let [base (* h 64)]
+        (dotimes [j 16]
+          (let [freq (Math/pow 10000.0 (- (/ (* 2.0 j) 32.0)))
+                ang (* pos freq)
+                c (Math/cos ang) s (Math/sin ang)
+                i0 (+ base (* 2 j)) i1 (inc i0)
+                x0 (aget x i0) x1 (aget x i1)]
+            (aset x i0 (float (- (* x0 c) (* x1 s))))
+            (aset x i1 (float (+ (* x1 c) (* x0 s)))))))))
+  x)
+
+(defn- attend-cache
+  "Single-query MHA over cached K/V [n, heads*hd]."
+  ^floats [^floats q ^floats kc ^floats vc n heads hd]
+  (let [n (long n) heads (long heads) hd (long hd)
+        dim (* heads hd)
+        scale (/ 1.0 (Math/sqrt (double hd)))
+        out (float-array dim)
+        scores (float-array n)]
+    (dotimes [h heads]
+      (let [qb (* h hd)
+            mx (loop [j 0 mx -1.0e30]
+                 (if (< j n)
+                   (let [s (* scale (loop [d 0 acc 0.0]
+                                      (if (< d hd)
+                                        (recur (inc d) (+ acc (* (aget q (+ qb d))
+                                                                 (aget kc (+ (* j dim) qb d)))))
+                                        acc)))]
+                     (aset scores j (float s))
+                     (recur (inc j) (max mx s)))
+                   mx))
+            sum (loop [j 0 s 0.0]
+                  (if (< j n)
+                    (let [e (Math/exp (- (aget scores j) mx))]
+                      (aset scores j (float e))
+                      (recur (inc j) (+ s e)))
+                    s))]
+        (dotimes [d hd]
+          (aset out (+ qb d)
+                (float (/ (loop [j 0 acc 0.0]
+                            (if (< j n)
+                              (recur (inc j) (+ acc (* (aget scores j) (aget vc (+ (* j dim) qb d)))))
+                              acc))
+                          sum))))))
+    out))
+
+(defn- attend-cache+w
+  "attend-cache that also ACCUMULATES head-averaged attention weights into wsink
+  (float[n]) — cross-attention alignment for timestamps."
+  ^floats [^floats q ^floats kc ^floats vc n heads hd ^floats wsink]
+  (let [n (long n) heads (long heads) hd (long hd)
+        dim (* heads hd)
+        scale (/ 1.0 (Math/sqrt (double hd)))
+        out (float-array dim)
+        scores (float-array n)
+        havg (float (/ 1.0 heads))]
+    (dotimes [h heads]
+      (let [qb (* h hd)
+            mx (loop [j 0 mx -1.0e30]
+                 (if (< j n)
+                   (let [s (* scale (loop [d 0 acc 0.0]
+                                      (if (< d hd)
+                                        (recur (inc d) (+ acc (* (aget q (+ qb d))
+                                                                 (aget kc (+ (* j dim) qb d)))))
+                                        acc)))]
+                     (aset scores j (float s))
+                     (recur (inc j) (max mx s)))
+                   mx))
+            sum (loop [j 0 s 0.0]
+                  (if (< j n)
+                    (let [e (Math/exp (- (aget scores j) mx))]
+                      (aset scores j (float e))
+                      (recur (inc j) (+ s e)))
+                    s))]
+        (dotimes [j n]
+          (aset wsink j (float (+ (aget wsink j) (* havg (/ (aget scores j) sum))))))
+        (dotimes [d hd]
+          (aset out (+ qb d)
+                (float (/ (loop [j 0 acc 0.0]
+                            (if (< j n)
+                              (recur (inc j) (+ acc (* (aget scores j) (aget vc (+ (* j dim) qb d)))))
+                              acc))
+                          sum))))))
+    out))
+
+(defn- decoder-state [m ^floats memory T]
+  (let [dd (long (:d-dec m))]
+    {:memory memory :T (long T)
+     ;; cross K/V per layer, computed once per memory version
+     :cross (mapv (fn [l]
+                    (let [p (str "model.decoder.layers." l ".encoder_attn.")]
+                      {:k (nn/linear memory (t m (str p "k_proj.weight")) (zeros dd) T dd dd)
+                       :v (nn/linear memory (t m (str p "v_proj.weight")) (zeros dd) T dd dd)}))
+                  (range (:dec-layers m)))
+     ;; self K/V caches grow per step
+     :self-k (mapv (fn [_] (atom [])) (range (:dec-layers m)))
+     :self-v (mapv (fn [_] (atom [])) (range (:dec-layers m)))}))
+
+(defn- cat-rows ^floats [rows dim]
+  (let [n (count rows) out (float-array (* n (long dim)))]
+    (dotimes [i n] (System/arraycopy ^floats (nth rows i) 0 out (* i (long dim)) (long dim)))
+    out))
+
+(defn- decode-step
+  "One greedy decoder step: token id + position → next logits argmax. The 5-arg
+  arity accumulates layer+head-averaged CROSS-attention weights into wsink
+  (float[T]) for timestamp alignment."
+  ([m state id pos] (decode-step m state id pos nil))
+  ([m state id pos ^floats wsink]
+  (let [dd (long (:d-dec m)) heads (long (:heads m)) hd (long (:hd m))
+        emb (t m "model.decoder.embed_tokens.weight")
+        x (java.util.Arrays/copyOfRange emb (* (long id) dd) (* (inc (long id)) dd))]
+    (loop [l 0 ^floats x x]
+      (if (< l (:dec-layers m))
+        (let [p (str "model.decoder.layers." l ".")
+              ;; self-attention
+              h (layer-norm! x (t m (str p "input_layernorm.weight")) 0.0 1 dd)
+              q (rope-partial! (qlin m (str p "self_attn.q_proj.weight") h nil) heads pos)
+              k (rope-partial! (qlin m (str p "self_attn.k_proj.weight") h nil) heads pos)
+              v (qlin m (str p "self_attn.v_proj.weight") h nil)
+              _ (swap! (nth (:self-k state) l) conj k)
+              _ (swap! (nth (:self-v state) l) conj v)
+              ks @(nth (:self-k state) l) vs @(nth (:self-v state) l)
+              a (attend-cache q (cat-rows ks dd) (cat-rows vs dd) (count ks) heads hd)
+              x (add! (qlin m (str p "self_attn.o_proj.weight") a nil) x)
+              ;; cross-attention
+              h2 (layer-norm! x (t m (str p "post_attention_layernorm.weight")) 0.0 1 dd)
+              q2 (qlin m (str p "encoder_attn.q_proj.weight") h2 nil)
+              {ck :k cv :v} (nth (:cross state) l)
+              ;; alignment signal lives in the LATER layers (early ones attend
+              ;; diffusely — the whisper alignment-heads lesson)
+              a2 (if (and wsink (>= l 7))
+                   (attend-cache+w q2 ck cv (:T state) heads hd wsink)
+                   (attend-cache q2 ck cv (:T state) heads hd))
+              x (add! (qlin m (str p "encoder_attn.o_proj.weight") a2 nil) x)
+              ;; SwiGLU MLP: fc1 → [value | gate], silu(gate)*value, fc2
+              h3 (layer-norm! x (t m (str p "final_layernorm.weight")) 0.0 1 dd)
+              f1 (qlin m (str p "mlp.fc1.weight") h3 (t m (str p "mlp.fc1.bias")))
+              gv (float-array 2560)
+              _ (dotimes [i 2560]
+                  (let [value (aget ^floats f1 i)
+                        gate (double (aget ^floats f1 (+ 2560 i)))]
+                    (aset gv i (float (* value (/ gate (+ 1.0 (Math/exp (- gate)))))))))
+              x (add! (qlin m (str p "mlp.fc2.weight") gv (t m (str p "mlp.fc2.bias"))) x)]
+          (recur (inc l) x))
+        (let [xf (layer-norm! x (t m "model.decoder.norm.weight") 0.0 1 dd)
+              logits (qlin m "proj_out.weight" xf nil)]
+          (loop [i 1 best 0 bv -1.0e30]                       ;; argmax
+            (if (< i 32768)
+              (let [v (aget ^floats logits i)]
+                (if (> v bv) (recur (inc i) i (double v)) (recur (inc i) best bv)))
+              best))))))))
+
+;; ---------------------------------------------------------------------------
+;; Tokenizer decode (SP-Llama: ▁→space, byte-fallback) + top-level API
+;; ---------------------------------------------------------------------------
+
+(defn decode-tokens [m ids]
+  (let [sb (java.io.ByteArrayOutputStream.)]
+    (doseq [id ids]
+      (let [tok (get (:id->tok m) (long id) "")]
+        (if-let [[_ hex] (re-matches #"<0x([0-9A-Fa-f]{2})>" tok)]
+          (.write sb (int (Long/parseLong hex 16)))
+          (when-not (#{"<s>" "</s>" "<unk>"} tok)
+            (.write sb (.getBytes (.replace ^String tok "▁" " ") "UTF-8"))))))
+    (let [s (String. (.toByteArray sb) "UTF-8")]
+      (if (.startsWith s " ") (subs s 1) s))))
+
+
+;; ---------------------------------------------------------------------------
+;; Streaming: ergodicity = bounded receptive fields, so recomputing a trailing
+;; window reproduces finalized frames bit-identically (no conv/encoder state).
+;; Frontend frame t needs 200Hz frames [4t-12, 4t] (samples 320t-960..320t+79);
+;; encoder frame t needs <=16 past frames per layer -> 224 total. Finalization
+;; withholds 16 frames (4 lookahead layers x window 4 = 320ms) until :final?.
+;; ---------------------------------------------------------------------------
+
+(defn- cat-blocks
+  "Concatenate variable-length float[] blocks."
+  ^floats [blocks]
+  (let [total (reduce + 0 (map #(alength ^floats %) blocks))
+        out (float-array total)]
+    (loop [off 0 [b & r] blocks]
+      (if b
+        (do (System/arraycopy ^floats b 0 out off (alength ^floats b))
+            (recur (+ off (alength ^floats b)) r))
+        out))))
+
+(defn stream-init
+  "Streaming session state. Push PCM with stream-push!; finish with :final? true."
+  [m]
+  {:m m :samples [] :nsamples 0 :feats [] :nfeats 0 :emitted 0 :memory [] :ids [1]})
+
+(defn- frontend-new-frames
+  "Compute feature frames [nfeats, Ttot) from accumulated samples, via a trailing
+  recompute window starting 3 output frames early (dropping the boundary frames)."
+  [m ^floats all nfeats]
+  (let [n80 (quot (alength all) 80)
+        Ttot (inc (quot (dec (inc (quot (dec n80) 2))) 2))]
+    (if (<= Ttot (long nfeats))
+      {:new nil :Ttot Ttot}
+      (let [a (long nfeats)
+            f0 (max 0 (- a 3))                         ;; 3-frame guard = 12 200Hz frames
+            k0 (* 4 f0)                                ;; aligned 200Hz frame start
+            slice (java.util.Arrays/copyOfRange all (* 80 k0) (* n80 80))
+            {:keys [^floats x T]} (frontend m slice)
+            drop-n (- a f0)                            ;; boundary frames to discard
+            cnt (- Ttot a)]
+        {:new (java.util.Arrays/copyOfRange x (* drop-n 768)
+                                            (* (+ drop-n cnt) 768))
+         :Ttot Ttot}))))
+
+(defn stream-push!
+  "Feed a PCM chunk (float[] @16kHz). Returns updated state; when :decode? is set
+  (or :final?) also re-decodes and attaches :text. Finalized encoder frames are
+  bit-identical to batch processing (verified)."
+  [state ^floats chunk & {:keys [decode? final?]}]
+  (let [m (:m state)
+        samples (conj (:samples state) chunk)
+        nsamples (+ (long (:nsamples state)) (alength chunk))
+        all (float-array nsamples)
+        _ (loop [off 0 [c & r] samples]
+            (when c
+              (System/arraycopy ^floats c 0 all off (alength ^floats c))
+              (recur (+ off (alength ^floats c)) r)))
+        all (java.util.Arrays/copyOfRange all 0 (* 80 (quot nsamples 80)))
+        {:keys [^floats new Ttot]} (frontend-new-frames m all (:nfeats state))
+        feats (if new (conj (:feats state) new) (:feats state))
+        nfeats (if new Ttot (:nfeats state))
+        stable (if final? (long nfeats) (max 0 (- (long nfeats) 16)))
+        emitted (long (:emitted state))
+        state (assoc state :samples samples :nsamples nsamples :feats feats :nfeats nfeats)
+        state (if (> stable emitted)
+                (let [e0 (max 0 (- emitted 224))
+                      featarr (cat-blocks feats)     ;; chunks are row blocks
+                      fslice (java.util.Arrays/copyOfRange featarr (* (long e0) 768) (* (long nfeats) 768))
+                      Ts (- (long nfeats) (long e0))
+                      encs (encode m fslice Ts)
+                      new-final (java.util.Arrays/copyOfRange encs (* (- emitted (long e0)) 768)
+                                                              (* (- stable (long e0)) 768))
+                      memnew (adapter m new-final (- stable emitted) emitted)]
+                  (assoc state :memory (conj (:memory state) memnew) :emitted stable))
+                state)
+        state (if (and (or decode? final?) (pos? (long (:emitted state))))
+                (let [mem (cat-blocks (:memory state))
+                      T (long (:emitted state))
+                      dstate (decoder-state m mem T)
+                      max-tokens (min 256 (long (Math/ceil (* 6.5 (/ nsamples 16000.0)))))
+                      ids (loop [ids [1] pos 0]
+                            (let [nxt (decode-step m dstate (peek ids) pos)]
+                              (if (or (= nxt 2) (>= (inc pos) max-tokens))
+                                ids
+                                (recur (conj ids nxt) (inc pos)))))]
+                  (assoc state :ids ids :text (decode-tokens m (rest ids))))
+                state)]
+    state))
+
+(defn transcribe-ts
+  "Like transcribe, but returns {:text s :words [{:word :start :end}]} — word-level
+  timestamps from monotonic cross-attention alignment (20ms encoder frames)."
+  [m wav]
+  (let [{:keys [^floats samples]} (if (string? wav) (audio/load-wav wav) wav)
+        n (* (quot (alength samples) 80) 80)
+        pcm (java.util.Arrays/copyOfRange samples 0 (int n))
+        {:keys [x T]} (frontend m pcm)
+        enc (encode m x T)
+        mem (adapter m enc T 0)
+        state (decoder-state m mem T)
+        max-tokens (min 256 (long (Math/ceil (* 6.5 (/ n 16000.0)))))
+        Tl (long T)
+        ;; greedy with attention capture
+        [ids rows] (loop [ids [1] rows [] pos 0]
+                     (let [w (float-array Tl)
+                           nxt (decode-step m state (peek ids) pos w)]
+                       (if (or (= nxt 2) (>= (inc pos) max-tokens))
+                         [ids (conj rows w)]
+                         (recur (conj ids nxt) (conj rows w) (inc pos)))))
+        out-ids (vec (rest ids))                            ;; tokens emitted (rows align)
+        ;; DTW alignment over the [tokens x frames] attention matrix (greedy argmax
+        ;; lets diffuse early rows collapse the start — the whisper lesson)
+        nt (count out-ids)
+        cost (let [c (make-array Double/TYPE nt Tl)]
+               (dotimes [i nt]
+                 (let [^floats w (nth rows i)
+                       sum (loop [j 0 s 1.0e-9] (if (< j Tl) (recur (inc j) (+ s (aget w j))) s))]
+                   (dotimes [j Tl]
+                     (aset ^doubles (aget ^objects c i) j (- (/ (aget w j) sum))))))
+               c)
+        frames (let [D (make-array Double/TYPE (inc nt) (inc Tl))
+                     P (make-array Byte/TYPE (inc nt) (inc Tl))]
+                 (dotimes [j (inc Tl)] (aset ^doubles (aget ^objects D 0) j
+                                             (if (zero? j) 0.0 1.0e18)))
+                 (dotimes [i nt] (aset ^doubles (aget ^objects D (inc i)) 0 1.0e18))
+                 (dotimes [i nt]
+                   (let [^doubles ci (aget ^objects cost i)
+                         ^doubles dprev (aget ^objects D i)
+                         ^doubles dcur (aget ^objects D (inc i))
+                         ^bytes pcur (aget ^objects P (inc i))]
+                     (dotimes [j Tl]
+                       (let [diag (aget dprev j) up (aget dprev (inc j)) left (aget dcur j)
+                             m (min diag (min up left))]
+                         (aset dcur (inc j) (+ (aget ci j) m))
+                         (aset pcur (inc j) (byte (cond (= m diag) 0 (= m up) 1 :else 2)))))))
+                 ;; backtrace: token i -> first frame on its path row
+                 (loop [i nt j Tl acc (transient (vec (repeat nt 0)))]
+                   (if (pos? i)
+                     (let [p (aget ^bytes (aget ^objects P i) j)
+                           acc (assoc! acc (dec i) (dec j))]
+                       (case (int p)
+                         0 (recur (dec i) (dec j) acc)
+                         1 (recur (dec i) j acc)
+                         2 (recur i (dec j) acc)))
+                     (persistent! acc))))
+        ;; group SP tokens into words (▁ starts a word)
+        words (loop [i 0 cur nil acc []]
+                (if (< i (count out-ids))
+                  (let [tok (get (:id->tok m) (long (nth out-ids i)) "")
+                        starts? (or (.startsWith ^String tok "▁") (nil? cur))
+                        piece (str/replace tok "▁" (if (.startsWith ^String tok "▁") " " ""))]
+                    (if (and starts? cur)
+                      (recur (inc i) {:word piece :start (nth frames i) :end (nth frames i)}
+                             (conj acc cur))
+                      (recur (inc i)
+                             (if cur
+                               (-> cur (update :word str piece) (assoc :end (nth frames i)))
+                               {:word piece :start (nth frames i) :end (nth frames i)})
+                             acc)))
+                  (if cur (conj acc cur) acc)))
+        fin (fn [w] {:word (str/trim (:word w))
+                     :start (* 0.02 (double (:start w)))
+                     :end (* 0.02 (inc (double (:end w))))})]
+    {:text (decode-tokens m out-ids)
+     :words (mapv fin (remove #(str/blank? (:word %)) words))}))
+
+(defn transcribe
+  "WAV path (or {:samples :rate} from pretrained.audio) → transcription string."
+  [m wav]
+  (let [{:keys [^floats samples]} (if (string? wav) (audio/load-wav wav) wav)
+        n (* (quot (alength samples) 80) 80)
+        pcm (java.util.Arrays/copyOfRange samples 0 (int n))
+        {:keys [x T]} (frontend m pcm)
+        enc (encode m x T)
+        mem (adapter m enc T 0)
+        state (decoder-state m mem T)
+        max-tokens (min 256 (long (Math/ceil (* 6.5 (/ n 16000.0)))))]
+    (loop [ids [1] pos 0]
+      (let [nxt (decode-step m state (peek ids) pos)]
+        (if (or (= nxt 2) (>= (inc pos) max-tokens))
+          (decode-tokens m (rest ids))
+          (recur (conj ids nxt) (inc pos)))))))

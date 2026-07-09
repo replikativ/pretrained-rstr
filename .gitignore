@@ -1,0 +1,6 @@
+/.cpcache/
+/.clj-kondo/
+/target/
+/.lsp/
+*.gguf
+.internal/

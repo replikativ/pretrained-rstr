@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <version>template</version>
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>org.replikativ</groupId>
+    <artifactId>pretrained-rstr</artifactId>
+    <packaging>jar</packaging>
+    <name>pretrained-rstr</name>
+    <description>Run pretrained HuggingFace models — text embeddings, speech-to-text, and decoder LLMs — natively on the JVM on the raster typed-dispatch compiler. No Python, no ONNX runtime: weights load from safetensors, quantize to int8/int4, and run on raster's CPU int8-MAC kernels and Intel-GPU (Level Zero/OpenCL) programs.</description>
+    <licenses>
+        <license>
+            <name>MIT License</name>
+            <url>https://opensource.org/licenses/MIT</url>
+        </license>
+    </licenses>
+    <scm>
+        <connection>scm:git:git@github.com:replikativ/pretrained-rstr.git</connection>
+        <developerConnection>scm:git:git@github.com/replikativ/pretrained-rstr.git</developerConnection>
+        <url>https://github.com/replikativ/pretrained-rstr</url>
+    </scm>
+</project>
