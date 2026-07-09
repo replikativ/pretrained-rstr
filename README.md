@@ -4,6 +4,8 @@
 [![CircleCI](https://circleci.com/gh/replikativ/pretrained-rstr.svg?style=shield)](https://circleci.com/gh/replikativ/pretrained-rstr)
 [![Slack](https://img.shields.io/badge/slack-join_chat-brightgreen.svg)](https://clojurians.slack.com/archives/C09622F337D)
 
+> ⚠️ **Experimental**: pretrained-rstr is under active development. APIs may change before 1.0. Feedback welcome!
+
 Run pretrained HuggingFace models — **text embeddings, speech-to-text, and decoder
 LLMs** — natively on the JVM, on the [raster](https://github.com/replikativ/raster)
 typed-dispatch compiler. No Python, no ONNX runtime: weights load from safetensors,
@@ -46,8 +48,8 @@ Intel-GPU (Level Zero/OpenCL) programs.
 | `:all-minilm-l6-v2`, `:bge-small-en-v1.5` | embeddings (BERT tier) | 23–33M f32 | parity with sentence-transformers |
 | `:moonshine-streaming-medium` | English ASR, **true streaming** | 245M | **WER 1.62% == HF torch** (LibriSpeech-100); word timestamps |
 | `:qwen3-asr-0.6b` / `-1.7b` | multilingual ASR (52 languages) | 0.6/1.7B | transcript char-identical to torch gold |
-| gemma-3-270m/1b | decoder LLM | ≤1B Q4/Q8 | token-exact GPU decode vs oracle; CPU ≈ llama.cpp speed |
-| Qwen3, SmolLM2/Llama, Qwen3-MoE | decoder LLMs | ≤1.7B Q4/Q8 | same descriptor-driven engine (shared attention/norm stack); add a checkpoint to run |
+| `:gemma-3-270m-it` / `:gemma-3-1b-it` | decoder LLM | ≤1B Q4/Q8 | token-exact GPU decode vs oracle; CPU ≈ llama.cpp speed |
+| `:qwen3-0.6b` / `:qwen3-1.7b`, `:smollm2-135m-instruct` / `:smollm2-360m-instruct` | decoder LLMs | ≤1.7B Q4/Q8 | same descriptor-driven engine (shared attention/norm stack) |
 
 Embeddings feed directly into [proximum](https://github.com/replikativ/proximum)
 (`emb/rows` → HNSW vector index) and [umap-rstr](https://github.com/replikativ/umap-rstr)
@@ -105,9 +107,10 @@ clojure -A:dev:test:valhalla -M -e "(require 'clojure.test 'pretrained.anchors-t
 - ffmpeg (optional, for non-WAV audio)
 - Intel GPU (optional): Level Zero or OpenCL runtime for the GPU decode/prefill paths
 
-## Status
+## License
 
-Pre-release. APIs may still move; the registry grows by demand — a same-family model
-is usually one descriptor entry; a new architecture is a small descriptor + a
-validation pass. Model weights carry their own licenses (all registry models are
-Apache-2.0/MIT).
+Copyright © 2026 Christian Weilbach
+
+pretrained-rstr is [MIT licensed](LICENSE). Model **weights** carry their own licenses
+(all registry models are Apache-2.0/MIT) — you are responsible for complying with each
+model's terms.
