@@ -12,9 +12,14 @@ Intel-GPU (Level Zero/OpenCL) programs.
 
 ```clojure
 (require '[pretrained.embed :as emb]
-         '[pretrained.asr :as asr])
+         '[pretrained.asr :as asr]
+         '[pretrained.lm :as lm])
 
-;; embeddings — weights auto-download from HF on first use
+;; every modality is the same shape: (load-X :key [dir] [opts]) then a task verb.
+;; a registry key auto-downloads weights from HF on first use; an explicit local dir
+;; skips the download (bring your own weights for a known model).
+
+;; embeddings
 (def e (emb/load-embedder :qwen3-embedding-0.6b))
 (emb/embed-texts e ["Datahike is a durable Datalog database."])
 ;; => {:data float[n*1024] :n 1 :dim 1024}   (L2-normalized rows)
@@ -27,9 +32,8 @@ Intel-GPU (Level Zero/OpenCL) programs.
 ;; => {:text "..." :words [{:word "And" :start 0.0 :end 0.02} ...]}
 
 ;; decoder LLMs
-(require 'pretrained.arch.gemma3 '[pretrained.loader :as loader])
-(def g (loader/from-pretrained "/path/to/gemma-3-270m-it"))
-(loader/generate-text g "The capital of France is" 20)
+(def g (lm/load-lm :gemma-3-270m-it))                ;; or (lm/load-lm :gemma-3-270m-it {:gpu? true})
+(lm/generate-text g "The capital of France is" 20)
 ;; => " Paris. ..."
 ```
 
@@ -58,10 +62,13 @@ type/gain, rope variants, GQA, qk-norm, sliding windows, sandwich norms, MoE rou
 — interpreted by one generic engine over raster's compilable `deftm` blocks. Adding a
 standard decoder-LM is a descriptor, not engine code.
 
-- `pretrained.embed` / `pretrained.asr` — task-level APIs (registry + auto-download)
+- `pretrained.embed` / `pretrained.asr` / `pretrained.lm` — task-level APIs, all the same
+  shape: a curated registry + HF auto-download + `load-X`/task-verb (CPU or `{:gpu? true}`)
 - `pretrained.decoder` — the descriptor-driven decode engine (`load-hf`, `decode-step`,
   `generate-cached`); GPU-resident decode/prefill in `pretrained.decoder-gpu`
-- `pretrained.loader` — architecture registry, tokenizer auto-detection, `from-pretrained`
+- `pretrained.loader` — the low-level generic loader: architecture registry, tokenizer
+  auto-detection, `from-pretrained` (dispatch any HF dir on `config.json` model_type — the
+  advanced, unvalidated path behind the curated `pretrained.lm` registry)
 - `pretrained.arch.*` — decoder descriptors as pure data: `gemma3`, `llama`, `qwen3`,
   `qwen3-moe`, `embedding-gemma`, plus the self-contained BERT encoder `bert`;
   `pretrained.asr.*` — moonshine, qwen3-asr

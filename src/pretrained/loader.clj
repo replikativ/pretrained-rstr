@@ -5,8 +5,12 @@
   each new architecture is one register-architecture! entry reusing the raster.dl
   building blocks; each new tokenizer family one more branch in detect-tokenizer.
 
-  Usage:
-    (require 'pretrained.arch.gemma3)         ;; registers gemma3
+  This is the LOW-LEVEL, generic loader — it dispatches ANY model dir on config.json
+  with no validation guarantee. For curated, validated models with HF auto-download,
+  use the task-level pretrained.lm/load-lm (which wraps this). Bundled architecture
+  namespaces are auto-required on a registry miss, so no manual (require ...) is needed.
+
+  Usage (advanced / bring-your-own-checkpoint):
     (def m (from-pretrained \"/path/to/gemma-3-270m-it\"))
     (generate-text m \"The capital of France is\" 20)"
   (:require [clojure.data.json :as json]
