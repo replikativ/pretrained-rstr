@@ -18,7 +18,7 @@
   HuggingFace naming conventions."
   (:refer-clojure :exclude [aget aset alength aclone + - * /])
   (:require [raster.core :refer [deftm]]
-            [raster.arrays :refer [aget aset alength alloc-like]]
+            [raster.arrays :refer [aget aset alength]]
             [raster.numeric :as n :refer [+ - * /]]
             [raster.dl.nn :as nn]
             [raster.dl.attention :as attn]
@@ -40,17 +40,6 @@
                                  (aget pos-emb i)
                                  (aget type-emb i))))]
     (nn/layer-norm token-emb ln-gamma ln-beta seq-len d-model eps))))
-
-;; ================================================================
-;; Residual add
-;; ================================================================
-
-(deftm residual-add! (All [T]
-  [dst :- (Array T) src :- (Array T) n :- Long]
-  :- (Array T)
-  (dotimes [i n]
-    (aset dst i (+ (aget dst i) (aget src i))))
-  dst))
 
 ;; ================================================================
 ;; Encoder block (deftm — 20 params, at IFn limit)
@@ -83,33 +72,9 @@
                         seq-len hidden-size 1e-12))))
 
 ;; ================================================================
-;; Mean pooling + L2 normalize (for sentence embeddings)
+;; Mean pooling + L2 normalize: raster.dl.nn substrate ops
+;; (nn/mean-pool + nn/l2-normalize!) — see sentence-embedding below.
 ;; ================================================================
-
-(deftm mean-pool (All [T]
-  [x :- (Array T) seq-len :- Long dim :- Long]
-  :- (Array T)
-  (let [out (alloc-like x dim)
-        inv-n (/ 1.0 (double seq-len))]
-    (dotimes [s seq-len]
-      (dotimes [d dim]
-        (aset out d (+ (aget out d)
-                       (aget x (+ (* s (int dim)) d))))))
-    (dotimes [d dim]
-      (aset out d (* (aget out d) inv-n)))
-    out)))
-
-(deftm l2-normalize (All [T]
-  [v :- (Array T) n :- Long]
-  :- (Array T)
-  (let [norm (n/sqrt (loop [i 0 acc 0.0]
-                       (if (< i n)
-                         (recur (inc i) (+ acc (* (aget v i) (aget v i))))
-                         acc)))
-        inv-norm (/ 1.0 (n/max norm 1e-12))]
-    (dotimes [i n]
-      (aset v i (* (aget v i) inv-norm)))
-    v)))
 
 (deftm cosine-similarity (All [T]
   [a :- (Array T) b :- (Array T) n :- Long]
@@ -191,9 +156,9 @@
   sentence-transformers default pooling). Returns float[hidden_size]."
   [model ^longs token-ids]
   (let [hidden (encode model token-ids)
-        dim (:hidden-size model)
-        seq-len (clojure.core/alength token-ids)]
-    (l2-normalize (mean-pool hidden seq-len dim) dim)))
+        dim (long (:hidden-size model))
+        seq-len (long (clojure.core/alength token-ids))]
+    (nn/l2-normalize! (nn/mean-pool hidden seq-len dim) dim)))
 
 ;; ================================================================
 ;; Public API — load + embed (folded in from the former transformers.clj)

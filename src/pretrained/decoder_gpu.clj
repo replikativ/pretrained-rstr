@@ -6,204 +6,53 @@
   (weights :constant, KV :state) and replayed per token. Device-side position (posbuf/clenbuf)
   so the graph binds once and the host only writes the token + replays.
 
-  PHASE 1 (this file): gemma-3 layer as a literal deftm (ported from the validated /tmp gcl2!,
-  matches arch.gemma3 flags: qk-norm, sandwich-norms, geglu, dual-rope/6, sliding-window 512).
-  PHASE 2: generate the layer deftm from descriptor flags (gen-layer-deftm) for llama/qwen/etc.
+  The decoder layer + head deftms are GENERATED from the model's descriptor flags
+  (gen-layer!/gen-head!) — the hand-written gemma-3-270m layer this generator was
+  validated against lives on as the frozen oracle fixture in
+  pretrained.decoder-gpu-oracle-test.
 
-  Matmuls use the GPU Q4K dp4a kernels (raster.quant.kernels-k) — a DIFFERENT quant layout than the
-  CPU stream-gemv path (pretrained.decoder/quantize-stream), so this ns carries its own Q4K
-  quantize (gpu-quantize)."
+  Matmuls use the GPU Q4K dp4a kernels (raster.quant.kernels-k); the weight packers
+  for the kernel layouts live next to the kernels (raster.quant.pack) — this ns only
+  walks the descriptor's linear roles and packs one tensor at a time."
   (:require [pretrained.decoder :as dec]
-            [raster.compiler.backend.cpu.quant :as cq]
+            [raster.arrays :as arr]
             [raster.quant.kernels-k :as qk]
+            [raster.quant.pack :as qpack]
             [raster.dl.nn :as nn]
             [raster.dl.attention :as attn]
             [raster.gpu.core :as gpu]
             [raster.compiler.pipeline :as pipeline]))
 
 ;; ---------------------------------------------------------------------------
-;; Q4K weight quantization (GPU dp4a layout)
+;; Q4K weight quantization (GPU dp4a layout; packer = raster.quant.pack/q4k-of)
 ;; ---------------------------------------------------------------------------
-
-(defn- b->i
-  "Reinterpret a little-endian byte[] as int[] (the dp4a kernel reads packed quants as int[])."
-  [^bytes b]
-  (let [n (quot (alength b) 4)
-        o (int-array n)
-        bb (.order (java.nio.ByteBuffer/wrap b) java.nio.ByteOrder/LITTLE_ENDIAN)]
-    (dotimes [i n] (aset o i (.getInt bb (* i 4))))
-    o))
-
-(defn- nextpad ^long [^long in] (long (* 256 (Math/ceil (/ (double in) 256.0)))))
-
-(defn- padw
-  "Zero-pad each row of a row-major [out,in] weight up to inp (Q4K needs in % 256 == 0)."
-  ^floats [^floats W ^long out ^long in ^long inp]
-  (if (= in inp)
-    W
-    (let [Wp (float-array (* out inp))]
-      (dotimes [o out] (System/arraycopy W (* o in) Wp (* o inp) in))
-      Wp)))
-
-(defn- q4k-of
-  "Quantize a row-major [out,in] weight to the Q4K dp4a buffer set."
-  [^floats W ^long out ^long in]
-  (let [inp (nextpad in)
-        z (cq/quantize-weight-q4k (padw W out in inp) cq/q4-K)]
-    {:wp (b->i (:wq z)) :da (:da z) :db (:db z) :aq (:aq z) :bq (:bq z) :in inp :out out}))
 
 (defn gpu-quantize
   "Q4K-quantize every linear-role weight (per-layer + globals) from the model map `m`.
-  Returns {hf-name -> {:wp :da :db :aq :bq :in :out}}. Parallel over weights (the tied
-  vocab×d_model lm-head is the long pole)."
+  Returns {hf-name -> {:wp :da :db :aq :bq :in :out}}. EAGER and memory-bounded:
+  strictly one tensor at a time, so peak heap = the source f32 weight (+ its padded
+  copy for the tied vocab×d_model lm-head) + one packed result — NOT one per pmap
+  chunk (the previous chunked-lazy pmap realized up to 32 quantize jobs at once and
+  drove multi-GB heap spikes at bind time)."
   [m]
   (let [desc (:desc m)
-        names+shapes (concat
-                      (for [role (:global-linear-roles desc)]
-                        [(dec/role-name desc role nil) (#'dec/linear-shape m role)])
-                      (for [l (range (:n-layers m)) role (:linear-roles desc)]
-                        [(dec/role-name desc role l) (#'dec/linear-shape m role)]))]
-    (into {} (pmap (fn [[nm [in out]]]
-                     [nm (q4k-of (:data (get (:weights m) nm)) out in)])
-                   names+shapes))))
+        names+shapes (vec (concat
+                           (for [role (:global-linear-roles desc)]
+                             [(dec/role-name desc role nil) (#'dec/linear-shape m role)])
+                           (for [l (range (:n-layers m)) role (:linear-roles desc)]
+                             [(dec/role-name desc role l) (#'dec/linear-shape m role)])))]
+    (persistent!
+     (reduce (fn [acc [nm [in out]]]
+               (assoc! acc nm (qpack/q4k-of (:data (get (:weights m) nm)) out in)))
+             (transient {})
+             names+shapes))))
 
-;; ---------------------------------------------------------------------------
-;; Gemma-3 decoder layer + head (PHASE 1: literal; matches arch.gemma3 flags)
-;; Ported verbatim from the validated /tmp gcl2! / gcomp-head! (oracle 236761).
-;; Device-side pos: rope/kv/attention read pos & cache_len from 1-elem device buffers.
-;; ---------------------------------------------------------------------------
-
-(raster.core/deftm gemma-layer!
-  [r-in :- (Array float) inln :- (Array float) qln :- (Array float) kln :- (Array float)
-   paln :- (Array float) pfln :- (Array float) pffln :- (Array float)
-   wqp :- (Array int) wqda :- (Array float) wqdb :- (Array float) wqaq :- (Array byte) wqbq :- (Array byte)
-   wkp :- (Array int) wkda :- (Array float) wkdb :- (Array float) wkaq :- (Array byte) wkbq :- (Array byte)
-   wvp :- (Array int) wvda :- (Array float) wvdb :- (Array float) wvaq :- (Array byte) wvbq :- (Array byte)
-   wop :- (Array int) woda :- (Array float) wodb :- (Array float) woaq :- (Array byte) wobq :- (Array byte)
-   wgp :- (Array int) wgda :- (Array float) wgdb :- (Array float) wgaq :- (Array byte) wgbq :- (Array byte)
-   wup :- (Array int) wuda :- (Array float) wudb :- (Array float) wuaq :- (Array byte) wubq :- (Array byte)
-   wdp :- (Array int) wdda :- (Array float) wddb :- (Array float) wdaq :- (Array byte) wdbq :- (Array byte)
-   kc :- (Array float) vc :- (Array float)
-   h :- (Array float) qinp :- (Array int) qins :- (Array float) qinb :- (Array int)
-   q :- (Array float) k :- (Array float) v :- (Array float) qn :- (Array float) kn :- (Array float)
-   qr :- (Array float) kr :- (Array float) sc :- (Array float) at :- (Array float)
-   qap :- (Array int) qas :- (Array float) qab :- (Array int)
-   o :- (Array float) o2 :- (Array float) xmid :- (Array float)
-   f :- (Array float) qfp :- (Array int) qfs :- (Array float) qfb :- (Array int)
-   gate :- (Array float) up :- (Array float) hh :- (Array float)
-   qhp :- (Array int) qhs :- (Array float) qhb :- (Array int)
-   down :- (Array float) down2 :- (Array float) r-out :- (Array float)
-   posbuf :- (Array long) clenbuf :- (Array long) submax :- (Array float)
-   maxpos :- Long eps :- Double theta :- Double scale :- Double] :- Void
-  (do
-    (nn/rms-norm! r-in inln h 1 640 eps 1.0)
-    (qk/quant-act-q8k-gpu! h qinp qins qinb submax 3)
-    (qk/qmatmul-q4k-dp4a! qinp qins qinb wqp wqda wqdb wqaq wqbq q 768 1024)
-    (qk/qmatmul-q4k-dp4a! qinp qins qinb wkp wkda wkdb wkaq wkbq k 768 256)
-    (qk/qmatmul-q4k-dp4a! qinp qins qinb wvp wvda wvdb wvaq wvbq v 768 256)
-    (nn/rms-norm! q qln qn 4 256 eps 1.0)
-    (nn/rms-norm! k kln kn 1 256 eps 1.0)
-    (attn/rope-pos-buf! qn qr 4 256 theta posbuf)
-    (attn/rope-pos-buf! kn kr 1 256 theta posbuf)
-    (attn/kv-append-buf! kr kc 256 posbuf)
-    (attn/kv-append-buf! v vc 256 posbuf)
-    (attn/gqa-decode-attention-buf! qr kc vc at sc clenbuf 4 4 1 256 maxpos (float scale))
-    (qk/quant-act-q8k-gpu! at qap qas qab submax 4)
-    (qk/qmatmul-q4k-dp4a! qap qas qab wop woda wodb woaq wobq o 1024 640)
-    (nn/rms-norm! o paln o2 1 640 eps 1.0)
-    (nn/residual-add! r-in o2 xmid 640)
-    (nn/rms-norm! xmid pfln f 1 640 eps 1.0)
-    (qk/quant-act-q8k-gpu! f qfp qfs qfb submax 3)
-    (qk/qmatmul-q4k-dp4a! qfp qfs qfb wgp wgda wgdb wgaq wgbq gate 768 2048)
-    (qk/qmatmul-q4k-dp4a! qfp qfs qfb wup wuda wudb wuaq wubq up 768 2048)
-    (nn/gelu-mul! gate up hh 2048)
-    (qk/quant-act-q8k-gpu! hh qhp qhs qhb submax 8)
-    (qk/qmatmul-q4k-dp4a! qhp qhs qhb wdp wdda wddb wdaq wdbq down 2048 640)
-    (nn/rms-norm! down pffln down2 1 640 eps 1.0)
-    (nn/residual-add! xmid down2 r-out 640)))
-
-(raster.core/deftm gemma-head!
-  [r-fin :- (Array float) finalln :- (Array float) fh :- (Array float)
-   hqp :- (Array int) hqs :- (Array float) hqb :- (Array int) submax :- (Array float)
-   lmp :- (Array int) lmda :- (Array float) lmdb :- (Array float) lmaq :- (Array byte) lmbq :- (Array byte)
-   logits :- (Array float) eps :- Double] :- Void
-  (do
-    (nn/rms-norm! r-fin finalln fh 1 640 eps 1.0)
-    (qk/quant-act-q8k-gpu! fh hqp hqs hqb submax 3)
-    (qk/qmatmul-q4k-dp4a! hqp hqs hqb lmp lmda lmdb lmaq lmbq logits 768 262144)))
-
-;; ---------------------------------------------------------------------------
-;; Stage A: functional single-row rms (par/reduce + par/map) drop-in for nn/rms-norm!.
-;; Same Void signature; the reduce result is realized as a resident 1-elem buffer and its scalar
-;; chain (inv) is fused into the consuming map — 4x better occupancy than map-void!'s 1-work-item
-;; serial reduce. ROWS is ignored (single-row only; q-norm's rows=4 keeps nn/rms-norm!).
-;; ---------------------------------------------------------------------------
-
-(raster.core/deftm rms-norm-fn!
-  [x :- (Array float) weight :- (Array float) out :- (Array float)
-   rows :- Long features :- Long eps :- Double gain :- Double] :- Void
-  ;; Consistent-float: this is a float GPU kernel, so the reduce accumulator and
-  ;; every FP scalar must be float. Threading double eps/gain/literals through it
-  ;; leaves raster.numeric ops undevirtualized (float×double has no monomorphic
-  ;; overload) → on GPU that can't lower to C → garbage tokens. Cast them to float.
-  (let [ss  (raster.par/reduce acc (float 0.0) i features
-              (raster.numeric/+ acc (raster.numeric/* (raster.arrays/aget x i)
-                                                      (raster.arrays/aget x i))))
-        inv (raster.numeric// (float 1.0) (raster.numeric/sqrt
-                                   (raster.numeric/+ (raster.numeric// ss (float features)) (float eps))))]
-    (raster.par/map-void! j features
-      (raster.arrays/aset out j
-        (raster.numeric/* (raster.numeric/* (raster.arrays/aget x j) inv)
-                          (raster.numeric/+ (float gain) (raster.arrays/aget weight j)))))))
-
-(raster.core/deftm gemma-layer-fn!
-  [r-in :- (Array float) inln :- (Array float) qln :- (Array float) kln :- (Array float)
-   paln :- (Array float) pfln :- (Array float) pffln :- (Array float)
-   wqp :- (Array int) wqda :- (Array float) wqdb :- (Array float) wqaq :- (Array byte) wqbq :- (Array byte)
-   wkp :- (Array int) wkda :- (Array float) wkdb :- (Array float) wkaq :- (Array byte) wkbq :- (Array byte)
-   wvp :- (Array int) wvda :- (Array float) wvdb :- (Array float) wvaq :- (Array byte) wvbq :- (Array byte)
-   wop :- (Array int) woda :- (Array float) wodb :- (Array float) woaq :- (Array byte) wobq :- (Array byte)
-   wgp :- (Array int) wgda :- (Array float) wgdb :- (Array float) wgaq :- (Array byte) wgbq :- (Array byte)
-   wup :- (Array int) wuda :- (Array float) wudb :- (Array float) wuaq :- (Array byte) wubq :- (Array byte)
-   wdp :- (Array int) wdda :- (Array float) wddb :- (Array float) wdaq :- (Array byte) wdbq :- (Array byte)
-   kc :- (Array float) vc :- (Array float)
-   h :- (Array float) qinp :- (Array int) qins :- (Array float) qinb :- (Array int)
-   q :- (Array float) k :- (Array float) v :- (Array float) qn :- (Array float) kn :- (Array float)
-   qr :- (Array float) kr :- (Array float) sc :- (Array float) at :- (Array float)
-   qap :- (Array int) qas :- (Array float) qab :- (Array int)
-   o :- (Array float) o2 :- (Array float) xmid :- (Array float)
-   f :- (Array float) qfp :- (Array int) qfs :- (Array float) qfb :- (Array int)
-   gate :- (Array float) up :- (Array float) hh :- (Array float)
-   qhp :- (Array int) qhs :- (Array float) qhb :- (Array int)
-   down :- (Array float) down2 :- (Array float) r-out :- (Array float)
-   posbuf :- (Array long) clenbuf :- (Array long) submax :- (Array float)
-   maxpos :- Long eps :- Double theta :- Double scale :- Double] :- Void
-  (do
-    (rms-norm-fn! r-in inln h 1 640 eps 1.0)               ;; Stage A
-    (qk/quant-act-q8k-gpu! h qinp qins qinb submax 3)
-    (qk/qmatmul-q4k-dp4a! qinp qins qinb wqp wqda wqdb wqaq wqbq q 768 1024)
-    (qk/qmatmul-q4k-dp4a! qinp qins qinb wkp wkda wkdb wkaq wkbq k 768 256)
-    (qk/qmatmul-q4k-dp4a! qinp qins qinb wvp wvda wvdb wvaq wvbq v 768 256)
-    (nn/rms-norm! q qln qn 4 256 eps 1.0)                  ;; rows=4 → keep map-void
-    (rms-norm-fn! k kln kn 1 256 eps 1.0)                  ;; Stage A
-    (attn/rope-pos-buf! qn qr 4 256 theta posbuf)
-    (attn/rope-pos-buf! kn kr 1 256 theta posbuf)
-    (attn/kv-append-buf! kr kc 256 posbuf)
-    (attn/kv-append-buf! v vc 256 posbuf)
-    (attn/gqa-decode-attention-buf! qr kc vc at sc clenbuf 4 4 1 256 maxpos (float scale))
-    (qk/quant-act-q8k-gpu! at qap qas qab submax 4)
-    (qk/qmatmul-q4k-dp4a! qap qas qab wop woda wodb woaq wobq o 1024 640)
-    (rms-norm-fn! o paln o2 1 640 eps 1.0)                 ;; Stage A
-    (nn/residual-add! r-in o2 xmid 640)
-    (rms-norm-fn! xmid pfln f 1 640 eps 1.0)               ;; Stage A
-    (qk/quant-act-q8k-gpu! f qfp qfs qfb submax 3)
-    (qk/qmatmul-q4k-dp4a! qfp qfs qfb wgp wgda wgdb wgaq wgbq gate 768 2048)
-    (qk/qmatmul-q4k-dp4a! qfp qfs qfb wup wuda wudb wuaq wubq up 768 2048)
-    (nn/gelu-mul! gate up hh 2048)
-    (qk/quant-act-q8k-gpu! hh qhp qhs qhb submax 8)
-    (qk/qmatmul-q4k-dp4a! qhp qhs qhb wdp wdda wddb wdaq wdbq down 2048 640)
-    (rms-norm-fn! down pffln down2 1 640 eps 1.0)          ;; Stage A
-    (nn/residual-add! xmid down2 r-out 640)))
+;; The hand-written gemma-3-270m layer/head deftms (gemma-layer!/gemma-layer-fn!/
+;; gemma-head!, ported from the validated /tmp gcl2!/gcomp-head!, oracle 236761)
+;; were dead in production — bind-decode! only ever uses the generated gen-layer!/
+;; gen-head! — and now live as the frozen oracle fixture in
+;; pretrained.decoder-gpu-oracle-test, which enforces that the generated layer
+;; reproduces them bit-exactly.
 
 ;; ---------------------------------------------------------------------------
 ;; On-device decode tail: argmax(logits) → tokbuf, embedding gather → next r0.
@@ -240,11 +89,12 @@
     out))
 
 ;; ---------------------------------------------------------------------------
-;; PHASE 2: descriptor-GENERATED layer + head. The layer deftm is emitted from the
+;; Descriptor-GENERATED layer + head. The layer deftm is emitted from the
 ;; model's descriptor flags (qk-norm / sandwich-norms / geglu|swiglu) + dims and
 ;; eval'd once per (arch, dims, rms-style) — Julia-style per-config specialization
-;; (dims as literals, so kernels constant-fold). Anchor: the gemma-3-270m generated
-;; layer reproduces the hand-written gemma-layer!/-fn! token-exactly.
+;; (dims as literals, so kernels constant-fold). Oracle: the gemma-3-270m generated
+;; layer/head reproduce the validated hand-written fixture bit-exactly — enforced
+;; by pretrained.decoder-gpu-oracle-test.
 ;; Distinct names per config avoid the deftm stale-arity reload trap.
 ;; ---------------------------------------------------------------------------
 
@@ -254,7 +104,7 @@
   (let [d (long (:d-model m)) dff (long (:d-ff m))
         nq (long (:n-q m)) nkv (long (:n-kv m)) hd (long (:head-dim m))
         qd (* nq hd) kvrow (* nkv hd)
-        dp (nextpad d) qdp (nextpad qd) dffp (nextpad dff)]
+        dp (qpack/nextpad d) qdp (qpack/nextpad qd) dffp (qpack/nextpad dff)]
     {:d d :dff dff :nq nq :nkv nkv :hd hd :qd qd :kvrow kvrow
      :dp dp :qdp qdp :dffp dffp
      :nsb-d (quot dp 256) :nsb-qd (quot qdp 256) :nsb-dff (quot dffp 256)
@@ -280,7 +130,7 @@
         go (double (get-in flags [:norm :gain-offset] 0.0))
         rms1 (fn [x w out]
                (if (= rms-style :fn)
-                 (list 'rms-norm-fn! x w out 1 d 'eps go)
+                 (list 'nn/rms-norm-1row! x w out d 'eps go)
                  (list 'nn/rms-norm! x w out 1 d 'eps go)))
         params (vec (concat
                      ['r-in :- (af :f) 'inln :- (af :f)]
@@ -318,7 +168,7 @@
                (list 'qk/qmatmul-q4k-dp4a! 'qinp 'qins 'qinb 'wvp 'wvda 'wvdb 'wvaq 'wvbq 'v dp kvrow)
                (when qk? (list 'nn/rms-norm! 'q 'qln 'qn nq hd 'eps go))
                (when qk? (if (and (= rms-style :fn) (= nkv 1))
-                           (list 'rms-norm-fn! 'k 'kln 'kn 1 hd 'eps go)
+                           (list 'nn/rms-norm-1row! 'k 'kln 'kn hd 'eps go)
                            (list 'nn/rms-norm! 'k 'kln 'kn nkv hd 'eps go)))
                (list 'attn/rope-pos-buf! (if qk? 'qn 'q) 'qr nq hd 'theta 'posbuf)
                (list 'attn/rope-pos-buf! (if qk? 'kn 'k) 'kr nkv hd 'theta 'posbuf)
@@ -526,46 +376,21 @@
 ;; final-norm + last-token pooling + L2 (a d-float job).
 ;; ---------------------------------------------------------------------------
 
-(defn quantize-one-q8
-  "Signed q8_0 quantize+pack ONE row-major [out,in] weight: per-32 block
-  d = max|w|/127, q in [-127,127], 4 bytes/int32 → {:wp :ws :in :out}.
-  in must be %32. Shared by the LM role quantizer and encoder-family towers
-  (AuT, BERT) that quantize by explicit tensor name."
-  [^floats W in out nm]
-  (assert (zero? (mod (long in) 32)) (str nm " in=" in " not %32"))
-  (let [in (long in) out (long out) nb (quot in 32)
-        wp (int-array (* out (quot in 4)))
-        ws (float-array (* out nb))]
-    (dotimes [o out]
-      (dotimes [b nb]
-        (let [base (+ (* o in) (* b 32))
-              mx (loop [k 0 mm 0.0]
-                   (if (< k 32)
-                     (recur (inc k) (max mm (Math/abs (double (aget W (+ base k))))))
-                     mm))
-              d (/ mx 127.0) id (if (pos? d) (/ 1.0 d) 0.0)]
-          (aset ws (+ (* o nb) b) (float d))
-          (dotimes [w 8]
-            (let [e (+ base (* w 4))
-                  q (fn [i] (bit-and (long (Math/round (* (aget W (+ e i)) id))) 0xFF))]
-              (aset wp (+ (* o (quot in 4)) (* b 8) w)
-                    (unchecked-int (bit-or (q 0) (bit-shift-left (q 1) 8)
-                                           (bit-shift-left (q 2) 16)
-                                           (bit-shift-left (q 3) 24)))))))))
-    {:wp wp :ws ws :in in :out out}))
-
 (defn quantize-q8s
-  "Signed q8_0 quantize+pack every linear-role weight: row-major, per-32 block
-  d = max|w|/127, q in [-127,127], 4 bytes/int32. {hf-name -> {:wp :ws :in :out}}.
-  Requires in % 32 == 0 (all supported dims are)."
+  "Signed q8_0 quantize+pack every linear-role weight (raster.quant.pack/quantize-one-q8:
+  row-major, per-32 block d = max|w|/127, q in [-127,127], 4 bytes/int32).
+  {hf-name -> {:wp :ws :in :out}}. Requires in % 32 == 0 (all supported dims are).
+  EAGER and memory-bounded: strictly one tensor at a time (no chunked-lazy pmap
+  realizing dozens of packed weights at once)."
   [m]
   (let [desc (:desc m)
-        names+shapes (concat
-                      (for [l (range (:n-layers m)) role (:linear-roles desc)]
-                        [(dec/role-name desc role l) (#'dec/linear-shape m role)]))]
-    (into {} (pmap (fn [[nm [in out]]]
-                     [nm (quantize-one-q8 (:data (get (:weights m) nm)) in out nm)])
-                   names+shapes))))
+        names+shapes (vec (for [l (range (:n-layers m)) role (:linear-roles desc)]
+                            [(dec/role-name desc role l) (#'dec/linear-shape m role)]))]
+    (persistent!
+     (reduce (fn [acc [nm [in out]]]
+               (assoc! acc nm (qpack/quantize-one-q8 (:data (get (:weights m) nm)) in out nm)))
+             (transient {})
+             names+shapes))))
 
 (defn- embed-layer-form
   "Generated PREFILL layer deftm: flags decide qk-norm/sandwich/act (as gen-layer!),
@@ -684,6 +509,13 @@
   T-sized resident buffers. Returns {:sess :model :T}. Replay per text via embed-gpu."
   [m & {:keys [T qw] :or {T 128}}]
   (let [eps (:eps m) scale (:attn-scale m)
+        ;; The symmetric-window mask kernel now exists on the substrate:
+        ;; attn/attn-prefill-scores-windowed! (validated GPU-resident, left =
+        ;; right = w gives |i-j| < w). Closing this assert means gen-embed-layer!
+        ;; must pick windowed vs bidir PER LAYER (EmbeddingGemma alternates
+        ;; sliding/global layers) and thread the two window scalars through the
+        ;; generated program + revalidate the GPU embedder anchor at T > 512 —
+        ;; left for a dedicated pass.
         _ (when (get-in m [:desc :flags :bidirectional?])
             (when-let [w (get-in m [:desc :flags :sliding-window :size])]
               (assert (<= (long T) (long w))
@@ -750,19 +582,12 @@
   ^floats [model ^floats rf n]
   (let [d (long (:d-model model))
         base (* (dec (long n)) d)
-          ^floats fln (:data (get (:weights model) (dec/role-name (:desc model) :final-norm nil)))
-          go (double (get-in model [:desc :flags :norm :gain-offset] 0.0))
-          eps (double (:eps model))
-          ms (loop [i 0 s 0.0]
-               (if (< i d) (recur (inc i) (+ s (let [v (double (aget rf (+ base i)))] (* v v)))) s))
-          inv (/ 1.0 (Math/sqrt (+ (/ ms d) eps)))
-          e (float-array d)]
-      (dotimes [i d]
-        (aset e i (float (* (aget rf (+ base i)) inv (+ go (aget fln i))))))
-      (let [ss (loop [i 0 s 0.0] (if (< i d) (recur (inc i) (+ s (let [v (double (aget e i))] (* v v)))) s))
-            l2 (/ 1.0 (Math/sqrt ss))]
-        (dotimes [i d] (aset e i (float (* (aget e i) l2)))))
-      e))
+        ^floats fln (:data (get (:weights model) (dec/role-name (:desc model) :final-norm nil)))
+        go (double (get-in model [:desc :flags :norm :gain-offset] 0.0))
+        eps (double (:eps model))
+        row (java.util.Arrays/copyOfRange rf (int base) (int (+ base d)))
+        ^floats e (nn/rms-norm row fln 1 d eps go)]
+    (nn/l2-normalize! e d)))
 
 (defn load-dense-head
   "Load the sentence-transformers Dense projection weights (2_Dense/3_Dense
@@ -794,22 +619,11 @@
         ^floats fln (:data (get (:weights model) (dec/role-name (:desc model) :final-norm nil)))
         go (double (get-in model [:desc :flags :norm :gain-offset] 0.0))
         eps (double (:eps model))
-        pooled (float-array d)]
-    (dotimes [r n]
-      (let [base (* r d)
-            ms (loop [i 0 s 0.0]
-                 (if (< i d) (recur (inc i) (+ s (let [v (double (aget rf (+ base i)))] (* v v)))) s))
-            inv (/ 1.0 (Math/sqrt (+ (/ ms d) eps)))]
-        (dotimes [i d]
-          (aset pooled i (float (+ (aget pooled i)
-                                   (/ (* (aget rf (+ base i)) inv (+ go (aget fln i)))
-                                      (double n))))))))
-    (let [^floats e (reduce (fn [^floats x head] (dense-apply head x)) pooled (:dense model))
-          dd (alength e)
-          ss (loop [i 0 s 0.0] (if (< i dd) (recur (inc i) (+ s (let [v (double (aget e i))] (* v v)))) s))
-          l2 (/ 1.0 (Math/sqrt ss))]
-      (dotimes [i dd] (aset e i (float (* (aget e i) l2))))
-      e)))
+        ^floats normed (nn/rms-norm (java.util.Arrays/copyOfRange rf 0 (int (* n d)))
+                                    fln n d eps go)
+        ^floats pooled (nn/mean-pool normed n d)
+        ^floats e (reduce (fn [^floats x head] (dense-apply head x)) pooled (:dense model))]
+    (nn/l2-normalize! e (long (alength e)))))
 
 (defn bind-decode!
   "Compile the layer + head programs, Q4K-quantize the weights, allocate resident buffers, bind
@@ -953,8 +767,6 @@
     (gpu/upload! sess :pr0 rows)
     (gpu/replay! sess :prefill)))
 
-(declare argmax)
-
 (defn decode-row!
   "One resident-decode step from an ARBITRARY input row (float[d-model]): write absolute
   `pos` + the row, replay the graph, return the logits (float[vocab]). This is the
@@ -1010,7 +822,7 @@
     (doseq [p (range p0)] (decode-token! dstate (nth prompt p) p)) ;; prime prompt
     (loop [p p0 tok (last prompt) out []]
       (if (< (count out) n)
-        (let [nt (argmax (decode-token! dstate tok p))]
+        (let [nt (arr/argmax (decode-token! dstate tok p))]
           (recur (inc p) nt (conj out nt)))
         out))))
 
@@ -1036,9 +848,3 @@
               (if (contains? eos-ids t) out (recur (inc p) out))))
         out))))
 
-(defn argmax ^long [^floats a]
-  (let [n (alength a)]
-    (loop [i 1 mi 0 mv (aget a 0)]
-      (if (< i n)
-        (if (> (aget a i) mv) (recur (inc i) i (aget a i)) (recur (inc i) mi mv))
-        mi))))

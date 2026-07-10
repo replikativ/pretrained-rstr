@@ -15,10 +15,13 @@
             [pretrained.audio :as audio]
             [pretrained.decoder :as dec]
             [pretrained.decoder-gpu :as dgpu]
+            [raster.quant.pack :as qpack]
             [raster.gpu.core :as gpu]
             [pretrained.loader :as loader]
             [pretrained.arch.qwen3 :as qwen3]
+            [raster.arrays :as arr]
             [raster.dl.nn :as nn]
+            [raster.dl.attention :as attn]
             [clojure.string :as str]
             [clojure.data.json :as json]))
 
@@ -156,44 +159,9 @@
 ;; AuT conv stem: per-100-frame chunk, channels-last conv2d 3x3 s2 p1 ×3
 ;; ---------------------------------------------------------------------------
 
-(defn- permute-conv-w
-  "torch [cout,cin,3,3] → channels-last [cout, 3*3*cin] (kh,kw,cin order)."
-  ^floats [^floats w cout cin]
-  (let [out (float-array (alength w))]
-    (dotimes [o (long cout)]
-      (dotimes [ci (long cin)]
-        (dotimes [kh 3]
-          (dotimes [kw 3]
-            (aset out (+ (* o (* 9 (long cin))) (* kh (* 3 (long cin))) (* kw (long cin)) ci)
-                  (aget w (+ (* o (* 9 (long cin))) (* ci 9) (* kh 3) kw)))))))
-    out))
-
-(defn- conv2d-s2
-  "Channels-last conv 3x3 stride 2 pad 1: x [H,W,cin] → [H',W',cout], H'=ceil(H/2)."
-  ^floats [^floats x ^floats wperm ^floats b H W cin cout]
-  (let [H (long H) W (long W) cin (long cin) cout (long cout)
-        H2 (quot (inc H) 2) W2 (quot (inc W) 2)
-        cols (float-array (* H2 W2 9 cin))]
-    (dotimes [oh H2]
-      (dotimes [ow W2]
-        (let [row (* (+ (* oh W2) ow) (* 9 cin))]
-          (dotimes [kh 3]
-            (dotimes [kw 3]
-              (let [ih (+ (* 2 oh) (dec kh)) iw (+ (* 2 ow) (dec kw))]
-                (when (and (>= ih 0) (< ih H) (>= iw 0) (< iw W))
-                  (System/arraycopy x (* (+ (* ih W) iw) cin)
-                                    cols (+ row (* kh 3 cin) (* kw cin)) cin))))))))
-    (nn/linear cols wperm b (* H2 W2) (* 9 cin) cout)))
-
 (defn- gelu! ^floats [^floats x]
-  (dotimes [i (alength x)]
-    (let [v (double (aget x i))
-          ;; erf via A&S 7.1.26
-          z (/ v (Math/sqrt 2.0)) az (Math/abs z)
-          tt (/ 1.0 (+ 1.0 (* 0.3275911 az)))
-          e (- 1.0 (* tt (+ 0.254829592 (* tt (+ -0.284496736 (* tt (+ 1.421413741 (* tt (+ -1.453152027 (* tt 1.061405429)))))))) (Math/exp (- (* az az)))))
-          erf (if (neg? z) (- e) e)]
-      (aset x i (float (* 0.5 v (+ 1.0 erf))))))
+  ;; erf-exact GELU (A&S 7.1.26) — the substrate kernel, in place.
+  (nn/gelu-erf! x x (long (alength x)))
   x)
 
 (def ^:private pe13
@@ -208,34 +176,39 @@
            pe)))
 
 (defn conv-stem
-  "mel [T,128] (T%100=0) → tokens [ (T/100)*13, 896 ] with per-chunk PE."
+  "mel [T,128] (T%100=0) → tokens [ (T/100)*13, 896 ] with per-chunk PE.
+  Substrate-composed: three nn/conv2d (channel-first [1,C,H,W], 3x3 stride 2
+  pad 1) — torch [cout,cin,3,3] weights are used AS-IS (nn/conv2d's im2col row
+  order IS the contiguous torch layout; the old channels-last path had to
+  permute them at load)."
   [m ^floats mel T]
   (let [d (long (get-in m [:audio :d]))
-        w1 (permute-conv-w (t m "audio_tower.conv2d1.weight") 480 1)
-        w2 (permute-conv-w (t m "audio_tower.conv2d2.weight") 480 480)
-        w3 (permute-conv-w (t m "audio_tower.conv2d3.weight") 480 480)
+        w1 (t m "audio_tower.conv2d1.weight")
+        w2 (t m "audio_tower.conv2d2.weight")
+        w3 (t m "audio_tower.conv2d3.weight")
         b1 (t m "audio_tower.conv2d1.bias") b2 (t m "audio_tower.conv2d2.bias") b3 (t m "audio_tower.conv2d3.bias")
         wout (t m "audio_tower.conv_out.weight")
         nchunks (quot (long T) 100)
         out (float-array (* nchunks 13 d))
         ^floats pe @pe13]
     (dotimes [ch nchunks]
-      ;; chunk [128,100] channels-last [H=128, W=100, cin=1]
+      ;; chunk [128,100]: with cin=1, [H=128,W=100] is the same array
+      ;; channel-first [1,1,128,100]
       (let [cx (float-array (* 128 100))
             _ (dotimes [f 100]
                 (dotimes [b 128]
-                  (aset cx (+ (* b 100) f)                 ;; [h=b, w=f, c=0]
+                  (aset cx (+ (* b 100) f)                 ;; [h=b, w=f]
                         (aget mel (+ (* (+ (* ch 100) f) 128) b)))))
-            c1 (gelu! (conv2d-s2 cx w1 b1 128 100 1 480))       ;; [64,50,480]
-            c2 (gelu! (conv2d-s2 c1 w2 b2 64 50 480 480))       ;; [32,25,480]
-            c3 (gelu! (conv2d-s2 c2 w3 b3 32 25 480 480))       ;; [16,13,480]
-            ;; flatten to [13, 480*16] with feature index c*16 + h
+            c1 (gelu! (nn/conv2d cx w1 b1 1 1 128 100 480 3 3 2 2 1 1))    ;; [1,480,64,50]
+            c2 (gelu! (nn/conv2d c1 w2 b2 1 480 64 50 480 3 3 2 2 1 1))    ;; [1,480,32,25]
+            c3 (gelu! (nn/conv2d c2 w3 b3 1 480 32 25 480 3 3 2 2 1 1))    ;; [1,480,16,13]
+            ;; flatten [480,16,13] channel-first to [13, 480*16], feature = c*16 + h
             flat (float-array (* 13 7680))
             _ (dotimes [w* 13]
                 (dotimes [h 16]
                   (dotimes [c 480]
                     (aset flat (+ (* w* 7680) (* c 16) h)
-                          (aget ^floats c3 (+ (* (+ (* h 13) w*) 480) c))))))
+                          (aget ^floats c3 (+ (* c 208) (* h 13) w*))))))
             tok (nn/linear flat wout (float-array d) 13 7680 d)]
         (dotimes [i (* 13 (int d))]
           (aset out (+ (* ch 13 (int d)) i)
@@ -247,51 +220,36 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- layer-norm-b
-  "Standard biased LayerNorm over rows."
+  "Standard biased LayerNorm over rows (raster.dl.nn/layer-norm, eps 1e-5)."
   ^floats [^floats x ^floats w ^floats b rows d]
-  (let [rows (long rows) d (long d) out (float-array (* rows d))]
-    (dotimes [r rows]
-      (let [base (* r d)
-            mean (/ (loop [i 0 s 0.0] (if (< i d) (recur (inc i) (+ s (aget x (+ base i)))) s)) d)
-            var (/ (loop [i 0 s 0.0]
-                     (if (< i d) (recur (inc i) (let [v (- (aget x (+ base i)) mean)] (+ s (* v v)))) s)) d)
-            inv (/ 1.0 (Math/sqrt (+ var 1e-5)))]
-        (dotimes [i d]
-          (aset out (+ base i) (float (+ (* (- (aget x (+ base i)) mean) inv (aget w i)) (aget b i)))))))
-    out))
+  (nn/layer-norm x w b (long rows) (long d) 1e-5))
 
 (defn- block-attention
-  "Dense bidirectional MHA within consecutive blocks of `win` tokens."
+  "Dense bidirectional MHA within consecutive blocks of `win` tokens — per block
+  the same substrate composition the GPU path runs (scores-bidir! → softmax! →
+  out!, MHA as GQA group 1). Blocks are contiguous row slices."
   ^floats [^floats q ^floats k ^floats v T heads hd win]
   (let [T (long T) heads (long heads) hd (long hd) win (long win)
-        dim (* heads hd) scale (/ 1.0 (Math/sqrt (double hd)))
-        out (float-array (* T dim)) scores (float-array T)]
-    (dotimes [i T]
-      (let [b0 (* win (quot i win)) b1 (min (dec T) (dec (+ b0 win)))]
-        (dotimes [h heads]
-          (let [qb (+ (* i dim) (* h hd))
-                mx (loop [j b0 mx -1.0e30]
-                     (if (<= j b1)
-                       (let [s (* scale (loop [dd 0 acc 0.0]
-                                          (if (< dd hd)
-                                            (recur (inc dd) (+ acc (* (aget q (+ qb dd)) (aget k (+ (* j dim) (* h hd) dd)))))
-                                            acc)))]
-                         (aset scores j (float s)) (recur (inc j) (max mx s)))
-                       mx))
-                sum (loop [j b0 s 0.0]
-                      (if (<= j b1)
-                        (let [e (Math/exp (- (aget scores j) mx))] (aset scores j (float e)) (recur (inc j) (+ s e)))
-                        s))]
-            (dotimes [dd hd]
-              (aset out (+ (* i dim) (* h hd) dd)
-                    (float (/ (loop [j b0 acc 0.0]
-                                (if (<= j b1)
-                                  (recur (inc j) (+ acc (* (aget scores j) (aget v (+ (* j dim) (* h hd) dd)))))
-                                  acc)) sum))))))))
+        dim (* heads hd)
+        scale (/ 1.0 (Math/sqrt (double hd)))
+        out (float-array (* T dim))]
+    (loop [b0 0]
+      (when (< b0 T)
+        (let [bt (min win (- T b0))
+              qs (java.util.Arrays/copyOfRange q (* b0 dim) (* (+ b0 bt) dim))
+              ks (java.util.Arrays/copyOfRange k (* b0 dim) (* (+ b0 bt) dim))
+              vs (java.util.Arrays/copyOfRange v (* b0 dim) (* (+ b0 bt) dim))
+              sc (float-array (* bt heads bt))
+              ob (float-array (* bt dim))]
+          (attn/attn-prefill-scores-bidir! qs ks sc bt heads 1 heads hd scale)
+          (attn/attn-prefill-softmax! sc bt heads)
+          (attn/attn-prefill-out! sc vs ob bt heads 1 heads hd)
+          (System/arraycopy ob 0 out (* b0 dim) (* bt dim))
+          (recur (+ b0 win)))))
     out))
 
 (defn- add2! ^floats [^floats a ^floats b]
-  (dotimes [i (alength a)] (aset a i (float (+ (aget a i) (aget b i))))) a)
+  (nn/residual-add! a b a (long (alength a))) a)
 
 (defn aut-encode
   "Conv-stem tokens [T,896] → projected audio embeddings [T, out-dim]."
@@ -394,11 +352,7 @@
      (let [out (loop [ids [] pos (dec P) tok* (peek prompt) n 0]
                  (let [h (dec/decode-step m tok* pos kc vc)
                        logits (dec/lm-logits m h)
-                       nxt (loop [i 1 best 0 bv -1.0e30]
-                             (if (< i (long (:vocab m)))
-                               (let [v (aget ^floats logits i)]
-                                 (if (> v bv) (recur (inc i) i (double v)) (recur (inc i) best bv)))
-                               best))]
+                       nxt (long (arr/argmax logits))]
                    (if (or (= nxt IM-END) (= nxt EOT) (>= n max-new))
                      ids
                      (recur (conj ids nxt) (inc pos) nxt (inc n)))))
@@ -464,7 +418,7 @@
          (list 'qk/quant-act-i8-rows-gpu! 'h2 'fp 'fs d T)
          (list 'qk/qmatmul-i8-gemm! 'fp 'fs 'wf1p 'wf1s 'g1 d ffn T)
          (list 'nn/add-bias-rows! 'g1 'bf1 'g1b T ffn)
-         (list 'nn/gelu! 'g1b 'gel (* T ffn))
+         (list 'nn/gelu-erf! 'g1b 'gel (* T ffn))   ;; erf-exact (matches CPU/torch)
          (list 'qk/quant-act-i8-rows-gpu! 'gel 'gp 'gs ffn T)
          (list 'qk/qmatmul-i8-gemm! 'gp 'gs 'wf2p 'wf2s 'dn ffn d T)
          (list 'nn/add-bias-rows! 'dn 'bf2 'dnb T d)
@@ -480,21 +434,28 @@
           v))))
 
 (defn- aut-quantize
-  "Q8-pack the 18 encoder layers' six linears. {[l pl] {:wp :ws}} + biases."
+  "Q8-pack the 18 encoder layers' six linears. {[l pl] {:q {:wp :ws} :b bias}}.
+  EAGER and memory-bounded: a plain reduce packs strictly one tensor at a time.
+  (The previous chunked-lazy `for` realized a whole chunk of quantize jobs —
+  every layer's packed arrays at once — before `into` consumed any, which blew
+  the heap at 5-8g during the GPU anchor.)"
   [m]
   (let [{:keys [d ffn layers]} (:audio m)
-        spec {"q"  [(fn [p] (str p "self_attn.q_proj"))   d d]
-              "k"  [(fn [p] (str p "self_attn.k_proj"))   d d]
-              "v"  [(fn [p] (str p "self_attn.v_proj"))   d d]
-              "o"  [(fn [p] (str p "self_attn.out_proj")) d d]
-              "f1" [(fn [p] (str p "fc1"))                d ffn]
-              "f2" [(fn [p] (str p "fc2"))                ffn d]}]
-    (into {}
-          (for [l (range layers) [pl [nm-fn in out]] spec
-                :let [p (str "audio_tower.layers." l ".")
-                      base (nm-fn p)]]
-            [[l pl] {:q (dgpu/quantize-one-q8 (t m (str base ".weight")) in out base)
-                     :b (t m (str base ".bias"))}]))))
+        spec [["q"  "self_attn.q_proj"   d d]
+              ["k"  "self_attn.k_proj"   d d]
+              ["v"  "self_attn.v_proj"   d d]
+              ["o"  "self_attn.out_proj" d d]
+              ["f1" "fc1"                d ffn]
+              ["f2" "fc2"                ffn d]]]
+    (persistent!
+     (reduce
+      (fn [acc [l [pl suffix in out]]]
+        (let [base (str "audio_tower.layers." l "." suffix)]
+          (assoc! acc [l pl]
+                  {:q (qpack/quantize-one-q8 (t m (str base ".weight")) in out base)
+                   :b (t m (str base ".bias"))})))
+      (transient {})
+      (vec (for [l (range layers) s spec] [l s]))))))
 
 (defn- bind-aut!
   "Bind the 18-layer AuT block program at block size T into a fresh session.

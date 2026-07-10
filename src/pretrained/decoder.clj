@@ -18,6 +18,7 @@
   (:require [pretrained.sampling :as samp]
             [raster.dl.nn :as nn]
             [raster.dl.attention :as attn]
+            [raster.par :as par]
             [pretrained.safetensors :as st]
             [raster.quant.op :as ql]
             [raster.compiler.backend.cpu.quant :as cq]
@@ -299,43 +300,24 @@
                           ;; PROBABILITIES -> renorm -> weighted sum of expert SwiGLUs
                           (let [E (long (:experts moe)) K (long (:top-k moe)) inter (long (:inter moe))
                                 ^floats gw (raw m :moe-router l)
-                                logits (float-array E)
-                                _ (dotimes [e E]
-                                    (aset logits e
-                                          (float (loop [i 0 s 0.0]
-                                                   (if (< i (long d-model))
-                                                     (recur (inc i) (+ s (* (aget gw (+ (* e (long d-model)) i))
-                                                                            (aget ^floats f i))))
-                                                     s)))))
-                                mx (loop [e 0 mm -1.0e30] (if (< e E) (recur (inc e) (max mm (aget logits e))) mm))
-                                probs (float-array E)
-                                _ (let [z (loop [e 0 s 0.0]
-                                            (if (< e E)
-                                              (let [v (Math/exp (- (aget logits e) mx))]
-                                                (aset probs e (float v)) (recur (inc e) (+ s v)))
-                                              s))]
-                                    (dotimes [e E] (aset probs e (float (/ (aget probs e) z)))))
+                                logits (nn/linear-nb f gw 1 (long d-model) E)
+                                ^floats probs (nn/softmax-1d logits E)
                                 top (vec (take K (sort-by #(- (aget probs (int %))) (range E))))
                                 psum (if (:norm-topk? moe)
                                        (reduce (fn [s e] (+ s (double (aget probs (int e))))) 0.0 top)
-                                       1.0)
-                                acc (float-array (long d-model))]
-                            (doseq [e top]
-                              (let [w (/ (double (aget probs (int e))) psum)
-                                    g (nn/silu (qsl qm (moe-name desc :gate l e) f) inter)
-                                    u (qsl qm (moe-name desc :up l e) f)
-                                    gu (let [o (float-array inter)]
-                                         (dotimes [i inter]
-                                           (aset o i (float (* (aget ^floats g i) (aget ^floats u i))))) o)
-                                    ^floats d (qsl qm (moe-name desc :down l e) gu)]
-                                (dotimes [i (long d-model)]
-                                  (aset acc i (float (+ (aget acc i) (* w (aget d i))))))))
-                            acc)
+                                       1.0)]
+                            (reduce (fn [acc e]
+                                      (let [w (/ (double (aget probs (int e))) psum)
+                                            g (nn/silu (qsl qm (moe-name desc :gate l e) f) inter)
+                                            u (qsl qm (moe-name desc :up l e) f)
+                                            gu (nn/hadamard g u inter)
+                                            d (qsl qm (moe-name desc :down l e) gu)]
+                                        (par/axpy w d acc)))
+                                    (float-array (long d-model)) top))
                           (let [g (qsl qm (nm :ffn-gate l) f)
                                 g (if ffn-geglu? (nn/gelu g (:d-ff m)) (nn/silu g (:d-ff m)))
                                 u (qsl qm (nm :ffn-up l) f)
-                                gu (let [n (:d-ff m) o (float-array n)]
-                                     (dotimes [i n] (aset o i (float (* (aget ^floats g i) (aget ^floats u i))))) o)]
+                                gu (nn/hadamard g u (:d-ff m))]
                             (qsl qm (nm :ffn-down l) gu)))
                      dn (if sand? (nn/rms-norm dn (raw m :ffn-post-norm l) 1 d-model eps go) dn)
                      dn (tapped tap :mlp-out l dn)
@@ -436,12 +418,8 @@
         kc (vec (repeatedly n-layers #(float-array slot)))
         vc (vec (repeatedly n-layers #(float-array slot)))
         ^floats h (loop [p 0 h nil]
-                    (if (< p P) (recur (inc p) (decode-step m (nth ids p) p kc vc)) h))
-        n (alength h)
-        ss (loop [i 0 s 0.0] (if (< i n) (recur (inc i) (+ s (* (aget h i) (aget h i)))) s))
-        inv (/ 1.0 (Math/sqrt ss))]
-    (dotimes [i n] (aset h i (float (* inv (aget h i)))))
-    h))
+                    (if (< p P) (recur (inc p) (decode-step m (nth ids p) p kc vc)) h))]
+    (nn/l2-normalize! h (long (alength h)))))
 
 (defn generate-cached
   "KV-cache generation; returns the new token ids. `sampler` is a fn [logits vocab] ->
