@@ -6,10 +6,10 @@
  ;; compilable blocks + quant kernels stay in raster.
  ;;
  ;; raster is released on Clojars (Maven-resolvable; its POM declares TypedClojure).
- ;; 0.2.258 already ships the GPU decode stack (raster.gpu.*, quant.kernels-k,
+ ;; 0.2.286 ships the GPU decode stack + the typing-consolidated compiler (raster.gpu.*, quant.kernels-k,
  ;; compiler.pipeline, dl.{nn,attention}) that the GPU paths call.
  ;; The :dev alias overrides raster with the sibling checkout for local work.
- :deps {org.replikativ/raster {:mvn/version "0.2.258"}
+ :deps {org.replikativ/raster {:mvn/version "0.2.286"}
         org.clojure/data.json {:mvn/version "2.5.0"}}
 
  :aliases
