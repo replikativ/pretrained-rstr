@@ -100,22 +100,9 @@
                 (float (* (- (aget x (+ base i)) mean) inv (+ gain-offset (aget w i))))))))
     out))
 
-(defn- erf-as ^double [^double z]
-  ;; Abramowitz–Stegun 7.1.26: |abs err| <= 1.5e-7 (below f32 output resolution).
-  (let [x (Math/abs z)
-        t (/ 1.0 (+ 1.0 (* 0.3275911 x)))
-        y (- 1.0 (* t (+ 0.254829592
-                         (* t (+ -0.284496736
-                                 (* t (+ 1.421413741
-                                         (* t (+ -1.453152027 (* t 1.061405429))))))))
-              (Math/exp (- (* x x)))))]
-    (if (neg? z) (- y) y)))
-
 (defn- gelu-erf! ^floats [^floats x]
-  (let [inv-sqrt2 (/ 1.0 (Math/sqrt 2.0))]
-    (dotimes [i (alength x)]
-      (let [v (double (aget x i))]
-        (aset x i (float (* 0.5 v (+ 1.0 (erf-as (* v inv-sqrt2)))))))))
+  ;; erf-exact GELU (A&S 7.1.26) — the substrate kernel, in place.
+  (nn/gelu-erf! x x (long (alength x)))
   x)
 
 (defn- linear1
@@ -195,43 +182,19 @@
 
 (defn- windowed-attention
   "MHA with sliding window [left right]: query i attends j where
-  (0 <= i-j < left) or (0 < j-i < right). q,k,v [T, heads*hd]; returns [T, heads*hd]."
+  (0 <= i-j < left) or (0 < j-i < right). q,k,v [T, heads*hd]; returns [T, heads*hd].
+  Substrate composition (MHA as GQA group 1): windowed scores (out-of-window =
+  -1e30, exp underflows to exact 0 under the shared softmax) → softmax → out."
   ^floats [^floats q ^floats k ^floats v T heads hd left right]
   (let [T (long T) heads (long heads) hd (long hd)
-        left (long left) right (long right)
         dim (* heads hd)
-        scale (/ 1.0 (Math/sqrt (double hd)))
-        out (float-array (* T dim))
-        scores (float-array T)]
-    (dotimes [i T]
-      (let [j0 (max 0 (- i (dec left)))
-            j1 (min (dec T) (+ i (max 0 (dec right))))]     ;; inclusive range
-        (dotimes [h heads]
-          (let [qb (+ (* i dim) (* h hd))
-                mx (loop [j j0 mx -1.0e30]
-                     (if (<= j j1)
-                       (let [kb (+ (* j dim) (* h hd))
-                             s (* scale (loop [d 0 acc 0.0]
-                                          (if (< d hd)
-                                            (recur (inc d) (+ acc (* (aget q (+ qb d)) (aget k (+ kb d)))))
-                                            acc)))]
-                         (aset scores j (float s))
-                         (recur (inc j) (max mx s)))
-                       mx))
-                sum (loop [j j0 s 0.0]
-                      (if (<= j j1)
-                        (let [e (Math/exp (- (aget scores j) mx))]
-                          (aset scores j (float e))
-                          (recur (inc j) (+ s e)))
-                        s))]
-            (dotimes [d hd]
-              (aset out (+ (* i dim) (* h hd) d)
-                    (float (/ (loop [j j0 acc 0.0]
-                                (if (<= j j1)
-                                  (recur (inc j) (+ acc (* (aget scores j)
-                                                           (aget v (+ (* j dim) (* h hd) d)))))
-                                  acc))
-                              sum))))))))
+        sc (float-array (* T heads T))
+        out (float-array (* T dim))]
+    (attn/attn-prefill-scores-windowed! q k sc T heads 1 heads hd
+                                        (/ 1.0 (Math/sqrt (double hd)))
+                                        (long left) (long right))
+    (attn/attn-prefill-softmax! sc T heads)
+    (attn/attn-prefill-out! sc v out T heads 1 heads hd)
     out))
 
 (defn encode

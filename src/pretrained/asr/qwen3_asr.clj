@@ -20,6 +20,7 @@
             [pretrained.arch.qwen3 :as qwen3]
             [raster.arrays :as arr]
             [raster.dl.nn :as nn]
+            [raster.dl.attention :as attn]
             [clojure.string :as str]
             [clojure.data.json :as json]))
 
@@ -187,14 +188,8 @@
     (nn/linear cols wperm b (* H2 W2) (* 9 cin) cout)))
 
 (defn- gelu! ^floats [^floats x]
-  (dotimes [i (alength x)]
-    (let [v (double (aget x i))
-          ;; erf via A&S 7.1.26
-          z (/ v (Math/sqrt 2.0)) az (Math/abs z)
-          tt (/ 1.0 (+ 1.0 (* 0.3275911 az)))
-          e (- 1.0 (* tt (+ 0.254829592 (* tt (+ -0.284496736 (* tt (+ 1.421413741 (* tt (+ -1.453152027 (* tt 1.061405429)))))))) (Math/exp (- (* az az)))))
-          erf (if (neg? z) (- e) e)]
-      (aset x i (float (* 0.5 v (+ 1.0 erf))))))
+  ;; erf-exact GELU (A&S 7.1.26) — the substrate kernel, in place.
+  (nn/gelu-erf! x x (long (alength x)))
   x)
 
 (def ^:private pe13
@@ -253,33 +248,27 @@
   (nn/layer-norm x w b (long rows) (long d) 1e-5))
 
 (defn- block-attention
-  "Dense bidirectional MHA within consecutive blocks of `win` tokens."
+  "Dense bidirectional MHA within consecutive blocks of `win` tokens — per block
+  the same substrate composition the GPU path runs (scores-bidir! → softmax! →
+  out!, MHA as GQA group 1). Blocks are contiguous row slices."
   ^floats [^floats q ^floats k ^floats v T heads hd win]
   (let [T (long T) heads (long heads) hd (long hd) win (long win)
-        dim (* heads hd) scale (/ 1.0 (Math/sqrt (double hd)))
-        out (float-array (* T dim)) scores (float-array T)]
-    (dotimes [i T]
-      (let [b0 (* win (quot i win)) b1 (min (dec T) (dec (+ b0 win)))]
-        (dotimes [h heads]
-          (let [qb (+ (* i dim) (* h hd))
-                mx (loop [j b0 mx -1.0e30]
-                     (if (<= j b1)
-                       (let [s (* scale (loop [dd 0 acc 0.0]
-                                          (if (< dd hd)
-                                            (recur (inc dd) (+ acc (* (aget q (+ qb dd)) (aget k (+ (* j dim) (* h hd) dd)))))
-                                            acc)))]
-                         (aset scores j (float s)) (recur (inc j) (max mx s)))
-                       mx))
-                sum (loop [j b0 s 0.0]
-                      (if (<= j b1)
-                        (let [e (Math/exp (- (aget scores j) mx))] (aset scores j (float e)) (recur (inc j) (+ s e)))
-                        s))]
-            (dotimes [dd hd]
-              (aset out (+ (* i dim) (* h hd) dd)
-                    (float (/ (loop [j b0 acc 0.0]
-                                (if (<= j b1)
-                                  (recur (inc j) (+ acc (* (aget scores j) (aget v (+ (* j dim) (* h hd) dd)))))
-                                  acc)) sum))))))))
+        dim (* heads hd)
+        scale (/ 1.0 (Math/sqrt (double hd)))
+        out (float-array (* T dim))]
+    (loop [b0 0]
+      (when (< b0 T)
+        (let [bt (min win (- T b0))
+              qs (java.util.Arrays/copyOfRange q (* b0 dim) (* (+ b0 bt) dim))
+              ks (java.util.Arrays/copyOfRange k (* b0 dim) (* (+ b0 bt) dim))
+              vs (java.util.Arrays/copyOfRange v (* b0 dim) (* (+ b0 bt) dim))
+              sc (float-array (* bt heads bt))
+              ob (float-array (* bt dim))]
+          (attn/attn-prefill-scores-bidir! qs ks sc bt heads 1 heads hd scale)
+          (attn/attn-prefill-softmax! sc bt heads)
+          (attn/attn-prefill-out! sc vs ob bt heads 1 heads hd)
+          (System/arraycopy ob 0 out (* b0 dim) (* bt dim))
+          (recur (+ b0 win)))))
     out))
 
 (defn- add2! ^floats [^floats a ^floats b]
@@ -452,7 +441,7 @@
          (list 'qk/quant-act-i8-rows-gpu! 'h2 'fp 'fs d T)
          (list 'qk/qmatmul-i8-gemm! 'fp 'fs 'wf1p 'wf1s 'g1 d ffn T)
          (list 'nn/add-bias-rows! 'g1 'bf1 'g1b T ffn)
-         (list 'nn/gelu! 'g1b 'gel (* T ffn))
+         (list 'nn/gelu-erf! 'g1b 'gel (* T ffn))   ;; erf-exact (matches CPU/torch)
          (list 'qk/quant-act-i8-rows-gpu! 'gel 'gp 'gs ffn T)
          (list 'qk/qmatmul-i8-gemm! 'gp 'gs 'wf2p 'wf2s 'dn ffn d T)
          (list 'nn/add-bias-rows! 'dn 'bf2 'dnb T d)

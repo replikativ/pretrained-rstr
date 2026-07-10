@@ -685,6 +685,13 @@
   T-sized resident buffers. Returns {:sess :model :T}. Replay per text via embed-gpu."
   [m & {:keys [T qw] :or {T 128}}]
   (let [eps (:eps m) scale (:attn-scale m)
+        ;; The symmetric-window mask kernel now exists on the substrate:
+        ;; attn/attn-prefill-scores-windowed! (validated GPU-resident, left =
+        ;; right = w gives |i-j| < w). Closing this assert means gen-embed-layer!
+        ;; must pick windowed vs bidir PER LAYER (EmbeddingGemma alternates
+        ;; sliding/global layers) and thread the two window scalars through the
+        ;; generated program + revalidate the GPU embedder anchor at T > 512 —
+        ;; left for a dedicated pass.
         _ (when (get-in m [:desc :flags :bidirectional?])
             (when-let [w (get-in m [:desc :flags :sliding-window :size])]
               (assert (<= (long T) (long w))
