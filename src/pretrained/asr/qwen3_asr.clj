@@ -159,35 +159,6 @@
 ;; AuT conv stem: per-100-frame chunk, channels-last conv2d 3x3 s2 p1 ×3
 ;; ---------------------------------------------------------------------------
 
-(defn- permute-conv-w
-  "torch [cout,cin,3,3] → channels-last [cout, 3*3*cin] (kh,kw,cin order)."
-  ^floats [^floats w cout cin]
-  (let [out (float-array (alength w))]
-    (dotimes [o (long cout)]
-      (dotimes [ci (long cin)]
-        (dotimes [kh 3]
-          (dotimes [kw 3]
-            (aset out (+ (* o (* 9 (long cin))) (* kh (* 3 (long cin))) (* kw (long cin)) ci)
-                  (aget w (+ (* o (* 9 (long cin))) (* ci 9) (* kh 3) kw)))))))
-    out))
-
-(defn- conv2d-s2
-  "Channels-last conv 3x3 stride 2 pad 1: x [H,W,cin] → [H',W',cout], H'=ceil(H/2)."
-  ^floats [^floats x ^floats wperm ^floats b H W cin cout]
-  (let [H (long H) W (long W) cin (long cin) cout (long cout)
-        H2 (quot (inc H) 2) W2 (quot (inc W) 2)
-        cols (float-array (* H2 W2 9 cin))]
-    (dotimes [oh H2]
-      (dotimes [ow W2]
-        (let [row (* (+ (* oh W2) ow) (* 9 cin))]
-          (dotimes [kh 3]
-            (dotimes [kw 3]
-              (let [ih (+ (* 2 oh) (dec kh)) iw (+ (* 2 ow) (dec kw))]
-                (when (and (>= ih 0) (< ih H) (>= iw 0) (< iw W))
-                  (System/arraycopy x (* (+ (* ih W) iw) cin)
-                                    cols (+ row (* kh 3 cin) (* kw cin)) cin))))))))
-    (nn/linear cols wperm b (* H2 W2) (* 9 cin) cout)))
-
 (defn- gelu! ^floats [^floats x]
   ;; erf-exact GELU (A&S 7.1.26) — the substrate kernel, in place.
   (nn/gelu-erf! x x (long (alength x)))
@@ -205,34 +176,39 @@
            pe)))
 
 (defn conv-stem
-  "mel [T,128] (T%100=0) → tokens [ (T/100)*13, 896 ] with per-chunk PE."
+  "mel [T,128] (T%100=0) → tokens [ (T/100)*13, 896 ] with per-chunk PE.
+  Substrate-composed: three nn/conv2d (channel-first [1,C,H,W], 3x3 stride 2
+  pad 1) — torch [cout,cin,3,3] weights are used AS-IS (nn/conv2d's im2col row
+  order IS the contiguous torch layout; the old channels-last path had to
+  permute them at load)."
   [m ^floats mel T]
   (let [d (long (get-in m [:audio :d]))
-        w1 (permute-conv-w (t m "audio_tower.conv2d1.weight") 480 1)
-        w2 (permute-conv-w (t m "audio_tower.conv2d2.weight") 480 480)
-        w3 (permute-conv-w (t m "audio_tower.conv2d3.weight") 480 480)
+        w1 (t m "audio_tower.conv2d1.weight")
+        w2 (t m "audio_tower.conv2d2.weight")
+        w3 (t m "audio_tower.conv2d3.weight")
         b1 (t m "audio_tower.conv2d1.bias") b2 (t m "audio_tower.conv2d2.bias") b3 (t m "audio_tower.conv2d3.bias")
         wout (t m "audio_tower.conv_out.weight")
         nchunks (quot (long T) 100)
         out (float-array (* nchunks 13 d))
         ^floats pe @pe13]
     (dotimes [ch nchunks]
-      ;; chunk [128,100] channels-last [H=128, W=100, cin=1]
+      ;; chunk [128,100]: with cin=1, [H=128,W=100] is the same array
+      ;; channel-first [1,1,128,100]
       (let [cx (float-array (* 128 100))
             _ (dotimes [f 100]
                 (dotimes [b 128]
-                  (aset cx (+ (* b 100) f)                 ;; [h=b, w=f, c=0]
+                  (aset cx (+ (* b 100) f)                 ;; [h=b, w=f]
                         (aget mel (+ (* (+ (* ch 100) f) 128) b)))))
-            c1 (gelu! (conv2d-s2 cx w1 b1 128 100 1 480))       ;; [64,50,480]
-            c2 (gelu! (conv2d-s2 c1 w2 b2 64 50 480 480))       ;; [32,25,480]
-            c3 (gelu! (conv2d-s2 c2 w3 b3 32 25 480 480))       ;; [16,13,480]
-            ;; flatten to [13, 480*16] with feature index c*16 + h
+            c1 (gelu! (nn/conv2d cx w1 b1 1 1 128 100 480 3 3 2 2 1 1))    ;; [1,480,64,50]
+            c2 (gelu! (nn/conv2d c1 w2 b2 1 480 64 50 480 3 3 2 2 1 1))    ;; [1,480,32,25]
+            c3 (gelu! (nn/conv2d c2 w3 b3 1 480 32 25 480 3 3 2 2 1 1))    ;; [1,480,16,13]
+            ;; flatten [480,16,13] channel-first to [13, 480*16], feature = c*16 + h
             flat (float-array (* 13 7680))
             _ (dotimes [w* 13]
                 (dotimes [h 16]
                   (dotimes [c 480]
                     (aset flat (+ (* w* 7680) (* c 16) h)
-                          (aget ^floats c3 (+ (* (+ (* h 13) w*) 480) c))))))
+                          (aget ^floats c3 (+ (* c 208) (* h 13) w*))))))
             tok (nn/linear flat wout (float-array d) 13 7680 d)]
         (dotimes [i (* 13 (int d))]
           (aset out (+ (* ch 13 (int d)) i)

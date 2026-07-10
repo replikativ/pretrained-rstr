@@ -14,7 +14,10 @@
   See .internal/moonshine_port_checklist.md."
   (:require [pretrained.safetensors :as st]
             [pretrained.audio :as audio]
+            [raster.core :refer [deftm]]
             [raster.arrays :as arr]
+            [raster.numeric :as num]
+            [raster.math :as rmath]
             [raster.dl.nn :as nn]
             [raster.dl.attention :as attn]
             [pretrained.decoder :as dec]
@@ -128,52 +131,61 @@
 ;; Frontend: raw PCM → 50Hz × 768
 ;; ---------------------------------------------------------------------------
 
-(defn- causal-conv1d
-  "Causal conv via im2col + BLAS: x [T,cin] row-major, weight [cout,cin,k] (contiguous
-  = [cout, cin*k]), stride 2, left-pad (k-1). Output [T2,cout], T2=(T-1)/2+1."
-  ^floats [^floats x ^floats w ^floats b T cin cout k]
-  (let [T (long T) cin (long cin) cout (long cout) k (long k)
-        T2 (inc (quot (dec T) 2))
-        cols (float-array (* T2 cin k))]
-    (dotimes [ti T2]
-      (let [center (* 2 ti)]                       ;; input frames [center-(k-1) .. center]
-        (dotimes [c cin]
-          (dotimes [kk k]
-            (let [src (+ (- center (dec k)) kk)]
-              (when (>= src 0)
-                (aset cols (+ (* ti (* cin k)) (* c k) kk)
-                      (aget x (+ (* src cin) c)))))))))
-    (nn/linear cols w b T2 (* cin k) cout)))
+(deftm cmvn-asinh!
+  "Per-80-sample-frame CMVN (mean, biased variance, eps 1e-6) + asinh(kk·x)
+  compression, FUSED: the normalized value stays a double all the way into
+  raster.math/asinh, with a single f32 rounding at the store. The streaming
+  invariant (finalized encoder frames bit-identical between streaming and
+  batch, validated vs HF torch) forbids splitting this into a layer-norm pass
+  + an asinh pass — that would round the intermediate to f32 and shift ULPs.
+  rmath/asinh's double path is the identical log(y + sqrt(y²+1)) formula.
+  The explicit (double ...) casts are load-bearing: in a float-array kernel
+  the walker otherwise monomorphizes the scalar accumulation to f32 (literal
+  promotion), which loses the f64 accumulation the torch gold requires —
+  verified 1-ULP drift without them, byte-identical with them."
+  [pcm :- (Array float) out :- (Array float) n80 :- Long kk :- Double] :- Void
+  (dotimes [f n80]
+    (let [base (* f 80)
+          mean (num//
+                (loop [i 0 s 0.0]
+                  (if (< i 80)
+                    (recur (inc i) (num/+ (double s) (double (arr/aget pcm (+ base i)))))
+                    s))
+                80.0)
+          var (num//
+               (loop [i 0 s 0.0]
+                 (if (< i 80)
+                   (recur (inc i)
+                          (let [v (num/- (double (arr/aget pcm (+ base i))) (double mean))]
+                            (num/+ (double s) (num/* v v))))
+                   s))
+               80.0)
+          inv (num// (double 1.0) (double (num/sqrt (num/+ (double var) 1.0e-6))))]
+      (dotimes [i 80]
+        (let [v (num/* (num/- (double (arr/aget pcm (+ base i))) (double mean)) (double inv))]
+          (arr/aset out (+ base i) (float (rmath/asinh (num/* (double kk) v)))))))))
 
 (defn frontend
-  "Raw float PCM (multiple of 80 samples) → features [T,768] row-major + T."
+  "Raw float PCM (multiple of 80 samples) → features [T,768] row-major + T.
+  Substrate-composed: cmvn-asinh! (above) → linear+silu → two causal
+  stride-2 channels-last convs (nn/conv1d-cl, pad-left k-1)."
   [m ^floats pcm]
   (let [n80 (quot (alength pcm) 80)
         framed (float-array (* n80 80))
         log-k (aget ^floats (t m "model.encoder.embedder.comp.log_k") 0)
         kk (Math/exp (double log-k))]
-    ;; per-frame CMVN + asinh(k*x)
-    (dotimes [f n80]
-      (let [base (* f 80)
-            mean (/ (loop [i 0 s 0.0] (if (< i 80) (recur (inc i) (+ s (aget pcm (+ base i)))) s)) 80.0)
-            var (/ (loop [i 0 s 0.0]
-                     (if (< i 80)
-                       (recur (inc i) (let [v (- (aget pcm (+ base i)) mean)] (+ s (* v v))))
-                       s)) 80.0)
-            inv (/ 1.0 (Math/sqrt (+ var 1e-6)))]
-        (dotimes [i 80]
-          (let [v (* (- (aget pcm (+ base i)) mean) inv)]
-            (aset framed (+ base i)
-                  (float (let [y (* kk v)] (Math/log (+ y (Math/sqrt (+ 1.0 (* y y))))))))))))
+    (cmvn-asinh! pcm framed n80 kk)
     (let [h (nn/silu (nn/linear framed (t m "model.encoder.embedder.linear.weight")
                                 (zeros 768) n80 80 768)
                      (* n80 768))
           T1 (inc (quot (dec n80) 2))
-          c1 (nn/silu (causal-conv1d h (t m "model.encoder.embedder.conv1.weight")
-                                     (t m "model.encoder.embedder.conv1.bias") n80 768 1536 5)
+          c1 (nn/silu (nn/conv1d-cl h (t m "model.encoder.embedder.conv1.weight")
+                                    (t m "model.encoder.embedder.conv1.bias")
+                                    n80 768 1536 5 2 4 0)
                       (* T1 1536))
-          c2 (causal-conv1d c1 (t m "model.encoder.embedder.conv2.weight")
-                            (t m "model.encoder.embedder.conv2.bias") T1 1536 768 5)]
+          c2 (nn/conv1d-cl c1 (t m "model.encoder.embedder.conv2.weight")
+                           (t m "model.encoder.embedder.conv2.bias")
+                           T1 1536 768 5 2 4 0)]
       {:x c2 :T (inc (quot (dec T1) 2))})))
 
 ;; ---------------------------------------------------------------------------
