@@ -241,22 +241,9 @@
 ;; Decoder: causal self-attn (partial interleaved RoPE) + cross-attn + SwiGLU
 ;; ---------------------------------------------------------------------------
 
-(defn- rope-partial!
-  "GPT-J interleaved partial RoPE in place: rotate first 32 of each 64-dim head.
-  x [heads*64] for one position `pos`."
-  [^floats x heads pos]
-  (let [pos (double pos)]
-    (dotimes [h (long heads)]
-      (let [base (* h 64)]
-        (dotimes [j 16]
-          (let [freq (Math/pow 10000.0 (- (/ (* 2.0 j) 32.0)))
-                ang (* pos freq)
-                c (Math/cos ang) s (Math/sin ang)
-                i0 (+ base (* 2 j)) i1 (inc i0)
-                x0 (aget x i0) x1 (aget x i1)]
-            (aset x i0 (float (- (* x0 c) (* x1 s))))
-            (aset x i1 (float (+ (* x1 c) (* x0 s)))))))))
-  x)
+(def ^:private max-positions
+  "Preallocated KV-cache rows — the decode loops cap tokens at (min 256 ...)."
+  256)
 
 (defn- attend-cache
   "Single-query MHA over cached K/V [n, heads*hd] — MHA as GQA with n-kv = n-q
@@ -267,42 +254,10 @@
 
 (defn- attend-cache+w
   "attend-cache that also ACCUMULATES head-averaged attention weights into wsink
-  (float[n]) — cross-attention alignment for timestamps."
+  (float[n]) — cross-attention alignment for timestamps (substrate kernel)."
   ^floats [^floats q ^floats kc ^floats vc n heads hd ^floats wsink]
-  (let [n (long n) heads (long heads) hd (long hd)
-        dim (* heads hd)
-        scale (/ 1.0 (Math/sqrt (double hd)))
-        out (float-array dim)
-        scores (float-array n)
-        havg (float (/ 1.0 heads))]
-    (dotimes [h heads]
-      (let [qb (* h hd)
-            mx (loop [j 0 mx -1.0e30]
-                 (if (< j n)
-                   (let [s (* scale (loop [d 0 acc 0.0]
-                                      (if (< d hd)
-                                        (recur (inc d) (+ acc (* (aget q (+ qb d))
-                                                                 (aget kc (+ (* j dim) qb d)))))
-                                        acc)))]
-                     (aset scores j (float s))
-                     (recur (inc j) (max mx s)))
-                   mx))
-            sum (loop [j 0 s 0.0]
-                  (if (< j n)
-                    (let [e (Math/exp (- (aget scores j) mx))]
-                      (aset scores j (float e))
-                      (recur (inc j) (+ s e)))
-                    s))]
-        (dotimes [j n]
-          (aset wsink j (float (+ (aget wsink j) (* havg (/ (aget scores j) sum))))))
-        (dotimes [d hd]
-          (aset out (+ qb d)
-                (float (/ (loop [j 0 acc 0.0]
-                            (if (< j n)
-                              (recur (inc j) (+ acc (* (aget scores j) (aget vc (+ (* j dim) qb d)))))
-                              acc))
-                          sum))))))
-    out))
+  (attn/gqa-decode-attention-weights! q kc vc (long n) (long heads) (long heads) (long hd)
+                                      (/ 1.0 (Math/sqrt (double hd))) wsink))
 
 (defn- decoder-state [m ^floats memory T]
   (let [dd (long (:d-dec m))]
@@ -313,14 +268,10 @@
                       {:k (nn/linear memory (t m (str p "k_proj.weight")) (zeros dd) T dd dd)
                        :v (nn/linear memory (t m (str p "v_proj.weight")) (zeros dd) T dd dd)}))
                   (range (:dec-layers m)))
-     ;; self K/V caches grow per step
-     :self-k (mapv (fn [_] (atom [])) (range (:dec-layers m)))
-     :self-v (mapv (fn [_] (atom [])) (range (:dec-layers m)))}))
-
-(defn- cat-rows ^floats [rows dim]
-  (let [n (count rows) out (float-array (* n (long dim)))]
-    (dotimes [i n] (System/arraycopy ^floats (nth rows i) 0 out (* i (long dim)) (long dim)))
-    out))
+     ;; self K/V: preallocated [max-positions, dd] row-major caches, appended
+     ;; in place at each decode position (the decoder.clj decode-step pattern)
+     :self-k (mapv (fn [_] (float-array (* max-positions dd))) (range (:dec-layers m)))
+     :self-v (mapv (fn [_] (float-array (* max-positions dd))) (range (:dec-layers m)))}))
 
 (defn- decode-step
   "One greedy decoder step: token id + position → next logits argmax. The 5-arg
@@ -336,13 +287,17 @@
         (let [p (str "model.decoder.layers." l ".")
               ;; self-attention
               h (layer-norm! x (t m (str p "input_layernorm.weight")) 0.0 1 dd)
-              q (rope-partial! (qlin m (str p "self_attn.q_proj.weight") h nil) heads pos)
-              k (rope-partial! (qlin m (str p "self_attn.k_proj.weight") h nil) heads pos)
+              ;; partial interleaved RoPE: rotate first 32 of each 64-dim head (GPT-J
+              ;; pairing, NOT the NeoX half-split — the moonshine port trap)
+              q (attn/rope-pos-partial! (qlin m (str p "self_attn.q_proj.weight") h nil)
+                                        heads hd 32 10000.0 pos)
+              k (attn/rope-pos-partial! (qlin m (str p "self_attn.k_proj.weight") h nil)
+                                        heads hd 32 10000.0 pos)
               v (qlin m (str p "self_attn.v_proj.weight") h nil)
-              _ (swap! (nth (:self-k state) l) conj k)
-              _ (swap! (nth (:self-v state) l) conj v)
-              ks @(nth (:self-k state) l) vs @(nth (:self-v state) l)
-              a (attend-cache q (cat-rows ks dd) (cat-rows vs dd) (count ks) heads hd)
+              ^floats kcl (nth (:self-k state) l) ^floats vcl (nth (:self-v state) l)
+              _ (attn/kv-append! k kcl dd pos)
+              _ (attn/kv-append! v vcl dd pos)
+              a (attend-cache q kcl vcl (inc pos) heads hd)
               x (add! (qlin m (str p "self_attn.o_proj.weight") a nil) x)
               ;; cross-attention
               h2 (layer-norm! x (t m (str p "post_attention_layernorm.weight")) 0.0 1 dd)
