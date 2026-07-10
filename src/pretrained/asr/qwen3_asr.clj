@@ -15,6 +15,7 @@
             [pretrained.audio :as audio]
             [pretrained.decoder :as dec]
             [pretrained.decoder-gpu :as dgpu]
+            [raster.quant.pack :as qpack]
             [raster.gpu.core :as gpu]
             [pretrained.loader :as loader]
             [pretrained.arch.qwen3 :as qwen3]
@@ -457,21 +458,28 @@
           v))))
 
 (defn- aut-quantize
-  "Q8-pack the 18 encoder layers' six linears. {[l pl] {:wp :ws}} + biases."
+  "Q8-pack the 18 encoder layers' six linears. {[l pl] {:q {:wp :ws} :b bias}}.
+  EAGER and memory-bounded: a plain reduce packs strictly one tensor at a time.
+  (The previous chunked-lazy `for` realized a whole chunk of quantize jobs —
+  every layer's packed arrays at once — before `into` consumed any, which blew
+  the heap at 5-8g during the GPU anchor.)"
   [m]
   (let [{:keys [d ffn layers]} (:audio m)
-        spec {"q"  [(fn [p] (str p "self_attn.q_proj"))   d d]
-              "k"  [(fn [p] (str p "self_attn.k_proj"))   d d]
-              "v"  [(fn [p] (str p "self_attn.v_proj"))   d d]
-              "o"  [(fn [p] (str p "self_attn.out_proj")) d d]
-              "f1" [(fn [p] (str p "fc1"))                d ffn]
-              "f2" [(fn [p] (str p "fc2"))                ffn d]}]
-    (into {}
-          (for [l (range layers) [pl [nm-fn in out]] spec
-                :let [p (str "audio_tower.layers." l ".")
-                      base (nm-fn p)]]
-            [[l pl] {:q (dgpu/quantize-one-q8 (t m (str base ".weight")) in out base)
-                     :b (t m (str base ".bias"))}]))))
+        spec [["q"  "self_attn.q_proj"   d d]
+              ["k"  "self_attn.k_proj"   d d]
+              ["v"  "self_attn.v_proj"   d d]
+              ["o"  "self_attn.out_proj" d d]
+              ["f1" "fc1"                d ffn]
+              ["f2" "fc2"                ffn d]]]
+    (persistent!
+     (reduce
+      (fn [acc [l [pl suffix in out]]]
+        (let [base (str "audio_tower.layers." l "." suffix)]
+          (assoc! acc [l pl]
+                  {:q (qpack/quantize-one-q8 (t m (str base ".weight")) in out base)
+                   :b (t m (str base ".bias"))})))
+      (transient {})
+      (vec (for [l (range layers) s spec] [l s]))))))
 
 (defn- bind-aut!
   "Bind the 18-layer AuT block program at block size T into a fresh session.
