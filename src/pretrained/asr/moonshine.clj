@@ -14,12 +14,13 @@
   See .internal/moonshine_port_checklist.md."
   (:require [pretrained.safetensors :as st]
             [pretrained.audio :as audio]
+            [raster.arrays :as arr]
             [raster.dl.nn :as nn]
+            [raster.dl.attention :as attn]
             [pretrained.decoder :as dec]
             [raster.linalg.blas :as blas]
             [raster.quant.op :as ql]
             [raster.compiler.backend.cpu.quant :as cq]
-            [raster.sci.special :as special]
             [clojure.string :as str]
             [clojure.data.json :as json]))
 
@@ -99,12 +100,6 @@
                 (float (* (- (aget x (+ base i)) mean) inv (+ gain-offset (aget w i))))))))
     out))
 
-(defn- silu! ^floats [^floats x]
-  (dotimes [i (alength x)]
-    (let [v (double (aget x i))]
-      (aset x i (float (/ v (+ 1.0 (Math/exp (- v))))))))
-  x)
-
 (defn- erf-as ^double [^double z]
   ;; Abramowitz–Stegun 7.1.26: |abs err| <= 1.5e-7 (below f32 output resolution).
   (let [x (Math/abs z)
@@ -135,11 +130,11 @@
   ^floats [m nm ^floats x ^floats b]
   (let [{:keys [wqi wsi in out]} (get (:qw m) nm)
         ^floats y (ql/qlinear-i8-q8 x wqi wsi in out)]
-    (when b (dotimes [i (alength y)] (aset y i (float (+ (aget y i) (aget b i))))))
+    (when b (nn/add-bias-rows! y b y 1 (long (alength y))))
     y))
 
 (defn- add! ^floats [^floats a ^floats b]
-  (dotimes [i (alength a)] (aset a i (float (+ (aget a i) (aget b i)))))
+  (nn/residual-add! a b a (long (alength a)))
   a)
 
 ;; ---------------------------------------------------------------------------
@@ -183,11 +178,13 @@
           (let [v (* (- (aget pcm (+ base i)) mean) inv)]
             (aset framed (+ base i)
                   (float (let [y (* kk v)] (Math/log (+ y (Math/sqrt (+ 1.0 (* y y))))))))))))
-    (let [h (silu! (nn/linear framed (t m "model.encoder.embedder.linear.weight")
-                              (zeros 768) n80 80 768))
-          c1 (silu! (causal-conv1d h (t m "model.encoder.embedder.conv1.weight")
-                                   (t m "model.encoder.embedder.conv1.bias") n80 768 1536 5))
+    (let [h (nn/silu (nn/linear framed (t m "model.encoder.embedder.linear.weight")
+                                (zeros 768) n80 80 768)
+                     (* n80 768))
           T1 (inc (quot (dec n80) 2))
+          c1 (nn/silu (causal-conv1d h (t m "model.encoder.embedder.conv1.weight")
+                                     (t m "model.encoder.embedder.conv1.bias") n80 768 1536 5)
+                      (* T1 1536))
           c2 (causal-conv1d c1 (t m "model.encoder.embedder.conv2.weight")
                             (t m "model.encoder.embedder.conv2.bias") T1 1536 768 5)]
       {:x c2 :T (inc (quot (dec T1) 2))})))
@@ -299,39 +296,11 @@
   x)
 
 (defn- attend-cache
-  "Single-query MHA over cached K/V [n, heads*hd]."
+  "Single-query MHA over cached K/V [n, heads*hd] — MHA as GQA with n-kv = n-q
+  (group 1) on the raster substrate decode-attention kernel."
   ^floats [^floats q ^floats kc ^floats vc n heads hd]
-  (let [n (long n) heads (long heads) hd (long hd)
-        dim (* heads hd)
-        scale (/ 1.0 (Math/sqrt (double hd)))
-        out (float-array dim)
-        scores (float-array n)]
-    (dotimes [h heads]
-      (let [qb (* h hd)
-            mx (loop [j 0 mx -1.0e30]
-                 (if (< j n)
-                   (let [s (* scale (loop [d 0 acc 0.0]
-                                      (if (< d hd)
-                                        (recur (inc d) (+ acc (* (aget q (+ qb d))
-                                                                 (aget kc (+ (* j dim) qb d)))))
-                                        acc)))]
-                     (aset scores j (float s))
-                     (recur (inc j) (max mx s)))
-                   mx))
-            sum (loop [j 0 s 0.0]
-                  (if (< j n)
-                    (let [e (Math/exp (- (aget scores j) mx))]
-                      (aset scores j (float e))
-                      (recur (inc j) (+ s e)))
-                    s))]
-        (dotimes [d hd]
-          (aset out (+ qb d)
-                (float (/ (loop [j 0 acc 0.0]
-                            (if (< j n)
-                              (recur (inc j) (+ acc (* (aget scores j) (aget vc (+ (* j dim) qb d)))))
-                              acc))
-                          sum))))))
-    out))
+  (attn/gqa-decode-attention q kc vc (long n) (long heads) (long heads) (long hd)
+                             (/ 1.0 (Math/sqrt (double hd)))))
 
 (defn- attend-cache+w
   "attend-cache that also ACCUMULATES head-averaged attention weights into wsink
@@ -434,11 +403,7 @@
           (recur (inc l) x))
         (let [xf (layer-norm! x (t m "model.decoder.norm.weight") 0.0 1 dd)
               logits (qlin m "proj_out.weight" xf nil)]
-          (loop [i 1 best 0 bv -1.0e30]                       ;; argmax
-            (if (< i 32768)
-              (let [v (aget ^floats logits i)]
-                (if (> v bv) (recur (inc i) i (double v)) (recur (inc i) best bv)))
-              best))))))))
+          (long (arr/argmax logits))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Tokenizer decode (SP-Llama: ▁→space, byte-fallback) + top-level API

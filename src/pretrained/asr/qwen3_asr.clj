@@ -18,6 +18,7 @@
             [raster.gpu.core :as gpu]
             [pretrained.loader :as loader]
             [pretrained.arch.qwen3 :as qwen3]
+            [raster.arrays :as arr]
             [raster.dl.nn :as nn]
             [clojure.string :as str]
             [clojure.data.json :as json]))
@@ -247,18 +248,9 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- layer-norm-b
-  "Standard biased LayerNorm over rows."
+  "Standard biased LayerNorm over rows (raster.dl.nn/layer-norm, eps 1e-5)."
   ^floats [^floats x ^floats w ^floats b rows d]
-  (let [rows (long rows) d (long d) out (float-array (* rows d))]
-    (dotimes [r rows]
-      (let [base (* r d)
-            mean (/ (loop [i 0 s 0.0] (if (< i d) (recur (inc i) (+ s (aget x (+ base i)))) s)) d)
-            var (/ (loop [i 0 s 0.0]
-                     (if (< i d) (recur (inc i) (let [v (- (aget x (+ base i)) mean)] (+ s (* v v)))) s)) d)
-            inv (/ 1.0 (Math/sqrt (+ var 1e-5)))]
-        (dotimes [i d]
-          (aset out (+ base i) (float (+ (* (- (aget x (+ base i)) mean) inv (aget w i)) (aget b i)))))))
-    out))
+  (nn/layer-norm x w b (long rows) (long d) 1e-5))
 
 (defn- block-attention
   "Dense bidirectional MHA within consecutive blocks of `win` tokens."
@@ -291,7 +283,7 @@
     out))
 
 (defn- add2! ^floats [^floats a ^floats b]
-  (dotimes [i (alength a)] (aset a i (float (+ (aget a i) (aget b i))))) a)
+  (nn/residual-add! a b a (long (alength a))) a)
 
 (defn aut-encode
   "Conv-stem tokens [T,896] → projected audio embeddings [T, out-dim]."
@@ -394,11 +386,7 @@
      (let [out (loop [ids [] pos (dec P) tok* (peek prompt) n 0]
                  (let [h (dec/decode-step m tok* pos kc vc)
                        logits (dec/lm-logits m h)
-                       nxt (loop [i 1 best 0 bv -1.0e30]
-                             (if (< i (long (:vocab m)))
-                               (let [v (aget ^floats logits i)]
-                                 (if (> v bv) (recur (inc i) i (double v)) (recur (inc i) best bv)))
-                               best))]
+                       nxt (long (arr/argmax logits))]
                    (if (or (= nxt IM-END) (= nxt EOT) (>= n max-new))
                      ids
                      (recur (conj ids nxt) (inc pos) nxt (inc n)))))

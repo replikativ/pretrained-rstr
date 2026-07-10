@@ -14,6 +14,7 @@
   CPU stream-gemv path (pretrained.decoder/quantize-stream), so this ns carries its own Q4K
   quantize (gpu-quantize)."
   (:require [pretrained.decoder :as dec]
+            [raster.arrays :as arr]
             [raster.compiler.backend.cpu.quant :as cq]
             [raster.quant.kernels-k :as qk]
             [raster.dl.nn :as nn]
@@ -750,19 +751,12 @@
   ^floats [model ^floats rf n]
   (let [d (long (:d-model model))
         base (* (dec (long n)) d)
-          ^floats fln (:data (get (:weights model) (dec/role-name (:desc model) :final-norm nil)))
-          go (double (get-in model [:desc :flags :norm :gain-offset] 0.0))
-          eps (double (:eps model))
-          ms (loop [i 0 s 0.0]
-               (if (< i d) (recur (inc i) (+ s (let [v (double (aget rf (+ base i)))] (* v v)))) s))
-          inv (/ 1.0 (Math/sqrt (+ (/ ms d) eps)))
-          e (float-array d)]
-      (dotimes [i d]
-        (aset e i (float (* (aget rf (+ base i)) inv (+ go (aget fln i))))))
-      (let [ss (loop [i 0 s 0.0] (if (< i d) (recur (inc i) (+ s (let [v (double (aget e i))] (* v v)))) s))
-            l2 (/ 1.0 (Math/sqrt ss))]
-        (dotimes [i d] (aset e i (float (* (aget e i) l2)))))
-      e))
+        ^floats fln (:data (get (:weights model) (dec/role-name (:desc model) :final-norm nil)))
+        go (double (get-in model [:desc :flags :norm :gain-offset] 0.0))
+        eps (double (:eps model))
+        row (java.util.Arrays/copyOfRange rf (int base) (int (+ base d)))
+        ^floats e (nn/rms-norm row fln 1 d eps go)]
+    (nn/l2-normalize! e d)))
 
 (defn load-dense-head
   "Load the sentence-transformers Dense projection weights (2_Dense/3_Dense
@@ -794,22 +788,11 @@
         ^floats fln (:data (get (:weights model) (dec/role-name (:desc model) :final-norm nil)))
         go (double (get-in model [:desc :flags :norm :gain-offset] 0.0))
         eps (double (:eps model))
-        pooled (float-array d)]
-    (dotimes [r n]
-      (let [base (* r d)
-            ms (loop [i 0 s 0.0]
-                 (if (< i d) (recur (inc i) (+ s (let [v (double (aget rf (+ base i)))] (* v v)))) s))
-            inv (/ 1.0 (Math/sqrt (+ (/ ms d) eps)))]
-        (dotimes [i d]
-          (aset pooled i (float (+ (aget pooled i)
-                                   (/ (* (aget rf (+ base i)) inv (+ go (aget fln i)))
-                                      (double n))))))))
-    (let [^floats e (reduce (fn [^floats x head] (dense-apply head x)) pooled (:dense model))
-          dd (alength e)
-          ss (loop [i 0 s 0.0] (if (< i dd) (recur (inc i) (+ s (let [v (double (aget e i))] (* v v)))) s))
-          l2 (/ 1.0 (Math/sqrt ss))]
-      (dotimes [i dd] (aset e i (float (* (aget e i) l2))))
-      e)))
+        ^floats normed (nn/rms-norm (java.util.Arrays/copyOfRange rf 0 (int (* n d)))
+                                    fln n d eps go)
+        ^floats pooled (nn/mean-pool normed n d)
+        ^floats e (reduce (fn [^floats x head] (dense-apply head x)) pooled (:dense model))]
+    (nn/l2-normalize! e (long (alength e)))))
 
 (defn bind-decode!
   "Compile the layer + head programs, Q4K-quantize the weights, allocate resident buffers, bind
@@ -953,8 +936,6 @@
     (gpu/upload! sess :pr0 rows)
     (gpu/replay! sess :prefill)))
 
-(declare argmax)
-
 (defn decode-row!
   "One resident-decode step from an ARBITRARY input row (float[d-model]): write absolute
   `pos` + the row, replay the graph, return the logits (float[vocab]). This is the
@@ -1010,7 +991,7 @@
     (doseq [p (range p0)] (decode-token! dstate (nth prompt p) p)) ;; prime prompt
     (loop [p p0 tok (last prompt) out []]
       (if (< (count out) n)
-        (let [nt (argmax (decode-token! dstate tok p))]
+        (let [nt (arr/argmax (decode-token! dstate tok p))]
           (recur (inc p) nt (conj out nt)))
         out))))
 
@@ -1036,9 +1017,3 @@
               (if (contains? eos-ids t) out (recur (inc p) out))))
         out))))
 
-(defn argmax ^long [^floats a]
-  (let [n (alength a)]
-    (loop [i 1 mi 0 mv (aget a 0)]
-      (if (< i n)
-        (if (> (aget a i) mv) (recur (inc i) i (aget a i)) (recur (inc i) mi mv))
-        mi))))
