@@ -104,6 +104,57 @@
      :max-position (:max_position_embeddings config)
      :layer-norm-eps (double (:layer_norm_eps config 1e-12))}))
 
+;; ================================================================
+;; Compiled encoder block
+;; ================================================================
+
+(def ^:private compiled-blocks
+  "dtype -> delay of the compile-aot'd `bert-block`.
+
+  Invoked directly, a deftm runs raster's default tier, where par forms expand
+  to sequential loops. `attention/softmax-rows!` is written for the opposite
+  assumption: its exp is a flat `broadcast` carrying an inlined deg-6 Taylor +
+  10 squarings (~26 float ops/element) because that is nearly free once the
+  broadcast becomes SIMD lanes. Unvectorized, the same shape is a scalar loop
+  over every element and the optimization inverts — measured at seq-len 128 /
+  hidden 384 / 12 heads:
+
+    softmax-rows!   758.8 ms  ->    0.83 ms   (911x)
+    bert-block      787.0 ms  ->   13.3 ms    (59x)
+    embed (MiniLM)  714.7 ms  ->   40.2 ms    (17.8x)
+
+  compile-aot vectorizes it (`{:simd-maps 1, :fallback 0}`); the GEMMs already
+  reach MKL either way, so this is the whole gap. Numerics are unchanged to f32
+  reassociation: cosine 1.0000005, max abs diff 3.4e-7.
+
+  One compile per dtype amortizes over every sequence the model embeds."
+  (atom {}))
+
+(defn- block-fn
+  "The compiled `bert-block` for `dtype`, falling back to the deftm itself if
+  compile-aot fails — backends are WIP, and a slow encode beats no encode."
+  [dtype]
+  @(get (swap! compiled-blocks
+               (fn [m]
+                 (if (contains? m dtype)
+                   m
+                   (assoc m dtype
+                          (delay
+                            (try
+                              ((requiring-resolve
+                                'raster.compiler.pipeline/compile-aot)
+                               #'bert-block :dtype dtype)
+                              (catch Throwable _ bert-block)))))))
+        dtype))
+
+(def ^:private float-array-class (Class/forName "[F"))
+
+(defn- array-dtype
+  "compile-aot selects an overload by dtype; pick it from the actual weights
+  rather than the config, since safetensors decides f32 vs f64."
+  [arr]
+  (if (instance? float-array-class arr) :float :double))
+
 (defn encode
   "Run the BERT encoder forward pass for one sequence.
   model: from load-model. token-ids: long[].
@@ -127,10 +178,10 @@
                            (w "embeddings.LayerNorm.weight")
                            (w "embeddings.LayerNorm.bias")
                            seq-len hidden-size layer-norm-eps)]
-    (loop [x x, layer 0]
+    (loop [x x, layer 0, blk (block-fn (array-dtype x))]
       (if (clojure.core/< layer num-layers)
         (let [p (str "encoder.layer." layer ".")]
-          (recur (bert-block x
+          (recur (blk x
                    (w (str p "attention.self.query.weight"))
                    (w (str p "attention.self.query.bias"))
                    (w (str p "attention.self.key.weight"))
@@ -148,7 +199,8 @@
                    (w (str p "output.LayerNorm.weight"))
                    (w (str p "output.LayerNorm.bias"))
                    seq-len hidden-size num-heads)
-                 (clojure.core/inc layer)))
+                 (clojure.core/inc layer)
+                 blk))
         x))))
 
 (defn sentence-embedding
