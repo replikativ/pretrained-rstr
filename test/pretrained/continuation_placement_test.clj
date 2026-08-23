@@ -45,6 +45,13 @@
           (is (= ["worker-a"] (mapv :kv/replica-node (:sources action))))))
       (placement/announce-replica!
        connection {:model-fingerprint model :prefix-hash prefix
+                   :node "worker-b" :tier :ssd :state :kv.replica/copying})
+      (testing "a local copy in progress suppresses duplicate actions"
+        (let [plan (placement/reconciliation-plan @connection "worker-b")]
+          (is (empty? (:actions plan)))
+          (is (= 1 (count (:in-progress plan))))))
+      (placement/announce-replica!
+       connection {:model-fingerprint model :prefix-hash prefix
                    :node "worker-b" :tier :ssd :state :kv.replica/ready
                    :store-key (random-uuid) :path "/worker-b/chunk" :bytes 128})
       (testing "the desired local tier satisfies the demand"
@@ -52,7 +59,7 @@
           (is (empty? (:actions plan)))
           (is (= 1 (count (:satisfied plan))))))
       (testing "placement writes produce lightweight tx notifications"
-        (is (= 3 (count @events)))
+        (is (= 4 (count @events)))
         (is (every? #(= "worker-b" (:node %)) @events)))
       (finally
         (placement/unlisten! connection listener)

@@ -79,25 +79,38 @@
   "Upsert observed availability for one chunk replica.
 
   `replica` requires model/prefix/node/tier and a state in `replica-states`.
-  Store key, path, and bytes are worker-local observations and are optional."
+  Store-ref/key, path, and bytes are worker-local observations and are optional."
   [connection {:keys [model-fingerprint prefix-hash node tier state
-                      store-key path bytes updated-at]}]
+                      store-ref store-key path bytes error updated-at]}]
   (when-not (and (string? model-fingerprint) (uuid? prefix-hash)
                  (string? node) (keyword? tier) (contains? replica-states state))
     (throw (ex-info "Replica announcement is incomplete or has an invalid state"
                     {:model-fingerprint model-fingerprint :prefix-hash prefix-hash
                      :node node :tier tier :state state})))
-  (d/transact connection
-              [(cond-> {:kv/replica-id (replica-id model-fingerprint prefix-hash node tier)
-                        :kv/replica-model-fingerprint model-fingerprint
-                        :kv/replica-prefix-hash prefix-hash
-                        :kv/replica-node node
-                        :kv/replica-tier tier
-                        :kv/replica-state state
-                        :kv/replica-updated-at (or updated-at (Date.))}
-                 store-key (assoc :kv/replica-store-key store-key)
-                 path (assoc :kv/replica-path (str path))
-                 bytes (assoc :kv/replica-bytes (long bytes)))]))
+  (let [id (replica-id model-fingerprint prefix-hash node tier)
+        previous-error (:kv/replica-error
+                        (ffirst (d/q '[:find (pull ?e [:kv/replica-error])
+                                       :in $ ?id
+                                       :where [?e :kv/replica-id ?id]]
+                                     @connection id)))
+        announcement
+        (cond-> {:kv/replica-id id
+                 :kv/replica-model-fingerprint model-fingerprint
+                 :kv/replica-prefix-hash prefix-hash
+                 :kv/replica-node node
+                 :kv/replica-tier tier
+                 :kv/replica-state state
+                 :kv/replica-updated-at (or updated-at (Date.))}
+          store-key (assoc :kv/replica-store-key store-key)
+          (or store-ref store-key) (assoc :kv/replica-blob
+                                           (or store-ref store-key))
+          path (assoc :kv/replica-path (str path))
+          bytes (assoc :kv/replica-bytes (long bytes))
+          error (assoc :kv/replica-error (str error)))
+        retractions (when (and previous-error (nil? error))
+                      [[:db/retract [:kv/replica-id id]
+                        :kv/replica-error previous-error]])]
+    (d/transact connection (into [announcement] retractions))))
 
 (defn retract-replica!
   "Retract one observed replica by its stable identity."
@@ -152,18 +165,29 @@
                                       :kv/replica-node
                                       (comp str :kv/replica-id)))
                        vec)
-            local (some #(when (and (= node (:kv/replica-node %))
-                                    (= tier (:kv/replica-tier %))) %)
-                        ready)]
-        (if local
-          (update plan :satisfied conj {:demand demand :replica local})
+            local-ready (some #(when (and (= node (:kv/replica-node %))
+                                          (= tier (:kv/replica-tier %))) %)
+                              ready)
+            local-copying (some #(when (and (= node (:kv/replica-node %))
+                                            (= tier (:kv/replica-tier %))
+                                            (= :kv.replica/copying
+                                               (:kv/replica-state %))) %)
+                                candidates)]
+        (cond
+          local-ready
+          (update plan :satisfied conj {:demand demand :replica local-ready})
+
+          local-copying
+          (update plan :in-progress conj {:demand demand :replica local-copying})
+
+          :else
           (update plan :actions conj
                   {:action :ensure-local
                    :demand demand
                    :source (first ready)
                    :sources ready
                    :chunk (catalog/lookup-chunk database model prefix)}))))
-    {:node node :satisfied [] :actions []}
+    {:node node :satisfied [] :in-progress [] :actions []}
     (demands database node now))))
 
 (def placement-attributes
