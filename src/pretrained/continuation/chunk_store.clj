@@ -36,6 +36,14 @@
                     :config {:encoding {:serializer :BoringSerializer}}
                     :opts {:sync? true}))
 
+(defn describe
+  "Return `{:store-key :path :bytes}` for an mmap-compatible stored chunk."
+  [store store-key]
+  (let [[path _] (kmm/value-location store store-key)]
+    {:store-key store-key
+     :path path
+     :bytes (.length (java.io.File. ^String path))}))
+
 (defn put!
   "Durably store one immutable chunk and return its catalog storage fields.
 
@@ -44,10 +52,7 @@
   (let [store-key (content-id chunk)]
     (when-not (k/exists? store store-key {:sync? true})
       (k/assoc store store-key chunk {:immutable? true} {:sync? true}))
-    (let [[path _] (kmm/value-location store store-key)]
-      {:store-key store-key
-       :path path
-       :bytes (.length (java.io.File. ^String path))})))
+    (describe store store-key)))
 
 (defn stored?
   "Return true when `store-key` is present in this chunk store."

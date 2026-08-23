@@ -128,22 +128,31 @@ observed replicas. `pretrained.continuation.replica/open-executor` connects that
 control plane to a bounded background copy worker: it moves bytes off-band,
 verifies the immutable Hasch identity and catalog metadata, then transitions the
 target replica through `copying` to `ready` or `failed`. Transaction listeners
-only offer work and never perform I/O. The built-in Konserve adapter supports
-worker-local stores and shared filesystem mounts; it currently decodes once
-during a cross-store copy. Remote transports can implement `ChunkRepository`
-without changing placement or restore, and Yggdrasil can version the catalog
-through its Datahike adapter.
+only offer work and never perform I/O. The built-in promoter uses Konserve's
+tiered store to explicitly synchronize one content key from its authoritative
+backend into the worker's local filestore frontend. It waits for that write and
+verifies the frontend before publishing `ready`; restore then mmaps the concrete
+frontend, not the tiered wrapper. The current tier sync decodes once during
+promotion. Remote or raw-copy transports can implement the narrow
+`ReplicaPromoter` effect without replacing Konserve's storage API, and Yggdrasil
+can version the catalog through its Datahike adapter.
 
 ```clojure
-(require '[pretrained.continuation.placement :as placement]
+(require '[konserve.tiered :as tiered]
+         '[pretrained.continuation.placement :as placement]
          '[pretrained.continuation.replica :as replica])
+
+(def worker-b-tiered
+  (tiered/connect-tiered-store
+   worker-b-store shared-store
+   :write-policy :frontend-only
+   :read-policy :frontend-first
+   :opts {:sync? true}))
 
 (def executor
   (replica/open-executor
    connection "worker-b" :ssd
-   (replica/konserve-repository worker-b-store)
-   (replica/repository-resolver
-    {"worker-a" (replica/konserve-repository worker-a-store)})))
+   (replica/konserve-tiered-promoter worker-b-tiered)))
 
 (placement/request!
  connection {:model-fingerprint fingerprint :prefix-hash prefix
