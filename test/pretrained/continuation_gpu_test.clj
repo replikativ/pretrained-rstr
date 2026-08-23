@@ -1,5 +1,6 @@
 (ns pretrained.continuation-gpu-test
   (:require [clojure.test :refer [deftest is testing]]
+            [pretrained.continuation :as continuation]
             [pretrained.continuation.gpu :as continuation-gpu]
             [pretrained.decoder-gpu :as decoder-gpu]
             [raster.gpu.core :as gpu]))
@@ -51,9 +52,9 @@
             snapshot (continuation-gpu/export-gpu state)
             restored (continuation-gpu/restore-gpu dstate snapshot
                                                    {:model-fingerprint "fixture-v1"})]
-        (testing "two K/V buffers per layer move as one batch"
-          (is (= [:kc0 :vc0 :kc1 :vc1] (mapv first @downloads)))
-          (is (= [:kc0 :vc0 :kc1 :vc1] (mapv first @uploads))))
+        (testing "declared slabs and layers move as one deterministic batch"
+          (is (= [:kc0 :kc1 :vc0 :vc1] (mapv first @downloads)))
+          (is (= [:kc0 :kc1 :vc0 :vc1] (mapv first @uploads))))
         (testing "five occupied rows of two floats each move, not maxpos capacity"
           (is (every? #(= {:elements 10} (nth % 2)) @downloads))
           (is (every? #(= 10 (alength ^floats (second %))) @uploads)))
@@ -69,7 +70,7 @@
         state {:continuation/backend :gpu
                :continuation/dstate dstate
                :continuation/model-fingerprint "fixture-v1"
-               :continuation/layout {:n-layers 2 :n-kv 1 :head-dim 2}
+               :continuation/layout (continuation/model-layout model)
                :continuation/processed-count 6
                :continuation/pending-token 7
                :continuation/tokens [1 2 3 4 5 6 7]}
@@ -98,7 +99,7 @@
         (is (every? #(= 4 (get-in % [2 :src-element])) @downloads))
         (continuation-gpu/upload-gpu-chunk! dstate descriptor
                                             (:chunk/payload tensor-chunk))
-        (is (= [0 8 4 12] (mapv #(get-in % [2 :src-element]) @uploads)))
+        (is (= [0 4 8 12] (mapv #(get-in % [2 :src-element]) @uploads)))
         (is (every? #(= 4 (get-in % [2 :dst-element])) @uploads)))
       (let [resumed (continuation-gpu/resume-prompt-from-prefix
                      dstate "fixture-v1" [1 2 3 4 5 6] 4)]

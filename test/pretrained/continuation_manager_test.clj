@@ -24,9 +24,7 @@
         state {:continuation/backend :cpu
                :continuation/model model
                :continuation/model-fingerprint "fixture-v1"
-               :continuation/layout {:n-layers 1 :n-kv 1 :head-dim 2
-                                     :dtype :float32 :byte-order :little-endian
-                                     :order :layer-kv-token-head-d}
+               :continuation/layout (continuation/model-layout model)
                :continuation/max-position 8
                :continuation/processed-count 2
                :continuation/pending-token 3
@@ -158,7 +156,16 @@
                  @uploads))
           (is (= [[5 4] [6 5]] @decoded))
           (is (= 7 @primed))
-          (is (= 6 (get-in result [:continuation :continuation/processed-count])))))
+          (is (= 6 (get-in result [:continuation :continuation/processed-count])))
+          (is (= {:chunks-planned 2 :chunks-reused 0 :chunks-stored 2
+                  :prefix-lookups 1 :full-hits 0 :partial-hits 1 :misses 0
+                  :requested-tokens 6 :cached-tokens 4
+                  :restored-chunks 2}
+                 (select-keys (manager/stats cache)
+                              [:chunks-planned :chunks-reused :chunks-stored
+                               :prefix-lookups :full-hits :partial-hits :misses
+                               :requested-tokens :cached-tokens
+                               :restored-chunks])))))
       (finally
         (.close cache)
         (d/delete-database config)
@@ -207,7 +214,10 @@
                   5 TimeUnit/SECONDS)
             (.get ^java.util.concurrent.CompletableFuture (:published queued-ticket)
                   5 TimeUnit/SECONDS)
-            (is (some? (manager/lookup cache "fixture-async-v1" [1 2 3]))))))
+            (is (some? (manager/lookup cache "fixture-async-v1" [1 2 3])))
+            (is (= [2 1]
+                   ((juxt :capture-accepted :capture-rejected)
+                    (manager/stats cache)))))))
       (finally
         (.countDown release-capture)
         (.close cache)

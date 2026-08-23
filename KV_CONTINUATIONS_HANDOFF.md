@@ -239,3 +239,23 @@ Important details:
 
 Model-free verification: `clojure -M:test` passes 31 tests / 142 assertions. The focused chunk
 suite covers Datahike -> Konserve mmap -> Raster upload, including old-catalog schema migration.
+
+## 11. UPDATE 2026-08-23 — generalized compatibility boundary and observability
+
+The chunk/GPU paths no longer encode K/V as an implementation assumption. Model descriptors may
+declare heterogeneous attention-state slabs; payloads follow declared slab then layer order and
+content identity includes the resolved layout. Conventional models retain `K0..Kn,V0..Vn` and
+the legacy whole-prefix format remains the KV archival fallback.
+
+`pretrained.model-identity/compatibility-fingerprint` derives a cache namespace from checkpoint
+bytes (or an immutable external revision), config/descriptor, resolved state layout, and an
+execution variant. Name quantization/runtime variants explicitly when their states are not
+numerically compatible.
+
+GPU device selection is now threaded through decoder LMs, embedders, and Qwen3-ASR. Raster's
+managed sessions currently accept `:ze:N` or `:ocl:N`; NVIDIA therefore uses its OpenCL ICD.
+Native `:cuda:N`, copy streams/events, and overlapped restore remain Raster work.
+
+`pretrained.continuation.manager/stats` reports hit quality, token reuse, chunk reuse/storage,
+restored bytes, queue depth, and accepted/rejected captures. The REPL demo returns these counters
+and derives the model fingerprint by default.

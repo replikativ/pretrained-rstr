@@ -495,20 +495,22 @@
   nil program silently records an EMPTY command graph -> the layer never runs, the
   residual stays zero, the whole stack outputs 0.0, and any argmax tail then breaks a
   tie by last-writer -> garbage. Fail loud here instead of miscompiling to zeros."
-  ([v what] (compile-resident-or-throw v what nil))
-  ([v what hint]
+  ([v device-id what] (compile-resident-or-throw v device-id what nil))
+  ([v device-id what hint]
    ;; :on-non-resident :nil so THIS wrapper's message (with the domain-specific hint) fires,
    ;; rather than compile-gpu-program's generic binding-level throw.
-   (or (pipeline/compile-gpu-program v :ze:0 :dtype :float :on-non-resident :nil)
+   (or (pipeline/compile-gpu-program v device-id :dtype :float :on-non-resident :nil)
        (throw (ex-info (str "compile-gpu-program returned nil for " what
                             " — not a resident-compilable program" (when hint (str " " hint)))
-                       {:program what})))))
+                       {:program what :device-id device-id})))))
 
 (defn bind-embed!
   "Compile + bind the PREFILL embed program: n-layers x generated embed layer over
-  T-sized resident buffers. Returns {:sess :model :T}. Replay per text via embed-gpu."
-  [m & {:keys [T qw] :or {T 128}}]
-  (let [eps (:eps m) scale (:attn-scale m)
+  T-sized resident buffers. `:device-id` defaults to `:ze:0`; use an OpenCL
+  device such as `:ocl:0` for NVIDIA or AMD. Returns {:sess :model :T}."
+  [m & {:keys [T qw device-id] :or {T 128 device-id :ze:0}}]
+  (let [_ (gpu/backend-type device-id)
+        eps (:eps m) scale (:attn-scale m)
         ;; The symmetric-window mask kernel now exists on the substrate:
         ;; attn/attn-prefill-scores-windowed! (validated GPU-resident, left =
         ;; right = w gives |i-j| < w). Closing this assert means gen-embed-layer!
@@ -522,7 +524,8 @@
                       (str "bidirectional prefill with T=" T " > sliding window " w
                            " needs the symmetric-window mask (not yet emitted)"))))
         layer-var (gen-embed-layer! m T)
-        layer-prog (compile-resident-or-throw layer-var (str "embed layer (T=" T ")"))
+        layer-prog (compile-resident-or-throw layer-var device-id
+                                              (str "embed layer (T=" T ")"))
         qw (or qw (quantize-q8s m))
         d (long (:d-model m))
         norm-names (set (keys (norm-roles m)))
@@ -543,7 +546,7 @@
                                  {:keys [sym size-fn]} (:allocs layer-prog)]
                              [(keyword (str "L" l "_" (name sym)))
                               [:float (long (size-fn layer-args)) nil]]))
-        sess (gpu/make-session :ze:0)
+        sess (gpu/make-session device-id)
         phases (atom [])]
     (gpu/alloc! sess (merge alloc-specs prog-alloc-specs))
     (swap! sess assoc :chain-roles roles)
@@ -554,7 +557,7 @@
             (gpu/bind-step! sess (assoc step :phase ph) args (fn [a] (pbk norm-names l (name a))))
             (swap! phases conj ph)))))
     (gpu/record-graph! sess @phases :embed)
-    {:sess sess :model m :T T}))
+    {:sess sess :model m :T T :device-id device-id}))
 
 (declare embed-pool-last embed-pool-mean)
 
@@ -627,10 +630,12 @@
 
 (defn bind-decode!
   "Compile the layer + head programs, Q4K-quantize the weights, allocate resident buffers, bind
-  18 layers + head into ONE command graph. Returns a decode-state {:sess :model …}."
-  [m & {:keys [maxpos layer-var head-var qw rms-style prefill-T steer]
-        :or {maxpos 64 rms-style :map-void}}]
-  (let [eps (:eps m) scale (:attn-scale m)
+  all layers + head into one command graph. `:device-id` defaults to `:ze:0`;
+  use an OpenCL device such as `:ocl:0` for NVIDIA or AMD. Returns a decode state."
+  [m & {:keys [maxpos layer-var head-var qw rms-style prefill-T steer device-id]
+        :or {maxpos 64 rms-style :map-void device-id :ze:0}}]
+  (let [_ (gpu/backend-type device-id)
+        eps (:eps m) scale (:attn-scale m)
         ;; Phase-2b: `steer` = {layer-idx ^floats vec} — a per-layer activation-addition at
         ;; :resid-post (steering / concept injection). When present, generate the steer-variant
         ;; layer (an injected residual-add!) and allocate a per-layer L{l}steer :constant buffer,
@@ -641,9 +646,10 @@
         head-var  (or head-var (gen-head! m))
         norm-names (set (keys (norm-roles m)))
         fn-hint (when (= rms-style :fn) "(rms-style :fn is incomplete; use :map-void)")
-        layer-prog (compile-resident-or-throw layer-var (str "layer (rms-style " rms-style ")") fn-hint)
-        head-prog  (compile-resident-or-throw head-var "head")
-        tail-prog  (compile-resident-or-throw #'decode-tail! "decode-tail!")
+        layer-prog (compile-resident-or-throw layer-var device-id
+                                              (str "layer (rms-style " rms-style ")") fn-hint)
+        head-prog  (compile-resident-or-throw head-var device-id "head")
+        tail-prog  (compile-resident-or-throw #'decode-tail! device-id "decode-tail!")
         tail-args  (scalar-args tail-prog {"vocab" (long (:vocab m)) "d" (long (:d-model m))})
         qw (or qw (gpu-quantize m))
         steer-specs (when steer?
@@ -671,7 +677,7 @@
                               [(keyword (name sym)) [:float (long (size-fn (scalar-args head-prog {"eps" eps}))) nil]])
                             (for [{:keys [sym size-fn]} (:allocs tail-prog)]
                               [(keyword (name sym)) [:float (long (size-fn tail-args)) nil]])))
-        sess (gpu/make-session :ze:0)
+        sess (gpu/make-session device-id)
         phases (atom [])]
     (gpu/alloc! sess (merge alloc-specs prog-alloc-specs))
     (swap! sess assoc :chain-roles roles)
@@ -708,7 +714,7 @@
             _ (assert (<= Tp (long maxpos)) "prefill-T must fit in maxpos")
             {:keys [d dff qd kvrow]} (dims-of m)
             pvar (gen-embed-layer! m Tp)
-            pprog (pipeline/compile-gpu-program pvar :ze:0 :dtype :float)
+            pprog (pipeline/compile-gpu-program pvar device-id :dtype :float)
             q8 (quantize-q8s m)
             pscratch (into {} (map (fn [[k v]] [(keyword (str "p_" (name k))) v])
                                    (dissoc (embed-scratch-specs m Tp) :k :v)))
@@ -752,7 +758,8 @@
                 (gpu/bind-step! sess (assoc step :phase ph) args (ppbk l))
                 (swap! pphases conj ph)))))
         (gpu/record-graph! sess @pphases :prefill)))
-    {:sess sess :model m :maxpos maxpos :prefill-T prefill-T}))
+    {:sess sess :model m :maxpos maxpos :prefill-T prefill-T
+     :device-id device-id}))
 
 (defn prefill-rows!
   "Batched prompt prefill: upload the [T,d] input rows (token embeddings with

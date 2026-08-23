@@ -4,7 +4,9 @@
   Every value has one contiguous `:chunk/payload` float array. Konserve 0.9.377
   can expose that nested RFC 8746 payload as a scoped read-only MemorySegment,
   avoiding decode and heap copies on the SSD-to-GPU path."
-  (:require [konserve.core :as k]
+  (:require [boring.core :as boring]
+            [clojure.string :as str]
+            [konserve.core :as k]
             [konserve.filestore :refer [connect-fs-store]]
             [konserve.mmap :as kmm])
   (:import [java.lang AutoCloseable]
@@ -14,7 +16,7 @@
            [java.util UUID]))
 
 (def ^:private hash-domain
-  (.getBytes "pretrained-rstr/kv-chunk-content/v1" StandardCharsets/UTF_8))
+  (.getBytes "pretrained-rstr/attention-chunk-content/v2" StandardCharsets/UTF_8))
 
 (defn- update-long!
   [^MessageDigest digest value]
@@ -36,8 +38,9 @@
   (let [digest (MessageDigest/getInstance "SHA-256")
         prefix ^UUID (:chunk/prefix-hash chunk)
         fingerprint-value (:chunk/model-fingerprint chunk)
-        _ (when-not (string? fingerprint-value)
-            (throw (ex-info "A durable KV chunk requires a model fingerprint"
+        _ (when-not (and (string? fingerprint-value)
+                         (not (str/blank? fingerprint-value)))
+            (throw (ex-info "A durable attention-state chunk requires a model fingerprint"
                             {:model-fingerprint fingerprint-value})))
         fingerprint (.getBytes ^String fingerprint-value
                                StandardCharsets/UTF_8)
@@ -49,8 +52,10 @@
     (update-long! digest (.getLeastSignificantBits prefix))
     (update-long! digest (alength fingerprint))
     (.update digest fingerprint)
-    (doseq [field [:n-layers :n-kv :head-dim]]
-      (update-long! digest (get-in chunk [:chunk/layout field])))
+    (let [attention-layout (get-in chunk [:chunk/layout :attention-state])
+          ^bytes layout-bytes (boring/encode attention-layout {:profile :archival})]
+      (update-long! digest (alength layout-bytes))
+      (.update digest layout-bytes))
     (update-long! digest (:chunk/start chunk))
     (update-long! digest (:chunk/token-count chunk))
     ;; A float[] heap segment cannot expose ByteBuffer on JDK 25. FloatBuffer.put

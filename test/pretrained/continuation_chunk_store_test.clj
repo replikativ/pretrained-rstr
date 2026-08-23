@@ -1,5 +1,6 @@
 (ns pretrained.continuation-chunk-store-test
   (:require [clojure.test :refer [deftest is]]
+            [pretrained.continuation :as continuation]
             [pretrained.continuation.chunk-store :as chunk-store])
   (:import [java.lang.foreign MemorySegment ValueLayout]
            [java.nio ByteOrder]
@@ -17,9 +18,10 @@
                    "pretrained-kv-chunks-"
                    (make-array java.nio.file.attribute.FileAttribute 0))
         store (chunk-store/open-store directory)
-        chunk {:chunk/version 1
+        chunk {:chunk/version 2
                :chunk/model-fingerprint "fixture-v1"
-               :chunk/layout {:n-layers 1 :n-kv 1 :head-dim 2}
+               :chunk/layout (continuation/model-layout
+                              {:n-layers 1 :n-kv 1 :head-dim 2})
                :chunk/start 0
                :chunk/token-count 2
                :chunk/prefix-hash (random-uuid)

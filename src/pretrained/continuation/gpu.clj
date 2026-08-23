@@ -4,7 +4,8 @@
   The logical boundary is shared with `pretrained.continuation`: K/V contains
   `[0, processed-count)`, and the pending token for `processed-count` is also
   resident in the decoder's `r0` buffer."
-  (:require [pretrained.continuation :as continuation]
+  (:require [pretrained.attention-state :as attention-state]
+            [pretrained.continuation :as continuation]
             [pretrained.decoder-gpu :as decoder-gpu]
             [raster.gpu.core :as gpu])
   (:import [java.lang.foreign MemorySegment]))
@@ -14,6 +15,16 @@
   (if (instance? MemorySegment source)
     (quot (.byteSize ^MemorySegment source) 4)
     (alength ^floats source)))
+
+(defn- allocate-tensor-groups
+  [layout token-count]
+  (reduce (fn [state slab]
+            (assoc state (:tensor-key slab)
+                   (vec (repeatedly (:count slab)
+                                    #(float-array (* (long token-count)
+                                                     (:elements-per-token slab)))))))
+          {}
+          (:slabs layout)))
 
 (defn- require-room!
   [state]
@@ -97,41 +108,35 @@
    :continuation/tokens (:continuation/tokens state)})
 
 (defn export-gpu-into!
-  "Download a GPU continuation's occupied K/V prefix into `destinations`.
+  "Download a GPU continuation's occupied attention-state prefix into `destinations`.
 
   `destinations` must have the metadata returned by `export-gpu-metadata` and a
-  K/V vector containing one JVM float array or writable `MemorySegment` per
-  layer. The complete batch is validated by Raster before any copy occurs.
+  tensor vector for every declared slab, containing one JVM float array or
+  writable `MemorySegment` per layer. Raster validates the complete batch.
   Returns `destinations` after the synchronous transfer."
   [state destinations]
   (let [metadata (export-gpu-metadata state)
         dstate (:continuation/dstate state)
-        model (:model dstate)
         processed (long (:continuation/processed-count state))
-        elements (* processed (continuation/kv-row-elements model))
-        n-layers (long (:n-layers model))
-        destination-keys (:continuation/keys destinations)
-        destination-values (:continuation/values destinations)]
-    (when-not (= metadata (dissoc destinations :continuation/keys
-                                   :continuation/values))
+        layout (get-in metadata [:continuation/layout :attention-state])
+        tensor-keys (mapv :tensor-key (:slabs layout))
+        groups (attention-state/tensor-groups destinations)]
+    (when-not (= metadata (apply dissoc destinations tensor-keys))
       (throw (ex-info "GPU export destinations do not match continuation metadata"
                       {:expected metadata
-                       :actual (dissoc destinations :continuation/keys
-                                       :continuation/values)})))
-    (when-not (and (= n-layers (count destination-keys))
-                   (= n-layers (count destination-values))
-                   (every? #(= elements (host-elements %))
-                           (concat destination-keys destination-values)))
+                       :actual (apply dissoc destinations tensor-keys)})))
+    (when-not (every? (fn [[slab tensors]]
+                        (let [elements (* processed (:elements-per-token slab))]
+                          (every? #(= elements (host-elements %)) tensors)))
+                      groups)
       (throw (ex-info "GPU export destinations do not match the occupied prefix"
-                      {:n-layers n-layers :occupied-elements elements})))
+                      {:processed-count processed :attention-state layout})))
     (gpu/download-ranges!
      (:sess dstate)
-     (vec (mapcat (fn [layer]
-                    [[(keyword (str "kc" layer)) (nth destination-keys layer)
-                      {:elements elements}]
-                     [(keyword (str "vc" layer)) (nth destination-values layer)
-                      {:elements elements}]])
-                  (range n-layers))))
+     (vec (for [[slab tensors] groups
+                layer (range (:count slab))]
+            [(attention-state/buffer-key slab layer) (nth tensors layer)
+             {:elements (* processed (:elements-per-token slab))}])))
     destinations))
 
 (defn export-gpu
@@ -140,16 +145,12 @@
   The 2×layers ranged transfers are submitted as one validate-before-copy batch.
   Returns the same portable snapshot shape as `continuation/export-cpu`."
   [state]
-  (let [dstate (:continuation/dstate state)
-        model (:model dstate)
-        processed (long (:continuation/processed-count state))
-        elements (* processed (continuation/kv-row-elements model))
-        n-layers (long (:n-layers model))]
+  (let [processed (long (:continuation/processed-count state))
+        layout (get-in state [:continuation/layout :attention-state])]
     (export-gpu-into!
      state
-     (assoc (export-gpu-metadata state)
-            :continuation/keys (vec (repeatedly n-layers #(float-array elements)))
-            :continuation/values (vec (repeatedly n-layers #(float-array elements)))))))
+     (merge (export-gpu-metadata state)
+            (allocate-tensor-groups layout processed)))))
 
 (defn export-gpu-chunk
   "Download one immutable token-range descriptor into a contiguous float payload.
@@ -160,12 +161,10 @@
   [state descriptor]
   (let [metadata (export-gpu-metadata state)
         dstate (:continuation/dstate state)
-        model (:model dstate)
-        row-elements (continuation/kv-row-elements model)
-        start-element (* (long (:chunk/start descriptor)) row-elements)
-        elements (* (long (:chunk/token-count descriptor)) row-elements)
-        n-layers (long (:n-layers model))
-        payload (float-array (* 2 n-layers elements))]
+        layout (get-in metadata [:continuation/layout :attention-state])
+        slabs (attention-state/payload-plan layout (:chunk/token-count descriptor))
+        slab-layouts (into {} (map (juxt :name identity)) (:slabs layout))
+        payload (float-array (reduce + 0 (map :elements slabs)))]
     (when (> (+ (:chunk/start descriptor) (:chunk/token-count descriptor))
              (:continuation/processed-count state))
       (throw (ex-info "GPU chunk extends beyond the occupied KV prefix"
@@ -173,21 +172,19 @@
                        :processed-count (:continuation/processed-count state)})))
     (gpu/download-ranges!
      (:sess dstate)
-     (vec (mapcat (fn [layer]
-                    [[(keyword (str "kc" layer)) payload
-                      {:src-element start-element
-                       :dst-element (* layer elements)
-                       :elements elements}]
-                     [(keyword (str "vc" layer)) payload
-                      {:src-element start-element
-                       :dst-element (* (+ n-layers layer) elements)
-                       :elements elements}]])
-                  (range n-layers))))
+     (mapv (fn [{:keys [slab layer element-offset elements]}]
+             (let [slab-layout (get slab-layouts slab)]
+               [(attention-state/buffer-key slab-layout layer) payload
+                {:src-element (* (long (:chunk/start descriptor))
+                                 (:elements-per-token slab-layout))
+                 :dst-element element-offset
+                 :elements elements}]))
+           slabs))
     (merge descriptor
-           {:chunk/version 1
+           {:chunk/version 2
             :chunk/model-fingerprint (:continuation/model-fingerprint metadata)
             :chunk/layout (:continuation/layout metadata)
-            :chunk/elements-per-slab elements
+            :chunk/slabs slabs
             :chunk/payload payload})))
 
 (defn upload-gpu-chunk!
@@ -197,13 +194,12 @@
   per-layer batch is validated before any device buffer is changed."
   [dstate descriptor payload]
   (let [{:keys [model maxpos sess]} dstate
-        row-elements (continuation/kv-row-elements model)
         start (long (:kv/start-token descriptor (:chunk/start descriptor)))
         token-count (long (:kv/token-count descriptor (:chunk/token-count descriptor)))
-        start-element (* start row-elements)
-        elements (* token-count row-elements)
-        n-layers (long (:n-layers model))
-        expected-elements (* 2 n-layers elements)]
+        layout (attention-state/layout model)
+        slabs (attention-state/payload-plan layout token-count)
+        slab-layouts (into {} (map (juxt :name identity)) (:slabs layout))
+        expected-elements (reduce + 0 (map :elements slabs))]
     (when (> (+ start token-count) (long maxpos))
       (throw (ex-info "KV chunk does not fit in the resident cache"
                       {:start start :token-count token-count :max-position maxpos})))
@@ -213,16 +209,13 @@
                        :actual-elements (host-elements payload)})))
     (gpu/upload-ranges!
      sess
-     (vec (mapcat (fn [layer]
-                    [[(keyword (str "kc" layer)) payload
-                      {:src-element (* layer elements)
-                       :dst-element start-element
-                       :elements elements}]
-                     [(keyword (str "vc" layer)) payload
-                      {:src-element (* (+ n-layers layer) elements)
-                       :dst-element start-element
-                       :elements elements}]])
-                  (range n-layers))))
+     (mapv (fn [{:keys [slab layer element-offset elements]}]
+             (let [slab-layout (get slab-layouts slab)]
+               [(attention-state/buffer-key slab-layout layer) payload
+                {:src-element element-offset
+                 :dst-element (* start (:elements-per-token slab-layout))
+                 :elements elements}]))
+           slabs))
     dstate))
 
 (defn resume-prompt-from-prefix
@@ -266,10 +259,8 @@
         expected-layout (continuation/model-layout model)
         snapshot-fingerprint (:continuation/model-fingerprint snapshot)
         processed (long (:continuation/processed-count snapshot))
-        elements (* processed (continuation/kv-row-elements model))
-        source-keys (:continuation/keys snapshot)
-        source-values (:continuation/values snapshot)
-        n-layers (long (:n-layers model))]
+        layout (:attention-state expected-layout)
+        groups (attention-state/tensor-groups snapshot)]
     (when-not (= 1 (:continuation/version snapshot))
       (throw (ex-info "Unsupported continuation snapshot version"
                       {:version (:continuation/version snapshot)})))
@@ -283,18 +274,18 @@
     (when (> processed (long maxpos))
       (throw (ex-info "Continuation does not fit in the resident KV cache"
                       {:processed-count processed :max-position maxpos})))
-    (when-not (and (= n-layers (count source-keys))
-                   (= n-layers (count source-values))
-                   (every? #(= elements (host-elements %))
-                           (concat source-keys source-values)))
+    (when-not (every? (fn [[slab tensors]]
+                        (let [elements (* processed (:elements-per-token slab))]
+                          (every? #(= elements (host-elements %)) tensors)))
+                      groups)
       (throw (ex-info "Continuation tensors do not match their declared layout"
-                      {:n-layers n-layers :occupied-elements elements})))
+                      {:processed-count processed :attention-state layout})))
     (gpu/upload-ranges!
      sess
-     (vec (mapcat (fn [layer]
-                    [[(keyword (str "kc" layer)) (nth source-keys layer) {:elements elements}]
-                     [(keyword (str "vc" layer)) (nth source-values layer) {:elements elements}]])
-                  (range n-layers))))
+     (vec (for [[slab tensors] groups
+                layer (range (:count slab))]
+            [(attention-state/buffer-key slab layer) (nth tensors layer)
+             {:elements (* processed (:elements-per-token slab))}])))
     (decoder-gpu/prime-resident-token! dstate (:continuation/pending-token snapshot))
     {:continuation/backend :gpu
      :continuation/dstate dstate

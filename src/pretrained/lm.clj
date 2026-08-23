@@ -5,7 +5,7 @@
     (require '[pretrained.lm :as lm])
     (def g (lm/load-lm :gemma-3-270m-it))                 ;; key -> HF auto-download (pretrained.hub)
     (lm/generate-text g \"The capital of France is\" 20)    ;; => \" Paris. ...\"
-    (lm/load-lm :gemma-3-270m-it {:gpu? true})            ;; resident Intel-GPU decode (Level Zero/OpenCL)
+    (lm/load-lm :gemma-3-270m-it {:gpu? true})            ;; resident GPU decode (Level Zero/OpenCL)
     (lm/load-lm :gemma-3-270m-it \"/local/dir\")            ;; your own weights for a known model
 
   Curated registry only. To run an ARBITRARY HF checkpoint (any registered architecture
@@ -28,8 +28,9 @@
 (defn load-lm
   "Load a decoder LM by registry key. Weights auto-download from HF into the local cache
   on first use (pretrained.hub); pass an explicit local dir to skip the download (your own
-  weights for a known model). opts: {:gpu? true} for resident Intel-GPU decode,
-  :maxpos KV-cache length (GPU, default 2048)."
+  weights for a known model). opts: `:gpu? true` enables resident GPU decode,
+  `:device-id` selects a Raster Level Zero/OpenCL device (default `:ze:0`), and
+  `:maxpos` sets the GPU KV-cache length (default 2048)."
   ([k] (load-lm k nil {}))
   ([k dir-or-opts]
    (if (map? dir-or-opts) (load-lm k nil dir-or-opts) (load-lm k dir-or-opts {})))
@@ -43,7 +44,8 @@
        (do (require 'pretrained.decoder-gpu)
            (assoc base ::mode :gpu
                   ::decode ((requiring-resolve 'pretrained.decoder-gpu/bind-decode!)
-                            base :maxpos (long (or (:maxpos opts) 2048)))))
+                            base :maxpos (long (or (:maxpos opts) 2048))
+                            :device-id (or (:device-id opts) :ze:0))))
        (assoc base ::mode :cpu)))))
 
 (defn generate-ids

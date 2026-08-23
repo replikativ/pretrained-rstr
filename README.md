@@ -10,7 +10,7 @@ Run pretrained HuggingFace models — **text embeddings, speech-to-text, and dec
 LLMs** — natively on the JVM, on the [raster](https://github.com/replikativ/raster)
 typed-dispatch compiler. No Python, no ONNX runtime: weights load from safetensors,
 quantize to int8/int4 streams, and run on raster's CPU int8-MAC kernels and
-Intel-GPU (Level Zero/OpenCL) programs.
+GPU-resident Level Zero/OpenCL programs.
 
 ```clojure
 (require '[pretrained.embed :as emb]
@@ -81,7 +81,7 @@ standard decoder-LM is a descriptor, not engine code.
   WAV pure-JVM, other audio via ffmpeg)
 
 **Quantized execution:** linear weights repack into int8/int4 streams executed by
-raster's spin-pool int8-MAC kernel (CPU) or dp4a kernels (Intel GPU). Q8_0 is measured
+raster's spin-pool int8-MAC kernel (CPU) or GPU dp4a kernels. Q8_0 is measured
 lossless for embeddings; decode uses Q4. Quantized streams are disk-cached next to the
 weights — the first load quantizes once (~30s for 0.6B), warm loads take ~5s.
 
@@ -105,7 +105,7 @@ clojure -A:dev:test:valhalla -M -e "(require 'clojure.test 'pretrained.anchors-t
   (see raster's README for the JVM flags)
 - OpenBLAS for the f32 GEMM paths
 - ffmpeg (optional, for non-WAV audio)
-- Intel GPU (optional): Level Zero or OpenCL runtime for the GPU decode/prefill paths
+- GPU (optional): Level Zero for Intel, or a compatible OpenCL ICD for Intel/NVIDIA/AMD
 
 ## License
 

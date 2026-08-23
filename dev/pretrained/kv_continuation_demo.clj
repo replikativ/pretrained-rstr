@@ -2,7 +2,14 @@
   "REPL showcases for durable CPU round-trips and asynchronous GPU checkpoints."
   (:require [pretrained.continuation :as continuation]
             [pretrained.continuation.gpu :as continuation-gpu]
-            [pretrained.continuation.manager :as manager]))
+            [pretrained.continuation.manager :as manager]
+            [pretrained.model-identity :as model-identity]))
+
+(defn- fingerprint
+  [model opts]
+  (or (:model-fingerprint opts)
+      (model-identity/compatibility-fingerprint
+       model (select-keys opts [:weights-id :execution-variant]))))
 
 (defn- timed
   [f]
@@ -14,10 +21,12 @@
   "Run an uninterrupted/split continuation comparison and catalog the checkpoint.
 
   Intended for an nREPL with `:dev`. `opts` requires `:max-position`,
-  `:model-fingerprint`, `:split-tokens`, and `:tail-tokens`. Returns token-exactness,
+  `:split-tokens`, and `:tail-tokens`. It derives a checkpoint fingerprint unless
+  `:model-fingerprint` is supplied. Returns token-exactness,
   the Datahike entity and separate checkpoint/query/restore timings."
   [model prompt-ids datahike-config cache-directory opts]
-  (let [{:keys [max-position model-fingerprint split-tokens tail-tokens]} opts
+  (let [{:keys [max-position split-tokens tail-tokens]} opts
+        model-fingerprint (fingerprint model opts)
         cache (manager/open-manager datahike-config cache-directory)]
     (try
       (let [total (+ (long split-tokens) (long tail-tokens))
@@ -45,14 +54,16 @@
          :entry (:value checkpoint)
          :checkpoint-ms (:milliseconds checkpoint)
          :query-ms (:milliseconds query)
-         :restore-ms (:milliseconds restore)})
+         :restore-ms (:milliseconds restore)
+         :cache-stats (manager/stats cache)})
       (finally
         (.close cache)))))
 
 (defn run-gpu-async-checkpoints!
   "Generate on a resident decoder while checkpoint capture/publication run behind it.
 
-  `opts` requires `:model-fingerprint`, `:tokens`, and `:checkpoint-every`; it may
+  `opts` requires `:tokens` and `:checkpoint-every`; it derives a checkpoint
+  fingerprint unless one is supplied. It may
   contain `:checkpoint-final?`, `:chunked?`, and `:chunk-size`. The reported
   generation time excludes waiting for cache work. The function subsequently
   waits for accepted tickets so its return value reports durable publication and
@@ -63,8 +74,9 @@
   is caller-asynchronous but may still contend with inference until a native CUDA
   copy-stream/event path is available."
   [dstate prompt-ids datahike-config cache-directory opts]
-  (let [{:keys [model-fingerprint tokens checkpoint-every checkpoint-final?
+  (let [{:keys [tokens checkpoint-every checkpoint-final?
                 chunked? chunk-size]} opts
+        model-fingerprint (fingerprint (:model dstate) opts)
         cache (manager/open-manager datahike-config cache-directory
                                     (cond-> {} chunk-size (assoc :chunk-size chunk-size)))]
     (try
@@ -85,7 +97,8 @@
          :accepted-count (count accepted)
          :capture-drain-ms (:milliseconds captured)
          :publication-drain-ms (:milliseconds published)
-         :entries (:value published)})
+         :entries (:value published)
+         :cache-stats (manager/stats cache)})
       (finally
         (.close cache)))))
 
@@ -93,11 +106,12 @@
   "Checkpoint a prompt as chunks, restore it, and compare generated tokens.
 
   `source-dstate` and `destination-dstate` should be independently bound decoder
-  states for the same model. `opts` requires `:model-fingerprint` and
-  `:tail-tokens`; `:chunk-size` defaults to 256. The returned timings separate the
+  states for the same model. `opts` requires `:tail-tokens`; `:chunk-size` defaults
+  to 256 and the model fingerprint is derived unless supplied. The returned timings separate the
   caller-asynchronous checkpoint submission/drain from query+mmap+GPU restoration."
   [source-dstate destination-dstate prompt-ids datahike-config cache-directory opts]
-  (let [{:keys [model-fingerprint tail-tokens chunk-size]} opts
+  (let [{:keys [tail-tokens chunk-size]} opts
+        model-fingerprint (fingerprint (:model source-dstate) opts)
         cache (manager/open-manager datahike-config cache-directory
                                     (cond-> {} chunk-size (assoc :chunk-size chunk-size)))]
     (try
@@ -120,6 +134,7 @@
          :submit-ms (:milliseconds submit)
          :capture-drain-ms (:milliseconds capture)
          :publication-drain-ms (:milliseconds publication)
-         :restore-ms (:milliseconds restore)})
+         :restore-ms (:milliseconds restore)
+         :cache-stats (manager/stats cache)})
       (finally
         (.close cache)))))

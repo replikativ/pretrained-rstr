@@ -5,7 +5,7 @@
   is the LMCache prefix-chain property: identical suffix tokens under different
   causal prefixes cannot alias. The continuation's pending token is deliberately
   outside the chain because no KV row has been computed for it yet."
-  (:require [pretrained.continuation :as continuation])
+  (:require [pretrained.attention-state :as attention-state])
   (:import [java.nio ByteBuffer]
            [java.nio.charset StandardCharsets]
            [java.security MessageDigest]
@@ -98,24 +98,30 @@
   "Copy one token-range descriptor out of a CPU continuation.
 
   The returned value is a standalone immutable Boring-friendly chunk with one
-  contiguous float payload ordered K layers then V layers. A loader can mmap it
-  once and slice it into per-layer transfers. Only the described range is copied."
+  contiguous float payload in declared slab/layer order. A loader can mmap it
+  once and slice it into transfers. Only the described token range is copied."
   [state descriptor]
   (when-not (= :cpu (:continuation/backend state))
     (throw (ex-info "cpu-tensor-chunk requires a CPU continuation"
                     {:backend (:continuation/backend state)})))
-  (let [model (:continuation/model state)
-        row-elements (continuation/kv-row-elements model)
-        start-element (* (long (:chunk/start descriptor)) row-elements)
-        elements (* (long (:chunk/token-count descriptor)) row-elements)
-        sources (concat (:continuation/keys state) (:continuation/values state))
-        payload (float-array (* elements (count sources)))]
-    (doseq [[payload-index ^floats source] (map-indexed vector sources)]
-      (System/arraycopy source (int start-element) payload
-                        (int (* payload-index elements)) (int elements)))
-    (merge descriptor
-           {:chunk/version 1
-            :chunk/model-fingerprint (:continuation/model-fingerprint state)
-            :chunk/layout (:continuation/layout state)
-            :chunk/elements-per-slab elements
-            :chunk/payload payload})))
+  (let [layout (get-in state [:continuation/layout :attention-state])
+        tensor-groups (into {} (map (fn [[slab tensors]] [(:name slab) [slab tensors]])
+                                    (attention-state/tensor-groups state)))
+        slabs (attention-state/payload-plan layout (:chunk/token-count descriptor))
+        payload-elements (reduce + 0 (map :elements slabs))
+        payload (float-array payload-elements)]
+    (doseq [{:keys [slab layer element-offset elements]} slabs
+            :let [[slab-layout tensors] (get tensor-groups slab)
+                  source-offset (* (long (:chunk/start descriptor))
+                                   (:elements-per-token slab-layout))
+                  source ^floats (nth tensors layer)]]
+      (System/arraycopy source (int source-offset) payload
+                        (int element-offset) (int elements)))
+    (cond-> (merge descriptor
+                   {:chunk/version 2
+                    :chunk/model-fingerprint (:continuation/model-fingerprint state)
+                    :chunk/layout (:continuation/layout state)
+                    :chunk/slabs slabs
+                    :chunk/payload payload})
+      (apply = (map :elements slabs))
+      (assoc :chunk/elements-per-slab (:elements (first slabs))))))

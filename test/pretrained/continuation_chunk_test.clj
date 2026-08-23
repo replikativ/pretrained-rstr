@@ -46,3 +46,27 @@
     (is (= 4 (:chunk/elements-per-slab tensor-chunk)))
     (is (= 2 (:chunk/start tensor-chunk)))
     (is (= 2 (:chunk/token-count tensor-chunk)))))
+
+(deftest cpu-chunks-follow-a-heterogeneous-slab-layout
+  (let [model {:desc {:attention-state
+                      {:kind :latent
+                       :slabs [{:name :latent :tensor-key :continuation/latent
+                                :buffer-prefix "lc" :count 1
+                                :elements-per-token 2}
+                               {:name :rope :tensor-key :continuation/rope
+                                :buffer-prefix "rc" :count 1
+                                :elements-per-token 1}]}}}
+        state {:continuation/backend :cpu
+               :continuation/model model
+               :continuation/model-fingerprint "latent-v1"
+               :continuation/layout (continuation/model-layout model)
+               :continuation/processed-count 3
+               :continuation/pending-token 4
+               :continuation/tokens [1 2 3 4]
+               :continuation/latent [(float-array [10 11 20 21 30 31])]
+               :continuation/rope [(float-array [40 50 60])]}
+        descriptor (second (chunk/plan (:continuation/tokens state) 3 2))
+        tensor-chunk (chunk/cpu-tensor-chunk state descriptor)]
+    (is (= [30.0 31.0 60.0] (vec (:chunk/payload tensor-chunk))))
+    (is (= [2 1] (mapv :elements (:chunk/slabs tensor-chunk))))
+    (is (nil? (:chunk/elements-per-slab tensor-chunk)))))

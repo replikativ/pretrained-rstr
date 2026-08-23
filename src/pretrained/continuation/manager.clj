@@ -17,7 +17,7 @@
 (declare close-manager!)
 
 (defrecord Manager [connection directory chunk-store chunk-size
-                    capture-executor publish-executor closed?]
+                    capture-executor publish-executor closed? metrics]
   Closeable
   (close [manager] (close-manager! manager)))
 
@@ -36,6 +36,27 @@
                        (ArrayBlockingQueue. (int capacity))
                        (daemon-thread-factory prefix)
                        (ThreadPoolExecutor$AbortPolicy.)))
+
+(defn- record-chunk-plan!
+  [^Manager manager planned missing]
+  (swap! (:metrics manager)
+         (fn [metrics]
+           (-> metrics
+               (update :chunks-planned + (count planned))
+               (update :chunks-reused + (- (count planned) (count missing)))
+               (update :chunks-stored + (count missing))))))
+
+(defn stats
+  "Return cache outcomes and current bounded-worker queue depths.
+
+  Counters are process-local and monotonic for this manager instance. They make
+  cache value and inference-path backpressure visible without querying Datahike."
+  [^Manager manager]
+  (assoc @(:metrics manager)
+         :capture-queue-depth (.size (.getQueue ^ThreadPoolExecutor
+                                                (:capture-executor manager)))
+         :publish-queue-depth (.size (.getQueue ^ThreadPoolExecutor
+                                                (:publish-executor manager)))))
 
 (defn- stop-executor!
   [^ExecutorService executor]
@@ -84,7 +105,12 @@
                 (long chunk-size)
                 (bounded-executor "pretrained-kv-capture-" max-pending-captures)
                 (bounded-executor "pretrained-kv-publish-" max-pending-publications)
-                (AtomicBoolean. false)))))
+                (AtomicBoolean. false)
+                (atom {:capture-accepted 0 :capture-rejected 0
+                       :chunks-planned 0 :chunks-reused 0 :chunks-stored 0
+                       :prefix-lookups 0 :full-hits 0 :partial-hits 0 :misses 0
+                       :requested-tokens 0 :cached-tokens 0
+                       :restored-chunks 0 :restored-bytes 0})))))
 
 (defn- missing-chunk-descriptors
   [^Manager manager model-fingerprint descriptors]
@@ -115,6 +141,7 @@
   (let [plan (:chunks (chunk/continuation-plan state (:chunk-size manager)))
         missing (missing-chunk-descriptors
                  manager (:continuation/model-fingerprint state) plan)
+        _ (record-chunk-plan! manager plan missing)
         stored (persist-chunks!
                 manager (mapv #(chunk/cpu-tensor-chunk state %) missing))]
     (publish-chunks! manager (:continuation/model-fingerprint state) stored)))
@@ -139,6 +166,7 @@
             (let [model-fingerprint (:continuation/model-fingerprint state)
                   plan (:chunks (chunk/continuation-plan state (:chunk-size manager)))
                   missing (missing-chunk-descriptors manager model-fingerprint plan)
+                  _ (record-chunk-plan! manager plan missing)
                   stored (persist-chunks!
                           manager (mapv #(continuation-gpu/export-gpu-chunk state %)
                                         missing))
@@ -160,12 +188,15 @@
               (reject! error))))]
     (if (.get ^AtomicBoolean (:closed? manager))
       (let [error (RejectedExecutionException. "Continuation manager is closed")]
+        (swap! (:metrics manager) update :capture-rejected inc)
         (reject! error)
         (assoc ticket :accepted? false))
       (try
         (.execute ^ExecutorService (:capture-executor manager) ^Runnable capture-task)
+        (swap! (:metrics manager) update :capture-accepted inc)
         ticket
         (catch RejectedExecutionException error
+          (swap! (:metrics manager) update :capture-rejected inc)
           (reject! error)
           (assoc ticket :accepted? false))))))
 
@@ -178,11 +209,21 @@
         entries (catalog/lookup-chunks
                  @(:connection manager) model-fingerprint
                  (mapv :chunk/prefix-hash descriptors))
-        matched (catalog/longest-prefix descriptors entries)]
+        matched (catalog/longest-prefix descriptors entries)
+        cached-token-count (reduce + 0 (map :kv/token-count matched))]
+    (swap! (:metrics manager)
+           (fn [metrics]
+             (-> metrics
+                 (update :prefix-lookups inc)
+                 (update :requested-tokens + processed)
+                 (update :cached-tokens + cached-token-count)
+                 (update (cond (= cached-token-count processed) :full-hits
+                               (zero? cached-token-count) :misses
+                               :else :partial-hits) inc))))
     {:descriptors descriptors
      :entries entries
      :matched matched
-     :cached-token-count (reduce + 0 (map :kv/token-count matched))}))
+     :cached-token-count cached-token-count}))
 
 (defn restore-gpu-prefix
   "Restore the longest cached prompt prefix and compute only its missing suffix.
@@ -204,6 +245,11 @@
                             :element-type (:element-type payload)
                             :byte-order (:byte-order payload)})))
          (continuation-gpu/upload-gpu-chunk! dstate entry (:segment payload)))))
+    (swap! (:metrics manager)
+           (fn [metrics]
+             (-> metrics
+                 (update :restored-chunks + (count matched))
+                 (update :restored-bytes + (reduce + 0 (map :kv/bytes matched))))))
     (assoc lookup-result
            :continuation
            (continuation-gpu/resume-prompt-from-prefix
@@ -319,12 +365,15 @@
               (reject! error))))]
     (if (.get ^AtomicBoolean (:closed? manager))
       (let [error (RejectedExecutionException. "Continuation manager is closed")]
+        (swap! (:metrics manager) update :capture-rejected inc)
         (reject! error)
         (assoc ticket :accepted? false))
       (try
         (.execute ^ExecutorService (:capture-executor manager) ^Runnable capture-task)
+        (swap! (:metrics manager) update :capture-accepted inc)
         ticket
         (catch RejectedExecutionException error
+          (swap! (:metrics manager) update :capture-rejected inc)
           (reject! error)
           (assoc ticket :accepted? false))))))
 

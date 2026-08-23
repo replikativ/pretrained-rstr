@@ -6,20 +6,27 @@
   at `processed-count`.  One step writes that token's K/V row and produces the
   next pending token.  This is the same boundary used by resident GPU decode, so
   CPU and GPU snapshots do not need to persist logits or hidden states."
-  (:require [pretrained.decoder :as dec]
+  (:require [pretrained.attention-state :as attention-state]
+            [pretrained.decoder :as dec]
             [pretrained.sampling :as sampling])
   (:import [java.nio ByteOrder]))
 
 (defn model-layout
-  "Return the durable KV layout descriptor for `model`."
+  "Return the durable attention-state layout descriptor for `model`.
+
+  Conventional KV dimensions remain at the top level for version-1 snapshot
+  compatibility. Non-KV architectures can omit them and describe their state
+  entirely through `:desc/:attention-state`."
   [model]
-  {:n-layers (long (:n-layers model))
-   :n-kv (long (:n-kv model))
-   :head-dim (long (:head-dim model))
-   :dtype :float32
-   :byte-order (if (= ByteOrder/LITTLE_ENDIAN (ByteOrder/nativeOrder))
-                 :little-endian :big-endian)
-   :order :layer-kv-token-head-d})
+  (let [attention-layout (attention-state/layout model)]
+    (cond-> {:dtype :float32
+             :byte-order (if (= ByteOrder/LITTLE_ENDIAN (ByteOrder/nativeOrder))
+                           :little-endian :big-endian)
+             :attention-state attention-layout}
+      (:n-layers model) (assoc :n-layers (long (:n-layers model)))
+      (:n-kv model) (assoc :n-kv (long (:n-kv model)))
+      (:head-dim model) (assoc :head-dim (long (:head-dim model)))
+      (= :kv (:kind attention-layout)) (assoc :order :layer-kv-token-head-d))))
 
 (defn kv-row-elements
   "Return the number of scalar K or V elements stored per token and layer."
