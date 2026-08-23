@@ -17,6 +17,7 @@
             [pretrained.decoder-gpu :as dgpu]
             [raster.quant.pack :as qpack]
             [raster.gpu.core :as gpu]
+            [raster.compiler.pipeline :as pipeline]
             [pretrained.loader :as loader]
             [pretrained.arch.qwen3 :as qwen3]
             [raster.arrays :as arr]
@@ -305,7 +306,8 @@
         nvalid (+ (* 13 (quot (long valid) 100))
                   (let [r (rem (long valid) 100)] (if (pos? r) (f1 (f1 (f1 r))) 0)))
         audio-rows (if (:gpu-encoder? opts)
-                     (aut-encode-gpu m (:x stem) (:T stem))
+                     (aut-encode-gpu m (:x stem) (:T stem)
+                                     (or (:device-id opts) :ze:0))
                      (aut-encode m (:x stem) (:T stem)))
         prompt (-> [IM-START]
                    (into (encode-text m (str "system\n" (or context ""))))
@@ -461,12 +463,12 @@
   "Bind the 18-layer AuT block program at block size T into a fresh session.
   Returns {:sess :T}. Cached per T on the model's ::aut-sessions atom is the
   caller's business — binding is ~seconds (program compile is cached by name)."
-  [m T]
+  [m T device-id]
   (let [{:keys [d ffn layers heads]} (:audio m)
         T (long T) d (long d) ffn (long ffn)
         hd (quot d heads)
         layer-var (gen-aut-layer! m T)
-        prog (raster.compiler.pipeline/compile-gpu-program layer-var :ze:0 :dtype :float)
+        prog (pipeline/compile-gpu-program layer-var device-id :dtype :float)
         qz (aut-quantize m)
         scratch {:h [:float (* T d) nil] :hp [:int (* T (quot d 4)) nil]
                  :hs [:float (* T (quot d 32)) nil]
@@ -502,7 +504,7 @@
                       (for [l (range layers)
                             {:keys [sym size-fn]} (:allocs prog)]
                         [(keyword (str "AL" l "_" (name sym))) [:float (long (size-fn args)) nil]]))
-        sess (gpu/make-session :ze:0)
+        sess (gpu/make-session device-id)
         pbk (fn [l] (fn [a]
                       (let [pn (name a)]
                         (cond (= pn "r-in")  (keyword (str "ar" l))
@@ -520,7 +522,7 @@
           (gpu/bind-step! sess (assoc step :phase ph) args (pbk l))
           (swap! phases conj ph))))
     (gpu/record-graph! sess @phases :aut)
-    {:sess sess :T T}))
+    {:sess sess :T T :device-id device-id}))
 
 (def ^:private aut-sessions (atom {}))
 
@@ -528,43 +530,47 @@
   "GPU AuT encode: run each `win`-sized block through the resident 18-layer
   program (one session per distinct block size, cached), then ln_post +
   projector on the CPU (tiny). Drop-in for aut-encode."
-  ^floats [m ^floats x0 T]
-  (let [{:keys [d layers window out-dim]} (:audio m)
-        T (long T) d (long d) win (long window)
-        nblk (quot (+ T (dec win)) win)
-        out (float-array (* T d))]
-    (dotimes [bi nblk]
-      (let [b0 (* bi win)
-            bt (min win (- T b0))
-            {:keys [sess]} (or (get @aut-sessions [(:dir m) bt])
-                               (let [s (bind-aut! m bt)]
-                                 (swap! aut-sessions assoc [(:dir m) bt] s) s))]
-        (gpu/upload! sess :ar0 (java.util.Arrays/copyOfRange x0 (* b0 d) (* (+ b0 bt) d)))
-        (gpu/replay! sess :aut)
-        (System/arraycopy (gpu/download sess (keyword (str "ar" layers))) 0
-                          out (* b0 d) (* bt d))))
-    ;; final norm + projector (CPU: [T,d] x 2 small GEMMs)
-    (let [xf (layer-norm-b out (t m "audio_tower.ln_post.weight") (t m "audio_tower.ln_post.bias") T d)
-          p1 (gelu! (nn/linear xf (t m "multi_modal_projector.linear_1.weight")
-                               (t m "multi_modal_projector.linear_1.bias") T d d))]
-      (nn/linear p1 (t m "multi_modal_projector.linear_2.weight")
-                 (t m "multi_modal_projector.linear_2.bias") T d out-dim))))
+  (^floats [m ^floats x0 T] (aut-encode-gpu m x0 T :ze:0))
+  (^floats [m ^floats x0 T device-id]
+   (let [{:keys [d layers window out-dim]} (:audio m)
+         T (long T) d (long d) win (long window)
+         nblk (quot (+ T (dec win)) win)
+         out (float-array (* T d))]
+     (dotimes [bi nblk]
+       (let [b0 (* bi win)
+             bt (min win (- T b0))
+             {:keys [sess]} (or (get @aut-sessions [(:dir m) bt device-id])
+                                (let [s (bind-aut! m bt device-id)]
+                                  (swap! aut-sessions assoc [(:dir m) bt device-id] s) s))]
+         (gpu/upload! sess :ar0 (java.util.Arrays/copyOfRange x0 (* b0 d) (* (+ b0 bt) d)))
+         (gpu/replay! sess :aut)
+         (System/arraycopy (gpu/download sess (keyword (str "ar" layers))) 0
+                           out (* b0 d) (* bt d))))
+     ;; final norm + projector (CPU: [T,d] x 2 small GEMMs)
+     (let [xf (layer-norm-b out (t m "audio_tower.ln_post.weight")
+                            (t m "audio_tower.ln_post.bias") T d)
+           p1 (gelu! (nn/linear xf (t m "multi_modal_projector.linear_1.weight")
+                                (t m "multi_modal_projector.linear_1.bias") T d d))]
+       (nn/linear p1 (t m "multi_modal_projector.linear_2.weight")
+                  (t m "multi_modal_projector.linear_2.bias") T d out-dim)))))
 
 ;; ---------------------------------------------------------------------------
-;; GPU-resident transcription (Arc/Level-Zero via pretrained.decoder-gpu)
+;; GPU-resident transcription (Level Zero/OpenCL via pretrained.decoder-gpu)
 ;; ---------------------------------------------------------------------------
 
 (defn bind-gpu
   "Compile + bind the resident GPU decode graph for this ASR model's Qwen3 LM.
   Expensive (compile + Q-quantize + upload); do it once and reuse the returned
   dstate across transcriptions. maxpos bounds prompt+generation length."
-  [m & {:keys [maxpos prefill-T] :or {maxpos 1024}}]
+  [m & {:keys [maxpos prefill-T device-id]
+        :or {maxpos 1024 device-id :ze:0}}]
   ;; prefill-T (opt-in): binds the batched-prefill graph. MEASURED on Arc/ze:
   ;; one prefill replay (28 layers x ~15 steps = 420 kernels) is LATENCY-bound
   ;; at these dims — 4.9s @T=256 vs ~1.2s for 158 sequential decode replays —
   ;; so per-token priming stays the default until the graph runs at higher
   ;; occupancy (fused steps or bigger batch). Correctness is validated.
-  (dgpu/bind-decode! m :maxpos maxpos :prefill-T prefill-T))
+  (dgpu/bind-decode! m :maxpos maxpos :prefill-T prefill-T
+                       :device-id device-id))
 
 (defn transcribe-gpu
   "GPU-resident transcription: the prompt primes the KV cache one row per graph
@@ -580,7 +586,8 @@
          {:keys [prompt ^floats audio-rows]} (prep-prompt m wav opts)
          P (count prompt)
          d (long (:d-model m))
-         dstate (or dstate (bind-gpu m :maxpos (+ P (long max-new))))
+         dstate (or dstate (bind-gpu m :maxpos (+ P (long max-new))
+                                      :device-id (or (:device-id opts) :ze:0)))
          maxpos (long (:maxpos dstate))]
      (when (> (+ P (long max-new)) maxpos)
        (throw (ex-info (str "prompt (" P ") + max-new (" max-new

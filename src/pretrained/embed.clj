@@ -43,14 +43,17 @@
 
 (defn load-embedder
   "Load an embedding model by registry key — weights auto-download from HF into
-  the local cache on first use (pretrained.hub). Pass an explicit dir to skip."
-  ([k]
-   (let [entry (get registry k)]
-     (assert entry (str "unknown embedder " k " — known: " (keys registry)))
-     (load-embedder k ((requiring-resolve 'pretrained.hub/ensure-model) (:hf entry)))))
-  ([k dir]
-   (let [entry (get registry k)]
-     (assert entry (str "unknown embedder " k " — known: " (keys registry)))
+  the local cache on first use (pretrained.hub). Pass an explicit dir to skip.
+  GPU entries accept `:T` and a Raster `:device-id` (default `:ze:0`)."
+  ([k] (load-embedder k nil {}))
+  ([k dir-or-opts]
+   (if (map? dir-or-opts)
+     (load-embedder k nil dir-or-opts)
+     (load-embedder k dir-or-opts {})))
+  ([k dir opts]
+   (let [entry (get registry k)
+         _ (assert entry (str "unknown embedder " k " — known: " (keys registry)))
+         dir (or dir ((requiring-resolve 'pretrained.hub/ensure-model) (:hf entry)))]
      (case (:engine entry)
        :decoder (do (require (:arch entry))
                     (assoc (loader/from-pretrained dir) ::entry entry))
@@ -61,7 +64,9 @@
              bind-embed (requiring-resolve 'pretrained.decoder-gpu/bind-embed!)
              quantize (requiring-resolve 'pretrained.decoder-gpu/quantize-q8s)
              m (assoc (loader/from-pretrained dir) ::entry entry)]
-         (assoc m ::gpu (bind-embed m :T (or (:T entry) 128) :qw (quantize m))))
+         (assoc m ::gpu (bind-embed m :T (or (:T opts) (:T entry) 128)
+                                      :device-id (or (:device-id opts) :ze:0)
+                                      :qw (quantize m))))
        :encoder
        (do (require 'pretrained.arch.bert)
            {::entry entry

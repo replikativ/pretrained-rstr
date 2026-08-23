@@ -131,6 +131,70 @@
       (is (.contains ^String (decode tok out) "Paris")
           "greedy GPU decode answers Paris (non-degenerate, non-zero logits)"))))
 
+(deftest ^:anchors ^:gpu gemma-gpu-continuation-roundtrip-anchor
+  (if-not (and (have? "gemma-3-270m-it") (.exists (java.io.File. (mdir "gemma-3-270m-it")))
+               (gpu-up?))
+    (println "SKIP gemma GPU continuation anchor (weights or GPU not present)")
+    (let [from (requiring-resolve 'pretrained.loader/from-pretrained)
+          bind (requiring-resolve 'pretrained.decoder-gpu/bind-decode!)
+          close (requiring-resolve 'raster.gpu/close-session!)
+          start (requiring-resolve 'pretrained.continuation.gpu/start-gpu)
+          advance (requiring-resolve 'pretrained.continuation.gpu/advance-gpu)
+          open-manager (requiring-resolve 'pretrained.continuation.manager/open-manager)
+          checkpoint (requiring-resolve 'pretrained.continuation.manager/checkpoint-gpu!)
+          lookup (requiring-resolve 'pretrained.continuation.manager/lookup)
+          restore (requiring-resolve 'pretrained.continuation.manager/restore-gpu)
+          delete-db (requiring-resolve 'datahike.api/delete-database)
+          g (from (mdir "gemma-3-270m-it"))
+          {:keys [tok encode]} (:tokenizer g)
+          prompt (vec (encode tok "The capital of France is"))
+          directory (java.nio.file.Files/createTempDirectory
+                     "pretrained-gemma-kv-"
+                     (make-array java.nio.file.attribute.FileAttribute 0))
+          config {:store {:backend :memory :id (random-uuid)}
+                  :schema-flexibility :write :keep-history? false :value-caps :default}
+          cache (open-manager config directory)
+          source-state (volatile! (bind g :maxpos 64))
+          fresh-state (volatile! nil)]
+      (try
+        (let [fingerprint "gemma-3-270m-it-anchor"
+              {:keys [uninterrupted-tokens first-part-tokens entry found]}
+              (let [source @source-state
+                    uninterrupted (advance
+                                   (start source prompt {:model-fingerprint fingerprint}) 6)
+                    first-part (advance
+                                (start source prompt {:model-fingerprint fingerprint}) 2)
+                    entry (checkpoint cache (:continuation first-part))
+                    found (lookup cache fingerprint
+                                  (:continuation/tokens (:continuation first-part)))]
+                (close (:sess source))
+                (vreset! source-state nil)
+                {:uninterrupted-tokens (:tokens uninterrupted)
+                 :first-part-tokens (:tokens first-part)
+                 :entry entry
+                 :found found})
+              _ (System/gc)
+              fresh (bind g :maxpos 64)
+              _ (vreset! fresh-state fresh)
+              restored (restore found fresh {:model-fingerprint fingerprint})
+              second-part (advance restored 4)]
+          (is (= (:kv/id entry) (:kv/id found))
+              "Datahike resolves the exact token prefix to its mmap snapshot")
+          (is (= uninterrupted-tokens
+                 (into first-part-tokens (:tokens second-part)))
+              "GPU -> mmap -> fresh GPU continuation is token-exact"))
+        (finally
+          (when-let [fresh @fresh-state]
+            (close (:sess fresh)))
+          (when-let [source @source-state]
+            (close (:sess source)))
+          (.close ^java.io.Closeable cache)
+          (delete-db config)
+          (with-open [paths (java.nio.file.Files/list directory)]
+            (doseq [path (iterator-seq (.iterator paths))]
+              (java.nio.file.Files/deleteIfExists path)))
+          (java.nio.file.Files/deleteIfExists directory))))))
+
 (deftest ^:anchors ^:gpu gpu-embedder-anchor
   ;; GPU prefill embedders (bind-embed!/embed-gpu — a DIFFERENT path than decode).
   ;; Same retrieval structure the torch-validated CPU anchor asserts.
