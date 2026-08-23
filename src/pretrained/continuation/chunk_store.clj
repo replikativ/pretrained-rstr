@@ -1,17 +1,21 @@
 (ns pretrained.continuation.chunk-store
   "Immutable KV chunks in a local Boring-backed Konserve filestore.
 
-  Every value has one contiguous `:chunk/payload` float array. Konserve 0.9.377
+  Every value has one contiguous `:chunk/payload` float array. Konserve 0.9.379
   can expose that nested RFC 8746 payload as a scoped read-only MemorySegment,
   avoiding decode and heap copies on the SSD-to-GPU path."
   (:require [boring.core]
+            [clojure.core.async :refer [<!!]]
             [clojure.string :as str]
             [hasch.core :as hasch]
             [konserve.core :as k]
             [konserve.filestore :refer [connect-fs-store]]
-            [konserve.mmap :as kmm])
+            [konserve.mmap :as kmm]
+            [konserve.tiered :as tiered])
   (:import [java.lang AutoCloseable]
            [java.util UUID]))
+
+(def ^:private durability-receipt-key ::durability-receipt)
 
 (defn content-id
   "Return the Hasch identity for a tensor chunk and its logical prefix.
@@ -53,6 +57,49 @@
     (when-not (k/exists? store store-key {:sync? true})
       (k/assoc store store-key chunk {:immutable? true} {:sync? true}))
     (describe store store-key)))
+
+(defn put-write-behind!
+  "Store one immutable chunk through a write-behind tiered store.
+
+  `local-store` must be the tiered store's mmap-compatible frontend. The
+  returned map describes that local copy and carries an internal durability
+  receipt for `await-durable!`. This function returns after the local write;
+  the authoritative backend write remains asynchronous.
+
+  The tiered write is deliberately repeated when the local content-addressed
+  object already exists. A previous backend attempt may have failed, so local
+  presence alone cannot prove global durability."
+  [local-store tiered-store chunk]
+  (let [store-key (content-id chunk)
+        {:keys [opts receipt]}
+        (tiered/with-write-behind-receipt {:sync? true})]
+    (k/assoc tiered-store store-key chunk {:immutable? true} opts)
+    (assoc (describe local-store store-key) durability-receipt-key receipt)))
+
+(defn local-result
+  "Return stored chunk fields without its private durability receipt."
+  [stored]
+  (dissoc stored durability-receipt-key))
+
+(defn await-durable!
+  "Wait for a stored chunk's authoritative backend write.
+
+  Plain local `put!` results have no receipt and return immediately. A failed
+  write-behind receipt throws with the storage identity in its exception data.
+  Returns the public local storage fields."
+  [stored]
+  (if-let [receipt (get stored durability-receipt-key)]
+    (let [{:keys [status error] :as outcome} (<!! receipt)]
+      (case status
+        :succeeded (local-result stored)
+        :failed (throw (ex-info "The authoritative continuation chunk write failed"
+                                {:store-key (:store-key stored)
+                                 :outcome (dissoc outcome :error)}
+                                error))
+        (throw (ex-info "The continuation chunk durability receipt was invalid"
+                        {:store-key (:store-key stored)
+                         :outcome outcome}))))
+    stored))
 
 (defn stored?
   "Return true when `store-key` is present in this chunk store."

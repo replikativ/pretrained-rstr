@@ -123,6 +123,22 @@ cold SSD. Chunk identities use Hasch and are published as Datahike
 `:db.type/store-ref` values, while the prefix hash separately identifies the
 causal token chain.
 
+For cluster durability, pass an already connected authoritative Konserve store
+(for example Konserve-S3) as `:chunk-backend-store`. The manager owns its local
+filestore but the caller retains ownership of the backend connection:
+
+```clojure
+(cache/open-manager datahike-config "/var/tmp/pretrained-kv"
+                    {:chunk-size 256
+                     :chunk-backend-store s3-store})
+```
+
+Chunk checkpoints write the local mmap-compatible frontend first. Their
+`:captured` future can therefore complete while the remote copy is in flight;
+`:published` completes only after every Konserve write-behind receipt succeeds
+and the Datahike transaction commits. Datahike never advertises a store-ref that
+only exists in one worker's cache.
+
 `pretrained.continuation.placement` records declarative per-worker demands and
 observed replicas. `pretrained.continuation.replica/open-executor` connects that
 control plane to a bounded background copy worker: it moves bytes off-band,

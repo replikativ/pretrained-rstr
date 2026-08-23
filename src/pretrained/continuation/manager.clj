@@ -1,6 +1,7 @@
 (ns pretrained.continuation.manager
   "Local durable continuation manager: snapshot files plus a Datahike catalog."
   (:require [datahike.api :as d]
+            [konserve.tiered :as tiered]
             [pretrained.continuation :as continuation]
             [pretrained.continuation.catalog :as catalog]
             [pretrained.continuation.chunk :as chunk]
@@ -16,7 +17,7 @@
 
 (declare close-manager!)
 
-(defrecord Manager [connection directory chunk-store chunk-size
+(defrecord Manager [connection directory chunk-store chunk-write-store chunk-size
                     capture-executor publish-executor closed? metrics]
   Closeable
   (close [manager] (close-manager! manager)))
@@ -81,11 +82,14 @@
 
   `opts` controls bounded background work with `:max-pending-captures` and
   `:max-pending-publications` (both default to 2), plus `:chunk-size` (default
-  256 processed tokens). Each stage has one low-priority daemon worker. Queue
+  256 processed tokens). `:chunk-backend-store` optionally supplies a
+  caller-owned authoritative Konserve store. Chunk writes then return after the
+  local filestore frontend and publish to Datahike only after their write-behind
+  receipts succeed. Each stage has one low-priority daemon worker. Queue
   saturation rejects cache work instead of blocking inference."
   ([datahike-config directory] (open-manager datahike-config directory {}))
   ([datahike-config directory {:keys [max-pending-captures max-pending-publications
-                                      chunk-size]
+                                      chunk-size chunk-backend-store]
                                :or {max-pending-captures 2
                                     max-pending-publications 2
                                     chunk-size chunk/default-chunk-size}}]
@@ -99,18 +103,27 @@
          chunk-path (.resolve path "chunks")]
      (Files/createDirectories path (make-array java.nio.file.attribute.FileAttribute 0))
      (Files/createDirectories chunk-path (make-array java.nio.file.attribute.FileAttribute 0))
-     (->Manager (catalog/ensure-database! datahike-config)
-                path
-                (chunk-store/open-store chunk-path)
-                (long chunk-size)
-                (bounded-executor "pretrained-kv-capture-" max-pending-captures)
-                (bounded-executor "pretrained-kv-publish-" max-pending-publications)
-                (AtomicBoolean. false)
-                (atom {:capture-accepted 0 :capture-rejected 0
-                       :chunks-planned 0 :chunks-reused 0 :chunks-stored 0
-                       :prefix-lookups 0 :full-hits 0 :partial-hits 0 :misses 0
-                       :requested-tokens 0 :cached-tokens 0
-                       :restored-chunks 0 :restored-bytes 0})))))
+     (let [local-store (chunk-store/open-store chunk-path)
+           write-store (if chunk-backend-store
+                         (tiered/connect-tiered-store
+                          local-store chunk-backend-store
+                          :write-policy :write-behind
+                          :read-policy :frontend-first
+                          :opts {:sync? true})
+                         local-store)]
+       (->Manager (catalog/ensure-database! datahike-config)
+                  path
+                  local-store
+                  write-store
+                  (long chunk-size)
+                  (bounded-executor "pretrained-kv-capture-" max-pending-captures)
+                  (bounded-executor "pretrained-kv-publish-" max-pending-publications)
+                  (AtomicBoolean. false)
+                  (atom {:capture-accepted 0 :capture-rejected 0
+                         :chunks-planned 0 :chunks-reused 0 :chunks-stored 0
+                         :prefix-lookups 0 :full-hits 0 :partial-hits 0 :misses 0
+                         :requested-tokens 0 :cached-tokens 0
+                         :restored-chunks 0 :restored-bytes 0}))))))
 
 (defn- missing-chunk-descriptors
   [^Manager manager model-fingerprint descriptors]
@@ -124,13 +137,19 @@
   [^Manager manager tensor-chunks]
   (mapv (fn [tensor-chunk]
           (merge tensor-chunk
-                 (chunk-store/put! (:chunk-store manager) tensor-chunk)))
+                 (if (identical? (:chunk-store manager)
+                                 (:chunk-write-store manager))
+                   (chunk-store/put! (:chunk-store manager) tensor-chunk)
+                   (chunk-store/put-write-behind!
+                    (:chunk-store manager) (:chunk-write-store manager)
+                    tensor-chunk))))
         tensor-chunks))
 
 (defn- publish-chunks!
   [^Manager manager model-fingerprint stored-chunks]
-  (catalog/put-chunks! (:connection manager) model-fingerprint stored-chunks)
-  stored-chunks)
+  (let [durable-chunks (mapv chunk-store/await-durable! stored-chunks)]
+    (catalog/put-chunks! (:connection manager) model-fingerprint durable-chunks)
+    durable-chunks))
 
 (defn checkpoint-cpu-chunks!
   "Persist missing immutable chunks from a CPU continuation and catalog them.
@@ -180,9 +199,9 @@
               (try
                 (.execute ^ExecutorService (:publish-executor manager)
                           ^Runnable publish-task)
-                (.complete captured stored)
+                (.complete captured (mapv chunk-store/local-result stored))
                 (catch RejectedExecutionException error
-                  (.complete captured stored)
+                  (.complete captured (mapv chunk-store/local-result stored))
                   (.completeExceptionally published error))))
             (catch Throwable error
               (reject! error))))]
