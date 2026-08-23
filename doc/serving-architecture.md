@@ -1,0 +1,201 @@
+# Distributed paged inference
+
+This document defines the serving architecture that the durable continuation
+prototype should grow into. Its two goals are to make pretrained models useful
+as a continuously batched inference runtime and to expose a concrete integration
+of Raster, Datahike, Konserve, Simmis, and Proximum.
+
+The durable cache is one input to scheduling, not the scheduler itself. Datahike
+holds queryable durable facts and desired placement; each inference process owns
+its latency-critical GPU allocator, queues, and transfer streams.
+
+## Requirements
+
+- Preserve the exact continuation boundary: attention state covers
+  `[0, processed-count)`, and `pending-token` is processed next.
+- Share exact token prefixes without copying their resident GPU pages.
+- Admit, preempt, resume, and mix prefill and decode work without allocating a
+  model-sized contiguous KV cache per request.
+- Keep checkpoint, object-store, catalog, and policy work off the inference
+  stream. Saturation drops speculative cache work, not tokens.
+- Support CUDA/NVIDIA and Level Zero through Raster's backend-neutral buffer,
+  stream, and event interfaces.
+- Describe persistent attention state as named slabs. Standard K/V, sliding
+  window K/V, and latent attention state must not require different storage or
+  policy engines.
+- Make decisions explainable and replayable from Datahike/Yggdrasil history,
+  while keeping Datalog and network round trips out of the per-token hot path.
+
+## Units of storage and execution
+
+Three granularities serve different workloads and must remain independent:
+
+| Unit | Typical size | Purpose |
+| --- | ---: | --- |
+| GPU page | 16–32 tokens per slab | allocation, sharing, copy-on-write, eviction |
+| Durable chunk | 128–512 tokens | hashing, object-store transfer, catalog publication |
+| Request span | arbitrary | one logical continuation and scheduler lane |
+
+A durable chunk contains an integral sequence of serialized slab ranges and may
+fill several GPU pages. Its final range may end in a partial page. Page size is a
+runtime/kernel choice; changing it does not change the Hasch content identity of
+a durable chunk. Conversely, changing durable chunk size changes prefix-chain
+nodes but not the attention result.
+
+The existing causal hash chain remains the authoritative exact-prefix index. A
+chunk commits to its parent hash and token range, so a lookup can stop safely at
+the first missing or incompatible node. Datahike can also index token ranges,
+owners, tenants, models, time, and observed reuse; the chain is not the only
+query path.
+
+## Components and ownership
+
+```text
+                       Datahike / Kabel writer
+                 catalog, demand, leases, observations
+                                |
+                    tx reports / policy snapshots
+                                v
+  request ---> scheduler ---> local cache manager ---> Raster batch executor
+                 |                 |        |             | GPU page pool
+                 |                 |        +-- SSD mmap --+ transfer stream
+                 |                 +----------- RAM staging
+                 v
+          admission/prefetch policy
+                 |
+                 +---------- Konserve tiered store ---------- S3
+                              immutable chunks
+```
+
+### Scheduler
+
+The scheduler owns request lifecycle and builds a new execution batch each
+iteration. It maintains decode, prefill, restore-ready, transfer-waiting, and
+preempted queues. Admission is constrained by a token budget, free GPU pages,
+model/layout compatibility, deadlines, and estimated restore-versus-recompute
+cost. Decode requests normally receive priority to avoid inter-token latency
+spikes, while a bounded prefill budget prevents starvation.
+
+Each request record contains its model fingerprint, token history, processed
+count, pending token, sampling state, deadline/priority, and logical page table.
+Sampling state is part of a resumable request but not part of reusable attention
+state: many samplers may safely share the same exact prefix pages.
+
+### GPU cache manager
+
+One manager per device owns physical pages and never delegates allocation to
+Datahike. A page moves through `free`, `loading`, `resident`, `evicting`, and
+`free`; a generation counter prevents a late transfer event from completing into
+a reused page. Resident pages have refcounts and immutable prefix identity.
+Appending to a shared partial tail uses copy-on-write.
+
+The manager exposes reservations, page-table installation, pin/unpin, and
+asynchronous load/evict operations. Transfers use a dedicated CUDA/Level Zero
+stream and events. A request becomes runnable only after its required page events
+complete; unrelated lanes continue decoding.
+
+### Raster execution contract
+
+Raster should accept one descriptor for a ragged batch rather than one recorded
+graph per request:
+
+```clojure
+{:tokens       int[B]
+ :positions    long[B]
+ :sequence-len long[B]
+ :page-table   int[B,max-pages]
+ :page-count   int[B]
+ :slot-offset  int[B]}
+```
+
+Attention state is a set of physical slab pools described by
+`pretrained.attention-state/layout`. Standard GQA has key and value pools;
+sliding-window models add per-layer retention metadata; MLA can describe latent
+and rotary slabs. Kernels receive page geometry and slab bindings rather than
+assuming contiguous `kcN`/`vcN` arrays. The first implementation can bucket by
+model, dtype, page geometry, and decode/prefill mode; heterogeneous model batches
+are not required.
+
+Continuous batching then becomes a host scheduling operation: completed lanes
+leave, newly ready lanes enter, and the same compiled Raster programs consume a
+different descriptor on the next replay.
+
+## Restore and checkpoint flows
+
+Restore is planned before bytes move:
+
+1. Query the longest exact compatible prefix and its observed locations.
+2. Reserve enough GPU pages or choose a smaller prefix under pressure.
+3. Prefer already-resident shared pages, then local SSD, RAM, peer, object store,
+   or recomputation according to measured completion cost.
+4. Stream durable chunks through bounded mmap scopes into reserved page ranges.
+   Chunk boundaries do not need to align with pages.
+5. Publish local `ready` observations only after content verification; mark the
+   request runnable only after GPU transfer events complete.
+6. Prefill the uncached suffix and leave the final token pending.
+
+Checkpointing takes immutable completed page ranges. GPU-to-host copies run on a
+transfer stream into a bounded pinned-memory pool. A low-priority worker writes
+the local mmap filestore; Konserve write-behind copies to S3; Datahike publication
+waits for backend receipts. If any queue is full, the optional checkpoint is
+skipped. Inference never waits for remote durability.
+
+## Policy
+
+Policy has a fast local evaluator and a durable control plane. The scheduler uses
+a periodically refreshed immutable snapshot and process-local measurements. It
+does not query Datahike for every batch.
+
+Admission scores the alternatives `resident reuse`, `SSD/S3 restore`, and
+`recompute` using predicted queue delay plus transfer or prefill time. Prefetch
+uses known routing, session affinity, active placement demands, and prefix reuse
+frequency. Eviction ranks unpinned pages by recomputation cost, next-use
+probability, size, age, and lower-tier availability. It must respect active
+leases, tenant quotas, and a protected working-set floor; absence of a demand is
+not permission to delete durable data.
+
+Initial policy should be deterministic weighted cost with recorded inputs and
+reasons. Simmis can later optimize weights or replace the evaluator, with every
+decision and outcome stored as facts for offline replay. Yggdrasil supplies the
+versioned state/history boundary.
+
+Proximum is useful for candidate generation: find semantically or structurally
+similar sessions, predict likely next prefixes, and cluster reuse observations.
+Approximate matches must never directly reuse attention state. A candidate still
+passes exact tokens, model fingerprint, layout, position semantics, and causal
+chain verification. Approximate KV reuse is a separate research feature with an
+explicit quality contract.
+
+## Datahike facts
+
+The current immutable chunk, demand, and replica entities are a valid base. The
+serving system adds short-lived entities for request intent, worker/device
+capacity, leases, transfer observations, cache hits, recompute measurements, and
+policy decisions. High-rate raw telemetry should be aggregated locally before
+transaction; Datahike stores decision-grade facts, not every kernel timestamp.
+
+Kabel routes all catalog mutations through one authoritative writer. Its sync
+stream lets each worker update a local Datahike replica and react to relevant
+transactions. Tensor bytes remain off-band in Konserve-S3 and worker-local
+filestores, avoiding a second trip through the catalog writer. Store refs express
+content identity and reachability; placement determines which workers pull the
+referenced object.
+
+## Delivery order
+
+1. Exercise the existing chunks and placement logic with a Kabel writer, two
+   worker-local filestores, and a shared S3-compatible store. Measure cold, warm,
+   partial, restart, and failed-transfer behavior.
+2. Introduce backend-neutral page geometry, page tables, and a model-free GPU
+   page allocator with refcount, generation, and lease tests.
+3. Add Raster paged decode for a homogeneous batch, then paged prefill and mixed
+   continuous batches. Compare every path with the existing contiguous oracle.
+4. Stream chunks directly into page reservations and add preemption/resumption.
+5. Implement deterministic admission, prefetch, and eviction policy with recorded
+   explanations; then connect Simmis optimization and Proximum candidates.
+6. Add layout adapters and oracle tests for Gemma sliding/global attention and
+   DeepSeek MLA before enabling cross-model production serving.
+
+The current contiguous decoder remains the correctness oracle throughout. It is
+also a useful small-model path; paging should be introduced behind a separate
+execution interface rather than rewriting it in place.

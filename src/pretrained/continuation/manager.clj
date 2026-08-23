@@ -17,7 +17,7 @@
 
 (declare close-manager!)
 
-(defrecord Manager [connection directory chunk-store chunk-write-store chunk-size
+(defrecord Manager [connection owns-connection? directory chunk-store chunk-write-store chunk-size
                     capture-executor publish-executor closed? metrics]
   Closeable
   (close [manager] (close-manager! manager)))
@@ -75,7 +75,24 @@
   (when (.compareAndSet ^AtomicBoolean (:closed? manager) false true)
     (stop-executor! (:capture-executor manager))
     (stop-executor! (:publish-executor manager))
-    (d/release (:connection manager))))
+    (when (:owns-connection? manager)
+      (d/release (:connection manager)))))
+
+(defn connection
+  "Return the Datahike connection used by `manager`.
+
+  The manager owns and releases connections it opens from a configuration. A
+  connection supplied to `open-manager` remains owned by the caller."
+  [^Manager manager]
+  (:connection manager))
+
+(defn local-chunk-store
+  "Return the manager's mmap-compatible local Konserve chunk store.
+
+  This is the concrete frontend to use for worker-local promotion and direct
+  mmap restoration. The manager retains ownership of the store lifecycle."
+  [^Manager manager]
+  (:chunk-store manager))
 
 (defn open-manager
   "Open a continuation manager rooted at `directory` and `datahike-config`.
@@ -85,11 +102,13 @@
   256 processed tokens). `:chunk-backend-store` optionally supplies a
   caller-owned authoritative Konserve store. Chunk writes then return after the
   local filestore frontend and publish to Datahike only after their write-behind
-  receipts succeed. Each stage has one low-priority daemon worker. Queue
-  saturation rejects cache work instead of blocking inference."
+  receipts succeed. `:connection` optionally supplies an already connected,
+  caller-owned Datahike connection, including a Kabel client connection; when
+  present, `datahike-config` is ignored. Each stage has one low-priority daemon
+  worker. Queue saturation rejects cache work instead of blocking inference."
   ([datahike-config directory] (open-manager datahike-config directory {}))
   ([datahike-config directory {:keys [max-pending-captures max-pending-publications
-                                      chunk-size chunk-backend-store]
+                                      chunk-size chunk-backend-store connection]
                                :or {max-pending-captures 2
                                     max-pending-publications 2
                                     chunk-size chunk/default-chunk-size}}]
@@ -111,7 +130,8 @@
                           :read-policy :frontend-first
                           :opts {:sync? true})
                          local-store)]
-       (->Manager (catalog/ensure-database! datahike-config)
+       (->Manager (or connection (catalog/ensure-database! datahike-config))
+                  (nil? connection)
                   path
                   local-store
                   write-store

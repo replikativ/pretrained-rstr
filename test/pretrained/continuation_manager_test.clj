@@ -6,6 +6,7 @@
             [konserve.memory :refer [new-mem-store]]
             [konserve.protocols :as protocols]
             [pretrained.continuation :as continuation]
+            [pretrained.continuation.catalog :as catalog]
             [pretrained.continuation.gpu :as continuation-gpu]
             [pretrained.continuation.manager :as manager]
             [pretrained.decoder-gpu :as decoder-gpu]
@@ -37,6 +38,24 @@
   [directory]
   (doseq [file (reverse (file-seq (.toFile directory)))]
     (Files/deleteIfExists (.toPath file))))
+
+(deftest caller-owned-connection-survives-manager-close
+  (let [directory (Files/createTempDirectory
+                   "pretrained-kv-external-connection-"
+                   (make-array java.nio.file.attribute.FileAttribute 0))
+        config {:store {:backend :memory :id (random-uuid)}
+                :schema-flexibility :write :keep-history? false :value-caps :default}
+        connection (catalog/ensure-database! config)
+        cache (manager/open-manager nil directory {:connection connection})]
+    (try
+      (is (identical? connection (manager/connection cache)))
+      (is (some? (manager/local-chunk-store cache)))
+      (.close cache)
+      (is (map? (d/transact connection [{:db/ident :fixture/external-connection}])))
+      (finally
+        (d/release connection)
+        (d/delete-database config)
+        (delete-directory! directory)))))
 
 (deftest checkpoint-query-restore-and-evict
   (let [directory (Files/createTempDirectory "pretrained-kv-manager-"
