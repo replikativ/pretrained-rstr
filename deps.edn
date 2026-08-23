@@ -32,6 +32,18 @@
                         "--enable-native-access=ALL-UNNAMED"
                         "--add-modules" "jdk.incubator.vector"]}
 
+  ;; Optional executable cluster showcase: a Kabel catalog writer plus two
+  ;; worker replicas and an S3-compatible immutable tensor backend. Keeping
+  ;; these dependencies out of :deps avoids imposing a server transport or an
+  ;; object-store SDK on embedded inference users.
+  :distributed-demo
+  {:extra-paths ["dev"]
+   :extra-deps {org.replikativ/kabel {:mvn/version "0.3.108"}
+                is.simm/distributed-scope {:mvn/version "0.1.6"}
+                org.replikativ/konserve-sync {:mvn/version "0.1.39"}
+                org.replikativ/konserve-s3 {:mvn/version "0.1.38"}
+                http-kit/http-kit {:mvn/version "2.8.1"}}}
+
   ;; Model-free unit tests. Model-gated tests are ^:anchors-tagged and excluded here
   ;; (they need multi-GB weights and/or a GPU); CI runs exactly `clojure -M:test`.
   :test {:extra-paths ["test"]

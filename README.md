@@ -153,6 +153,29 @@ promotion. Remote or raw-copy transports can implement the narrow
 `ReplicaPromoter` effect without replacing Konserve's storage API, and Yggdrasil
 can version the catalog through its Datahike adapter.
 
+The [distributed paged inference design](doc/serving-architecture.md) separates
+durable transfer chunks from GPU allocation pages and specifies the path to
+continuous batching, asynchronous restore/checkpoint streams, and explainable
+admission, prefetch, and eviction policy.
+
+With MinIO listening on `localhost:9000`, the optional cluster alias runs a
+self-cleaning, model-free end-to-end check. It writes through a worker-local
+filestore to S3, commits catalog and placement facts through a Kabel writer,
+promotes the chunks to a second worker, mmaps them, and restarts that worker:
+
+```clojure
+;; clojure -M:distributed-demo
+(require '[pretrained.distributed-continuation-demo :as distributed])
+(distributed/run-minio-smoke!)
+```
+
+`open-authority!`, `open-worker!`, `checkpoint-gpu-prefix!`, and
+`restore-gpu-prefix!` expose the same stages for a bound model. The source phase
+returns a small serializable manifest for the destination phase. Concurrent
+workers should run in separate JVMs; the smoke turns them over sequentially
+because distributed-scope intentionally keeps one in-process route per remote
+peer.
+
 ```clojure
 (require '[konserve.tiered :as tiered]
          '[pretrained.continuation.placement :as placement]
