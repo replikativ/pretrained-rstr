@@ -54,7 +54,13 @@
                 (first (catalog/lookup-chunks
                         @connection "fixture-v1"
                         [(:chunk/prefix-hash (first descriptors))]))))
-            "model plus chain hash is one idempotent logical catalog node"))
+            "model plus chain hash is one idempotent logical catalog node")
+        (is (= replacement
+               (:kv/blob
+                (catalog/lookup-chunk
+                 @connection "fixture-v1"
+                 (:chunk/prefix-hash (first descriptors)))))
+            "the content identity is also a Datahike store-ref"))
       (let [found (catalog/lookup-chunks
                    @connection "fixture-v1" (mapv :chunk/prefix-hash descriptors))]
         (is (= [0 2] (mapv :kv/chunk-index found))

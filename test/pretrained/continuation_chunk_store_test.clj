@@ -1,5 +1,6 @@
 (ns pretrained.continuation-chunk-store-test
   (:require [clojure.test :refer [deftest is]]
+            [hasch.core :as hasch]
             [pretrained.continuation :as continuation]
             [pretrained.continuation.chunk-store :as chunk-store])
   (:import [java.lang.foreign MemorySegment ValueLayout]
@@ -29,6 +30,8 @@
     (try
       (let [first-write (chunk-store/put! store chunk)
             second-write (chunk-store/put! store chunk)]
+        (is (= (hasch/uuid [::chunk-store/attention-chunk-v3 chunk])
+               (:store-key first-write)))
         (is (= (:store-key first-write) (:store-key second-write)))
         (is (= (:bytes first-write) (:bytes second-write)))
         (chunk-store/with-mmap-payload

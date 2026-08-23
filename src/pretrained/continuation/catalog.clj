@@ -93,11 +93,15 @@
     :db/cardinality :db.cardinality/one :db/index true}
    {:db/ident :kv/replica-store-key :db/valueType :db.type/uuid
     :db/cardinality :db.cardinality/one}
+   {:db/ident :kv/replica-blob :db/valueType :db.type/store-ref
+    :db/cardinality :db.cardinality/one}
    {:db/ident :kv/replica-path :db/valueType :db.type/string
     :db/cardinality :db.cardinality/one}
    {:db/ident :kv/replica-bytes :db/valueType :db.type/long
     :db/cardinality :db.cardinality/one}
    {:db/ident :kv/replica-updated-at :db/valueType :db.type/instant
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :kv/replica-error :db/valueType :db.type/string
     :db/cardinality :db.cardinality/one}
 
    {:db/ident :kv/demand-id :db/valueType :db.type/uuid
@@ -174,6 +178,7 @@
                          :kv/start-token (long start)
                          :kv/token-count (long token-count)
                          :kv/store-key store-key
+                         :kv/blob store-key
                          :kv/bytes (long bytes)
                          :kv/created-at created-at}
                   parent-hash (assoc :kv/parent-hash parent-hash)))

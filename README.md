@@ -119,10 +119,36 @@ continuation boundary as uninterrupted inference.
 
 The benchmark separates prefill, checkpoint submission/drain, first measured
 restore, and process/page-cache-warm restore; it does not label warm pages as
-cold SSD. `pretrained.continuation.placement` adds declarative per-worker demands
-and observed replicas. Its Datahike listener only emits lightweight change
-notifications: a Spindel reaction or bounded worker performs the actual copy,
-while Yggdrasil can version the catalog through its Datahike adapter.
+cold SSD. Chunk identities use Hasch and are published as Datahike
+`:db.type/store-ref` values, while the prefix hash separately identifies the
+causal token chain.
+
+`pretrained.continuation.placement` records declarative per-worker demands and
+observed replicas. `pretrained.continuation.replica/open-executor` connects that
+control plane to a bounded background copy worker: it moves bytes off-band,
+verifies the immutable Hasch identity and catalog metadata, then transitions the
+target replica through `copying` to `ready` or `failed`. Transaction listeners
+only offer work and never perform I/O. The built-in Konserve adapter supports
+worker-local stores and shared filesystem mounts; it currently decodes once
+during a cross-store copy. Remote transports can implement `ChunkRepository`
+without changing placement or restore, and Yggdrasil can version the catalog
+through its Datahike adapter.
+
+```clojure
+(require '[pretrained.continuation.placement :as placement]
+         '[pretrained.continuation.replica :as replica])
+
+(def executor
+  (replica/open-executor
+   connection "worker-b" :ssd
+   (replica/konserve-repository worker-b-store)
+   (replica/repository-resolver
+    {"worker-a" (replica/konserve-repository worker-a-store)})))
+
+(placement/request!
+ connection {:model-fingerprint fingerprint :prefix-hash prefix
+             :node "worker-b" :tier :ssd :priority 10})
+```
 
 ## Validation methodology
 
