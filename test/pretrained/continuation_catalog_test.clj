@@ -81,6 +81,8 @@
         (try
           (is (= :kv/store-key (:db/ident (d/entity @connection :kv/store-key))))
           (is (= :kv/kind (:db/ident (d/entity @connection :kv/kind))))
+          (is (= :kv/replica-id (:db/ident (d/entity @connection :kv/replica-id))))
+          (is (= :kv/demand-id (:db/ident (d/entity @connection :kv/demand-id))))
           (finally
             (d/release connection))))
       (finally

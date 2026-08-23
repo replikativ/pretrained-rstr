@@ -85,6 +85,45 @@ raster's spin-pool int8-MAC kernel (CPU) or GPU dp4a kernels. Q8_0 is measured
 lossless for embeddings; decode uses Q4. Quantized streams are disk-cached next to the
 weights — the first load quantizes once (~30s for 0.6B), warm loads take ~5s.
 
+## Durable attention-state cache
+
+Decoder inference can checkpoint immutable, prefix-hashed attention-state chunks
+without blocking the generation thread. Datahike indexes logical identity and
+placement policy; Konserve/Boring stores contiguous FP32 payloads; restore mmaps
+one chunk at a time and uploads its slices directly through Raster. The final
+prompt token remains pending, so restoring a prefix resumes at exactly the same
+continuation boundary as uninterrupted inference.
+
+```clojure
+(require '[pretrained.continuation.benchmark :as bench]
+         '[pretrained.continuation.manager :as cache]
+         '[pretrained.model-identity :as identity])
+
+(def fingerprint
+  (identity/compatibility-fingerprint
+   model {:execution-variant {:backend :ze
+                              :linear-weights :q4k
+                              :attention-state :float32}}))
+
+(def manager
+  (cache/open-manager
+   {:store {:backend :memory :id (random-uuid)}
+    :schema-flexibility :write :keep-history? false :value-caps :default}
+   "/var/tmp/pretrained-kv"
+   {:chunk-size 256}))
+
+;; dstate is a bound pretrained.decoder-gpu state; prompt-ids is a token vector.
+(bench/benchmark-gpu-prefix! manager dstate fingerprint prompt-ids
+                             {:warmups 1 :iterations 5})
+```
+
+The benchmark separates prefill, checkpoint submission/drain, first measured
+restore, and process/page-cache-warm restore; it does not label warm pages as
+cold SSD. `pretrained.continuation.placement` adds declarative per-worker demands
+and observed replicas. Its Datahike listener only emits lightweight change
+notifications: a Spindel reaction or bounded worker performs the actual copy,
+while Yggdrasil can version the catalog through its Datahike adapter.
+
 ## Validation methodology
 
 Every port is validated against its reference implementation before it ships:
