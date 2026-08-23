@@ -74,7 +74,48 @@
    {:db/ident :kv/token-count :db/valueType :db.type/long
     :db/cardinality :db.cardinality/one}
    {:db/ident :kv/store-key :db/valueType :db.type/uuid
-    :db/cardinality :db.cardinality/one :db/index true}])
+    :db/cardinality :db.cardinality/one :db/index true}
+
+   ;; Cluster placement is deliberately separate from the immutable chunk entity.
+   ;; A store key/path is meaningful only together with the worker and tier that
+   ;; can serve it.
+   {:db/ident :kv/replica-id :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+   {:db/ident :kv/replica-model-fingerprint :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :kv/replica-prefix-hash :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :kv/replica-node :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :kv/replica-tier :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :kv/replica-state :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :kv/replica-store-key :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :kv/replica-path :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :kv/replica-bytes :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :kv/replica-updated-at :db/valueType :db.type/instant
+    :db/cardinality :db.cardinality/one}
+
+   {:db/ident :kv/demand-id :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+   {:db/ident :kv/demand-model-fingerprint :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :kv/demand-prefix-hash :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :kv/demand-node :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :kv/demand-tier :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :kv/demand-priority :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :kv/demand-owner :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one}
+   {:db/ident :kv/demand-expires-at :db/valueType :db.type/instant
+    :db/cardinality :db.cardinality/one}])
 
 (defn ensure-database!
   "Create a Datahike catalog at `config` when absent, then return a connection."
@@ -159,6 +200,18 @@
                 [])
         by-hash (into {} found)]
     (vec (keep by-hash requested))))
+
+(defn lookup-chunk
+  "Return one immutable chunk entry for exact model and chain-prefix identity."
+  [database model-fingerprint prefix-hash]
+  (ffirst
+   (d/q '[:find (pull ?e [*])
+          :in $ ?model ?prefix
+          :where
+          [?e :kv/model-fingerprint ?model]
+          [?e :kv/prefix-hash ?prefix]
+          [?e :kv/kind :kv.kind/chunk]]
+        database model-fingerprint prefix-hash)))
 
 (defn longest-prefix
   "Return the longest root-contiguous portion of `descriptors` present in `entries`.
