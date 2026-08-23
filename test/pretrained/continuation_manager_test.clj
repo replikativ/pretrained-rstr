@@ -1,6 +1,10 @@
 (ns pretrained.continuation-manager-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.core.async :refer [go <! promise-chan put!]]
+            [clojure.test :refer [deftest is]]
             [datahike.api :as d]
+            [konserve.core :as k]
+            [konserve.memory :refer [new-mem-store]]
+            [konserve.protocols :as protocols]
             [pretrained.continuation :as continuation]
             [pretrained.continuation.gpu :as continuation-gpu]
             [pretrained.continuation.manager :as manager]
@@ -9,6 +13,25 @@
   (:import [java.lang.foreign MemorySegment]
            [java.nio.file Files]
            [java.util.concurrent CountDownLatch TimeUnit]))
+
+(defn- delayed-assoc-store
+  [backend-store ^CountDownLatch entered release-write]
+  (reify protocols/PEDNKeyValueStore
+    (-exists? [_ key opts]
+      (protocols/-exists? backend-store key opts))
+    (-get-meta [_ key opts]
+      (protocols/-get-meta backend-store key opts))
+    (-get-in [_ key-vec not-found opts]
+      (protocols/-get-in backend-store key-vec not-found opts))
+    (-update-in [_ key-vec meta-up-fn up-fn opts]
+      (protocols/-update-in backend-store key-vec meta-up-fn up-fn opts))
+    (-assoc-in [_ key-vec meta-up-fn val opts]
+      (go
+        (.countDown entered)
+        (<! release-write)
+        (<! (protocols/-assoc-in backend-store key-vec meta-up-fn val opts))))
+    (-dissoc [_ key opts]
+      (protocols/-dissoc backend-store key opts))))
 
 (defn- delete-directory!
   [directory]
@@ -260,6 +283,64 @@
           (is (= 2 (count published)))
           (is (= 4 (:cached-token-count lookup)))))
       (finally
+        (.close cache)
+        (d/delete-database config)
+        (delete-directory! directory)))))
+
+(deftest write-behind-chunks-publish-only-after-backend-durability
+  (let [directory (Files/createTempDirectory "pretrained-kv-write-behind-"
+                                             (make-array java.nio.file.attribute.FileAttribute 0))
+        config {:store {:backend :memory :id (random-uuid)}
+                :schema-flexibility :write :keep-history? false :value-caps :default}
+        model {:n-layers 1 :n-kv 1 :head-dim 2}
+        state {:continuation/backend :gpu
+               :continuation/dstate {:model model :maxpos 8 :sess ::session}
+               :continuation/model-fingerprint "fixture-write-behind-v1"
+               :continuation/layout (continuation/model-layout model)
+               :continuation/max-position 8
+               :continuation/processed-count 4
+               :continuation/pending-token 5
+               :continuation/tokens [1 2 3 4 5]}
+        backend-store (new-mem-store (atom {}) {:sync? true})
+        entered (CountDownLatch. 1)
+        release-write (promise-chan)
+        cache (manager/open-manager
+               config directory
+               {:chunk-size 2
+                :chunk-backend-store
+                (delayed-assoc-store backend-store entered release-write)})]
+    (try
+      (with-redefs [continuation-gpu/export-gpu-chunk
+                    (fn [_ descriptor]
+                      (merge descriptor
+                             {:chunk/version 1
+                              :chunk/model-fingerprint "fixture-write-behind-v1"
+                              :chunk/layout (continuation/model-layout model)
+                              :chunk/elements-per-slab 4
+                              :chunk/payload (float-array 8)}))]
+        (let [ticket (manager/checkpoint-gpu-chunks-async! cache state)
+              captured (.get ^java.util.concurrent.CompletableFuture (:captured ticket)
+                             5 TimeUnit/SECONDS)]
+          (is (= 2 (count captured)) "GPU-to-local capture completes")
+          (is (.await entered 5 TimeUnit/SECONDS) "the backend copy started")
+          (is (false? (.isDone ^java.util.concurrent.CompletableFuture
+                       (:published ticket)))
+              "publication waits for authoritative storage")
+          (is (zero? (:cached-token-count
+                      (manager/lookup-chunk-prefix
+                       cache "fixture-write-behind-v1" [1 2 3 4 5])))
+              "Datahike cannot expose blobs that exist only on this worker")
+          (put! release-write true)
+          (let [published (.get ^java.util.concurrent.CompletableFuture
+                           (:published ticket) 5 TimeUnit/SECONDS)]
+            (is (= 2 (count published)))
+            (is (every? #(k/exists? backend-store (:store-key %) {:sync? true})
+                        published))
+            (is (= 4 (:cached-token-count
+                      (manager/lookup-chunk-prefix
+                       cache "fixture-write-behind-v1" [1 2 3 4 5])))))))
+      (finally
+        (put! release-write true)
         (.close cache)
         (d/delete-database config)
         (delete-directory! directory)))))

@@ -13,7 +13,7 @@
  :deps {org.replikativ/raster {:mvn/version "0.2.321"}
         org.replikativ/boring {:mvn/version "0.1.27"}
         org.replikativ/hasch {:mvn/version "0.4.102"}
-        org.replikativ/konserve {:mvn/version "0.9.377"}
+        org.replikativ/konserve {:mvn/version "0.9.379"}
         org.replikativ/datahike {:mvn/version "0.8.1777"}
         org.clojure/data.json {:mvn/version "2.5.0"}}
 
