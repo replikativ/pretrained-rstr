@@ -826,6 +826,31 @@
           (recur (inc p) nt (conj out nt)))
         out))))
 
+(defn prime-resident-token!
+  "Put `token` in the resident decoder's input row without advancing the KV cache.
+
+  This establishes the continuation boundary used by `resident-step!`: K/V holds
+  positions before `pos`, while the token for `pos` is resident in `r0`. Returns
+  `dstate`."
+  [dstate token]
+  (gpu/upload! (:sess dstate) :r0 (embed-row (:model dstate) token))
+  dstate)
+
+(defn resident-step!
+  "Process the token currently resident in `r0` at absolute `pos`.
+
+  The recorded graph writes its K/V row, selects the next greedy token, and leaves
+  that next token's embedding resident in `r0`. Returns the generated token id."
+  [dstate pos]
+  (let [{:keys [sess maxpos]} dstate]
+    (when-not (< (long pos) (long maxpos))
+      (throw (ex-info "Resident decode reached its maximum position"
+                      {:position pos :max-position maxpos})))
+    (gpu/upload! sess :posbuf (long-array [pos]))
+    (gpu/upload! sess :clenbuf (long-array [(inc (long pos))]))
+    (gpu/replay! sess :decode)
+    (long (aget ^ints (gpu/download sess :tokbuf) 0))))
+
 (defn generate-resident
   "Greedy autoregressive rollout fully on-device: after priming the prompt, each step uploads
   only the 16-byte position, replays the graph (layers + head + argmax/embed-gather tail), and
@@ -847,4 +872,3 @@
                   out (conj out t)]
               (if (contains? eos-ids t) out (recur (inc p) out))))
         out))))
-

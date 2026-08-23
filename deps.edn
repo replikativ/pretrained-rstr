@@ -6,11 +6,14 @@
  ;; compilable blocks + quant kernels stay in raster.
  ;;
  ;; raster is released on Clojars (Maven-resolvable; its POM declares TypedClojure).
- ;; 0.2.287 adds the compositional-dedup substrate (windowed attention, gelu-erf,
- ;; partial rope, conv1d-cl, quant.pack) on top of the GPU decode stack + the
- ;; typing-consolidated compiler.
+ ;; 0.2.321 provides ranged resident-buffer transfers and keeps hardware
+ ;; intrinsics opaque through the typed GPU compilation pipeline. Both are
+ ;; required by durable GPU KV continuation export/restore.
  ;; The :dev alias overrides raster with the sibling checkout for local work.
- :deps {org.replikativ/raster {:mvn/version "0.2.287"}
+ :deps {org.replikativ/raster {:mvn/version "0.2.321"}
+        org.replikativ/boring {:mvn/version "0.1.27"}
+        org.replikativ/konserve {:mvn/version "0.9.377"}
+        org.replikativ/datahike {:mvn/version "0.8.1777"}
         org.clojure/data.json {:mvn/version "2.5.0"}}
 
  :aliases

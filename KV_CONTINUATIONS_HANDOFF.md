@@ -189,3 +189,53 @@ token prefix up to that block**, which is what `:kv/prefix-hash` is.
 - Tests that depend on state outside the test (disk caches, device timing bars) are the flake class
   raster is currently cleaning up — write the token-exact tests against an in-memory reference, and
   give Boring/Datahike tests a temp directory fixture.
+
+## 9. UPDATE 2026-08-22 — the `bind-decode!` census failure you reported is FIXED, but not in 0.2.320
+
+Your `KV_CONTINUATION_GPU_BIND_BUG.md` was right: the census was doing its job. Root cause was
+`par/dp4a` being a plain `defn` (no return type), and fixing that exposed four further defects in
+the GPU/wasm intrinsic lowering (raster PR #97, merged). `bind-decode!` on gemma-3-270m now returns
+`:BIND-OK` on the Arc — verified against the exact repro in your report.
+
+**It is released as `org.replikativ/raster 0.2.321`** (tag `v0.2.321`, cut 2026-08-22). Bump the
+pin from `0.2.320` → `0.2.321` and re-run your gate:
+
+    clojure -M:dev -e "(require 'pretrained.loader 'pretrained.decoder-gpu)
+      (pretrained.decoder-gpu/bind-decode! (pretrained.loader/from-pretrained
+        (str (System/getProperty \"user.home\") \"/Development/models/gemma-3-270m-it\")) :maxpos 64)"
+
+Expected: a resident decoder state, no census throw. (0.2.320 still fails exactly as your report
+describes — the fix is one release later.)
+
+## 10. UPDATE 2026-08-23 — chunked local tier implemented
+
+The branch now has both formats. Whole-prefix `.rstrkv` snapshots remain the archival fallback;
+the reuse path stores immutable processed-token chunks (256 tokens by default) in a local
+Konserve filestore using Boring.
+
+The logical and physical flows are:
+
+```
+processed tokens -> parent-linked prefix hashes -> one batched Datahike lookup
+GPU KV range      -> one contiguous FP32 array  -> one Konserve value per missing chunk
+Datahike matches  -> Konserve mmap payload      -> Raster ranged upload at token offset
+missing prompt suffix ---------------------------------------> ordinary decoder prefill
+```
+
+Important details:
+
+- The pending token is outside the hash chain because its KV row does not exist yet.
+- Each physical payload is ordered `K0..Kn,V0..Vn`, so Konserve 0.9.377 maps a chunk once and
+  Raster slices that one segment for every layer.
+- Datahike holds query/policy facts and a local `:kv/store-key`; local off-band chunks do not
+  pretend to be Datahike `:db.type/store-ref` values. A database-owned blob adapter can be added
+  later without changing the chain/query contract.
+- Restore maps/uploads one chunk at a time, bounding mapped residency. Transfers are synchronous;
+  this does not yet overlap SSD/device IO with decode.
+- `checkpoint-gpu-chunks-async!` uses bounded low-priority workers. Submission does no cache IO,
+  but the background device copy can still contend with inference on current backends.
+- `restore-gpu-prefix` loads the longest root-contiguous match and computes only the prompt suffix.
+- `dev/pretrained/kv_continuation_demo.clj` contains `run-gpu-prefix-reuse!` for an nREPL demo.
+
+Model-free verification: `clojure -M:test` passes 31 tests / 142 assertions. The focused chunk
+suite covers Datahike -> Konserve mmap -> Raster upload, including old-catalog schema migration.
