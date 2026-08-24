@@ -233,11 +233,18 @@ unrelated continuations to form one batch without changing graph pointers.
          :pages-per-sequence 128}))
 ```
 
+For model execution, `:query-view` and `:output-view` may be FP16 Raster
+`ResidentBufferView`s owned by adjacent projection and output graphs. The runner
+then uploads only the small route descriptors and returns the resident output
+view after completion; query and attention tensors never cross the host.
+
 The current routed leaf is Raster's deliberately simple FP16 correctness
 reference. Page restoration and graph execution are integrated, but the existing
 decoder does not yet select this path automatically. Optimized attention-state
 append, asynchronous transfer queues, and serving policy can replace the narrow
 adapter seams without changing Datahike/Konserve identities or page ownership.
+The remaining decoder hot-path gap is page-routed FP32-to-FP16 K/V append; the
+resident-view seam deliberately does not disguise that conversion as a host copy.
 
 ## Validation methodology
 

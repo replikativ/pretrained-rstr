@@ -1,8 +1,10 @@
 (ns pretrained.continuation.paged-attention
   "Raster routed-attention binding for resident continuation page pools.
 
-  A runner owns fixed-capacity query/route/output buffers and one verified Raster
-  kernel graph. Buffer contents vary per batch; page-pool addresses and graph
+  A runner owns fixed-capacity route buffers and one verified Raster kernel
+  graph. Query and output may either be private buffers or caller-owned Raster
+  resident views, allowing adjacent model graphs to compose without host tensor
+  transfers. Buffer contents vary per batch; page-pool addresses and graph
   geometry remain stable."
   (:refer-clojure :exclude [run!])
   (:require [pretrained.continuation.page-pool :as page-pool]
@@ -36,6 +38,13 @@
   [prefix role]
   (keyword (str prefix "-" (name role))))
 
+(defn- checked-resident-view
+  [role view]
+  (when (and view (not (gpu/resident-buffer-view? view)))
+    (throw (ex-info "Paged-attention external bindings must be Raster resident views"
+                    {:role role :binding view :actual (type view)})))
+  view)
+
 (defn- slab
   [pool slab-name layer expected-elements]
   (let [slab-layout (some #(when (= slab-name (:name %)) %)
@@ -59,11 +68,14 @@
   Required options are `:layer`, `:batch-size`, `:total-query-tokens`,
   `:q-heads`, `:kv-heads`, `:qk-head-dim`, `:value-head-dim`, and
   `:pages-per-sequence`. `:scale` defaults to `1/sqrt(qk-head-dim)`.
+  Optional `:query-view` and `:output-view` bind caller-owned FP16 Raster
+  resident views instead of allocating private tensor buffers.
 
   Returns the semantic problem, verified graph, logical buffer identities and
   concrete allocation specs used by `open-runner!`."
   [pool {:keys [id layer batch-size total-query-tokens q-heads kv-heads
-                qk-head-dim value-head-dim pages-per-sequence scale key-prefix]
+                qk-head-dim value-head-dim pages-per-sequence scale key-prefix
+                query-view output-view]
          :as opts}]
   (when-not (page-pool/page-pool? pool)
     (throw (ex-info "Paged attention requires a DevicePagePool" {:pool pool})))
@@ -125,18 +137,25 @@
                   :visibility (attention/visibility {:causal? true})})
         routed (attention-route/route! problem)
         specs (attention/buffer-specs problem)
+        _ (checked-resident-view :query query-view)
+        _ (checked-resident-view :output output-view)
         allocations
-        {(:query keys) [:half (get-in specs [(:query ids) :elements]) nil :input]
-         (:query-row-offsets keys)
-         [:int (get-in specs [(:query-row-offsets ids) :elements]) nil :input]
-         (:query-positions keys)
-         [:int (get-in specs [(:query-positions ids) :elements]) nil :input]
-         (:page-table keys) [:int (get-in specs [(:page-table ids) :elements]) nil :input]
-         (:lengths keys) [:int (get-in specs [(:lengths ids) :elements]) nil :input]
-         (:start-positions keys)
-         [:int (get-in specs [(:start-positions ids) :elements]) nil :input]
-         (:output keys) [:half (get-in specs [(:output ids) :elements]) nil :output]}
-        bindings {(:query ids) (:query keys)
+        (cond->
+         {(:query-row-offsets keys)
+          [:int (get-in specs [(:query-row-offsets ids) :elements]) nil :input]
+          (:query-positions keys)
+          [:int (get-in specs [(:query-positions ids) :elements]) nil :input]
+          (:page-table keys) [:int (get-in specs [(:page-table ids) :elements]) nil :input]
+          (:lengths keys) [:int (get-in specs [(:lengths ids) :elements]) nil :input]
+          (:start-positions keys)
+          [:int (get-in specs [(:start-positions ids) :elements]) nil :input]}
+          (nil? query-view)
+          (assoc (:query keys)
+                 [:half (get-in specs [(:query ids) :elements]) nil :input])
+          (nil? output-view)
+          (assoc (:output keys)
+                 [:half (get-in specs [(:output ids) :elements]) nil :output]))
+        bindings {(:query ids) (or query-view (:query keys))
                   (:query-row-offsets ids) (:query-row-offsets keys)
                   (:query-positions ids) (:query-positions keys)
                   (:key-pages ids) (get (page-pool/buffer-keys pool) [:key layer])
@@ -144,7 +163,7 @@
                   (:page-table ids) (:page-table keys)
                   (:lengths ids) (:lengths keys)
                   (:start-positions ids) (:start-positions keys)
-                  (:output ids) (:output keys)}]
+                  (:output ids) (or output-view (:output keys))}]
     {:problem problem
      :graph (:graph routed)
      :strategy (:strategy routed)
@@ -152,6 +171,7 @@
      :buffer-keys keys
      :bindings bindings
      :allocations allocations
+     :owned-buffer-keys (set (clojure.core/keys allocations))
      :options (assoc opts
                      :layer layer
                      :batch-size batch-size
@@ -161,8 +181,10 @@
 (defn open-runner!
   "Allocate and bind a fixed-capacity Raster paged-attention reference runner.
 
-  The caller owns `pool` and its Raster session. Closing the runner releases its
-  graph and private descriptor/query/output buffers, but not the page pool."
+  The caller owns `pool`, its Raster session, and any `:query-view` or
+  `:output-view`. Closing the runner releases its graph and private buffers, but
+  not the page pool or caller-owned views. Raster validates view dtype, extent,
+  allocation lifetime, and session identity while binding."
   [pool opts]
   (let [{:keys [problem graph buffer-keys bindings allocations] :as plan}
         (reference-plan pool opts)
@@ -204,17 +226,20 @@
     result))
 
 (defn load-batch!
-  "Validate and upload one packed query batch and its continuation routes.
+  "Validate and install one packed query batch and its continuation routes.
 
   `batch` contains `:continuation-ids`, `:query-values`, `:row-offsets`, and
-  `:positions`. Its capacities must exactly match the runner. No graph may be in
+  `:positions`. Omit `:query-values` when the runner was opened with
+  `:query-view`; the producer must have populated that resident view before
+  submission. Its capacities must exactly match the runner. No graph may be in
   flight while these reusable descriptor buffers are changed. Returns `runner`."
   [runner {:keys [continuation-ids query-values row-offsets positions]}]
   (locking runner
     (let [{:keys [closed? pending lease plan]} @(:state runner)
           {:keys [batch-size total-query-tokens pages-per-sequence]}
           (:options plan)
-          problem (:problem runner)]
+          problem (:problem runner)
+          resident-query? (some? (get-in plan [:options :query-view]))]
       (when closed?
         (throw (ex-info "Paged-attention runner is closed" {})))
       (when pending
@@ -223,6 +248,11 @@
       (when-not (= batch-size (count continuation-ids))
         (throw (ex-info "Continuation batch has the wrong lane count"
                         {:expected batch-size :actual (count continuation-ids)})))
+      (when (= resident-query? (some? query-values))
+        (throw (ex-info (if resident-query?
+                          "Resident-query runner does not accept host query values"
+                          "Private-query runner requires host query values")
+                        {:resident-query? resident-query?})))
       (let [new-lease (page-pool/acquire-lease! (:pool runner) continuation-ids)
             offsets (int-array row-offsets)
             positions (int-array positions)
@@ -231,22 +261,28 @@
                           {:pages-per-sequence pages-per-sequence})
             q-elements (* total-query-tokens (:q-heads problem)
                           (:qk-head-dim problem))
-            query-values (half-array query-values q-elements)
+            query-values (when-not resident-query?
+                           (half-array query-values q-elements))
             keys (:buffer-keys runner)]
         (try
           (attention/validate-query-values! problem offsets positions)
           (attention/validate-routing! problem route-values)
           (gpu/upload-ranges!
            (:session runner)
-           [[(:query keys) query-values {:elements (alength ^shorts query-values)}]
-            [(:query-row-offsets keys) offsets {:elements (alength offsets)}]
-            [(:query-positions keys) positions {:elements (alength positions)}]
-            [(:page-table keys) (:page-table route-values)
-             {:elements (alength ^ints (:page-table route-values))}]
-            [(:lengths keys) (:lengths route-values)
-             {:elements (alength ^ints (:lengths route-values))}]
-            [(:start-positions keys) (:start-positions route-values)
-             {:elements (alength ^ints (:start-positions route-values))}]])
+           (cond->
+            []
+             (not resident-query?)
+             (conj [(:query keys) query-values
+                    {:elements (alength ^shorts query-values)}])
+             true
+             (into [[(:query-row-offsets keys) offsets {:elements (alength offsets)}]
+                    [(:query-positions keys) positions {:elements (alength positions)}]
+                    [(:page-table keys) (:page-table route-values)
+                     {:elements (alength ^ints (:page-table route-values))}]
+                    [(:lengths keys) (:lengths route-values)
+                     {:elements (alength ^ints (:lengths route-values))}]
+                    [(:start-positions keys) (:start-positions route-values)
+                     {:elements (alength ^ints (:start-positions route-values))}]])))
           (swap! (:state runner) assoc :lease new-lease)
           (when lease
             (page-pool/release-lease! (:pool runner) lease))
@@ -272,7 +308,11 @@
         event))))
 
 (defn await!
-  "Wait for `event`, release it, and return the output as FP16 bits."
+  "Wait for `event`, release it, and return the attention result.
+
+  A private-output runner downloads and returns FP16 bits. A runner opened with
+  `:output-view` returns that resident view after establishing GPU completion;
+  no tensor data crosses to the host."
   [runner event]
   (locking runner
     (when-not (= event (:pending @(:state runner)))
@@ -280,13 +320,17 @@
                       {:expected (:pending @(:state runner)) :actual event})))
     (try
       (gpu/await-event! (:session runner) event)
-      (gpu/download (:session runner) (:output (:buffer-keys runner)))
+      (or (get-in @(:state runner) [:plan :options :output-view])
+          (gpu/download (:session runner) (:output (:buffer-keys runner))))
       (finally
         (gpu/release-event! (:session runner) event)
         (swap! (:state runner) assoc :pending nil)))))
 
 (defn run!
-  "Load, execute, and synchronously return one batch's FP16 output bits."
+  "Load, execute, and synchronously return one batch's attention result.
+
+  The return shape follows `await!`: FP16 bits for private output, or the
+  caller-owned resident output view when one was configured."
   [runner batch]
   (load-batch! runner batch)
   (await! runner (submit! runner)))
@@ -303,7 +347,7 @@
         (finally
           (when-let [lease (:lease @(:state runner))]
             (page-pool/release-lease! (:pool runner) lease))
-          (doseq [key (vals (:buffer-keys runner))]
+          (doseq [key (get-in @(:state runner) [:plan :owned-buffer-keys])]
             (when (gpu/buffer (:session runner) key)
               (gpu/free-buffer! (:session runner) key)))
           (swap! (:state runner) assoc :closed? true :pending nil :lease nil)))))

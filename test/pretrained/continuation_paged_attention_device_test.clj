@@ -62,6 +62,41 @@
               (is (= 4 (count actual)))
               (is (every? true?
                           (map #(< (Math/abs (- %1 %2)) 0.04)
-                               expected actual))))))
+                               expected actual)))))
+          (gpu/alloc! session
+                      {:resident-query [:half 4 (short-array
+                                                 (map #(Float/floatToFloat16 (float %))
+                                                      [1 0 1 0]))]
+                       :resident-output [:half 4 nil]})
+          (let [query-view (gpu/buffer-view session :resident-query)
+                output-view (gpu/buffer-view session :resident-output)]
+            (with-open [runner
+                        (paged-attention/open-runner!
+                         pool {:id :resident-device-fixture
+                               :key-prefix "resident-device-attention"
+                               :layer 0
+                               :batch-size 2
+                               :total-query-tokens 2
+                               :q-heads 1
+                               :kv-heads 1
+                               :qk-head-dim 2
+                               :value-head-dim 2
+                               :pages-per-sequence 2
+                               :query-view query-view
+                               :output-view output-view})]
+              (is (identical?
+                   output-view
+                   (paged-attention/run!
+                    runner
+                    {:continuation-ids [:a :b]
+                     :row-offsets [0 1 2]
+                     :positions [1 0]}))))
+            (let [actual (decode-halfs (gpu/download session :resident-output))
+                  expected [16.6048 26.6048 5.0 7.0]]
+              (is (every? true?
+                          (map #(< (Math/abs (- %1 %2)) 0.04)
+                               expected actual))))
+            (is (some? (gpu/buffer session :resident-query)))
+            (is (some? (gpu/buffer session :resident-output)))))
         (finally
           (gpu/close-session! session))))))
