@@ -5,9 +5,11 @@
             [konserve.core :as k]
             [konserve.memory :refer [new-mem-store]]
             [konserve.protocols :as protocols]
+            [pretrained.attention-state :as attention-state]
             [pretrained.continuation :as continuation]
             [pretrained.continuation.gpu :as continuation-gpu]
             [pretrained.continuation.manager :as manager]
+            [pretrained.continuation.page-pool :as page-pool]
             [pretrained.decoder-gpu :as decoder-gpu]
             [raster.gpu.core :as gpu])
   (:import [java.lang.foreign MemorySegment]
@@ -189,6 +191,79 @@
                                :prefix-lookups :full-hits :partial-hits :misses
                                :requested-tokens :cached-tokens
                                :restored-chunks])))))
+      (finally
+        (.close cache)
+        (d/delete-database config)
+        (delete-directory! directory)))))
+
+(deftest chunked-konserve-mmap-scatters-into-resident-pages
+  (let [directory (Files/createTempDirectory
+                   "pretrained-kv-paged-manager-"
+                   (make-array java.nio.file.attribute.FileAttribute 0))
+        config {:store {:backend :memory :id (random-uuid)}
+                :schema-flexibility :write :keep-history? false :value-caps :default}
+        model {:n-layers 1 :n-kv 1 :head-dim 2}
+        cpu-state {:continuation/backend :cpu
+                   :continuation/model model
+                   :continuation/model-fingerprint "fixture-paged-v1"
+                   :continuation/layout (continuation/model-layout model)
+                   :continuation/max-position 8
+                   :continuation/processed-count 4
+                   :continuation/pending-token 5
+                   :continuation/tokens [1 2 3 4 5]
+                   :continuation/keys [(float-array [10 11 20 21 30 31 40 41
+                                                     0 0 0 0 0 0 0 0])]
+                   :continuation/values [(float-array [50 51 60 61 70 71 80 81
+                                                       0 0 0 0 0 0 0 0])]}
+        pool (page-pool/->DevicePagePool
+              ::session (attention-state/layout model) 2 4 :half
+              {[:key 0] :pool-k0, [:value 0] :pool-v0}
+              (atom {:free (apply sorted-set (range 4))
+                     :refcounts {}
+                     :routes {}}))
+        uploads (atom [])
+        cache (manager/open-manager config directory {:chunk-size 2})]
+    (try
+      (manager/checkpoint-cpu-chunks! cache cpu-state)
+      (with-redefs [gpu/buffer-view
+                    (fn [_ key opts] {:key key :opts opts})
+                    gpu/upload-ranges!
+                    (fn [_ entries]
+                      (swap! uploads into
+                             (mapv (fn [[view ^shorts source
+                                        {:keys [src-element elements] :as spec}]]
+                                     [(:key view)
+                                      (quot (get-in view [:opts :byte-offset]) 2)
+                                      (mapv #(Float/float16ToFloat
+                                              (aget source (int %)))
+                                            (range src-element
+                                                   (+ src-element elements)))
+                                      spec])
+                                   entries))
+                      (mapv second entries))]
+        (let [result (manager/restore-paged-prefix!
+                      cache pool :request-a "fixture-paged-v1"
+                      [1 2 3 4 5 6 7])]
+          (is (= 4 (:cached-token-count result)))
+          (is (= {:continuation-id :request-a
+                  :pages [0 1]
+                  :token-count 4
+                  :start-position 0}
+                 (:resident-route result)))
+          (is (= [[:pool-k0 0 [10.0 11.0 20.0 21.0] {:src-element 0
+                                                       :dst-element 0
+                                                       :elements 4}]
+                  [:pool-v0 0 [50.0 51.0 60.0 61.0] {:src-element 4
+                                                       :dst-element 0
+                                                       :elements 4}]
+                  [:pool-k0 4 [30.0 31.0 40.0 41.0] {:src-element 0
+                                                       :dst-element 0
+                                                       :elements 4}]
+                  [:pool-v0 4 [70.0 71.0 80.0 81.0] {:src-element 4
+                                                       :dst-element 0
+                                                       :elements 4}]]
+                 @uploads))
+          (is (= 2 (:restored-chunks (manager/stats cache))))))
       (finally
         (.close cache)
         (d/delete-database config)

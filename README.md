@@ -175,6 +175,47 @@ can version the catalog through its Datahike adapter.
              :node "worker-b" :tier :ssd :priority 10})
 ```
 
+### Resident paged attention
+
+`pretrained.continuation.page-pool` maps the same durable chunks into stable
+worker-local Raster allocations. A logical page covers every attention-state
+slab and layer, so full prefix pages can be shared safely while a partial tail
+uses copy-on-write. Durable chunk size and device page size are independent: a
+256-token Konserve object can scatter into sixteen 16-token GPU pages.
+
+`pretrained.continuation.paged-attention` binds those pools to Raster's semantic
+`AttentionProblem` and verified `KernelGraph`. Fixed-capacity runners update
+packed query positions and dense page tables between submissions, allowing
+unrelated continuations to form one batch without changing graph pointers.
+
+```clojure
+(require '[pretrained.attention-state :as attention-state]
+         '[pretrained.continuation.manager :as cache]
+         '[pretrained.continuation.page-pool :as pages]
+         '[pretrained.continuation.paged-attention :as paged-attn])
+
+(def pool
+  (pages/open-pool!
+   (:sess dstate)
+   (attention-state/layout (:model dstate))
+   {:page-size 16 :physical-pages 1024 :dtype :half}))
+
+(cache/restore-paged-prefix!
+ manager pool :request-a fingerprint prompt-ids)
+
+(def runner
+  (paged-attn/open-runner!
+   pool {:layer 0 :batch-size 8 :total-query-tokens 8
+         :q-heads 4 :kv-heads 1 :qk-head-dim 64 :value-head-dim 64
+         :pages-per-sequence 128}))
+```
+
+The current routed leaf is Raster's deliberately simple FP16 correctness
+reference. Page restoration and graph execution are integrated, but the existing
+decoder does not yet select this path automatically. Optimized attention-state
+append, asynchronous transfer queues, and serving policy can replace the narrow
+adapter seams without changing Datahike/Konserve identities or page ownership.
+
 ## Validation methodology
 
 Every port is validated against its reference implementation before it ships:
