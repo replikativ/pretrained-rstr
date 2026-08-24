@@ -120,6 +120,28 @@ Continuous batching then becomes a host scheduling operation: completed lanes
 leave, newly ready lanes enter, and the same compiled Raster programs consume a
 different descriptor on the next replay.
 
+The pretrained adapter can already bind FP16 query and output
+`ResidentBufferView`s directly into routed attention, so projection, attention,
+and output graphs can share allocations without tensor uploads or downloads.
+Completing decoder integration requires one additional Raster operation with an
+explicit ordered ABI:
+
+```clojure
+{:k-rows       fp32[B,n-kv,head-dim]
+ :v-rows       fp32[B,n-kv,value-head-dim]
+ :slot-mapping int[B] ; physical-page * page-size + page-offset
+ :k-pages      fp16[physical-pages,page-size,n-kv,head-dim]
+ :v-pages      fp16[physical-pages,page-size,n-kv,value-head-dim]}
+```
+
+It converts projected rows with round-to-nearest-even and scatters each lane to
+its reserved slot. Its graph effect reads rows and slot mapping and writes both
+page pools, so Raster can order append before attention on the same queue. The
+operation must be batched, backend-neutral, bindable through resident views, and
+return an event before the page manager commits its append reservations. Page
+allocation, copy-on-write, generation checks, and route mutation remain cache
+manager responsibilities rather than kernel semantics.
+
 ## Restore and checkpoint flows
 
 Restore is planned before bytes move:

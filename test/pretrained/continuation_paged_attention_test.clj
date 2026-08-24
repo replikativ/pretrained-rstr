@@ -43,6 +43,82 @@
     (is (= #{:half :int}
            (set (map first (vals (:allocations plan))))))))
 
+(deftest resident-views-compose-attention-with-adjacent-device-graphs
+  (let [page-pool (pool)
+        query-view (Object.)
+        output-view (Object.)]
+    (with-redefs [gpu/resident-buffer-view? (constantly true)]
+      (let [plan (paged-attention/reference-plan
+                  page-pool
+                  {:id :resident-fixture
+                   :key-prefix "resident-fixture"
+                   :layer 0
+                   :batch-size 2
+                   :total-query-tokens 2
+                   :q-heads 4
+                   :kv-heads 2
+                   :qk-head-dim 8
+                   :value-head-dim 8
+                   :pages-per-sequence 2
+                   :query-view query-view
+                   :output-view output-view})]
+        (testing "caller-owned tensor views replace only private tensor allocations"
+          (is (identical? query-view
+                          (get (:bindings plan) (get-in plan [:ids :query]))))
+          (is (identical? output-view
+                          (get (:bindings plan) (get-in plan [:ids :output]))))
+          (is (= #{:int} (set (map first (vals (:allocations plan))))))
+          (is (= (set (keys (:allocations plan))) (:owned-buffer-keys plan))))))))
+
+(deftest resident-query-and-output-avoid-host-tensor-transfers
+  (let [page-pool (pool)
+        output-view (Object.)
+        uploads (atom nil)
+        submitted (Object.)
+        plan (paged-attention/reference-plan
+              page-pool
+              {:id :resident-fixture
+               :key-prefix "resident-fixture"
+               :layer 0
+               :batch-size 2
+               :total-query-tokens 2
+               :q-heads 4
+               :kv-heads 2
+               :qk-head-dim 8
+               :value-head-dim 8
+               :pages-per-sequence 2})
+        plan (assoc-in plan [:options :query-view] (Object.))
+        plan (assoc-in plan [:options :output-view] output-view)
+        runner (paged-attention/->PagedAttentionRunner
+                ::session page-pool (:problem plan) ::handle
+                {:query :q
+                 :query-row-offsets :q-offsets
+                 :query-positions :q-positions
+                 :page-table :page-table
+                 :lengths :lengths
+                 :start-positions :starts
+                 :output :out}
+                ::graph
+                (atom {:closed? false :pending nil :lease nil :plan plan}))]
+    (page-pool/allocate-route! page-pool :a 5)
+    (page-pool/allocate-route! page-pool :b 3)
+    (with-redefs [gpu/upload-ranges!
+                  (fn [_ entries] (reset! uploads entries) (mapv second entries))
+                  gpu/submit-kernel-graph! (fn [_ _] submitted)
+                  gpu/await-event! (fn [_ event] (is (identical? submitted event)))
+                  gpu/release-event! (fn [_ _] nil)
+                  gpu/download (fn [& _] (throw (ex-info "unexpected tensor download" {})))]
+      (paged-attention/load-batch!
+       runner
+       {:continuation-ids [:a :b]
+        :row-offsets [0 1 2]
+        :positions [4 2]})
+      (is (= [:q-offsets :q-positions :page-table :lengths :starts]
+             (mapv first @uploads)))
+      (is (identical? output-view
+                      (paged-attention/await! runner
+                                              (paged-attention/submit! runner)))))))
+
 (deftest runner-composes-page-routes-and-uses-raster-events
   (let [page-pool (pool)
         uploads (atom nil)
