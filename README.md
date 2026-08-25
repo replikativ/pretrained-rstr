@@ -211,6 +211,13 @@ uses copy-on-write. Durable chunk size and device page size are independent: a
 packed query positions and dense page tables between submissions, allowing
 unrelated continuations to form one batch without changing graph pointers.
 
+`pretrained.continuation.paged-append` reserves one physical slot per batch
+lane and binds projected resident FP32 K/V rows directly to Raster 0.2.355's
+routed FP16 assignment graph. The same reservation batch is reused across
+layers and becomes visible only after every layer write succeeds. Attention may
+lease its prospective post-append route and queue behind assignment on the same
+in-order Raster session without publishing unfinished state.
+
 `pretrained.continuation.scheduler` plans bounded continuous batches with decode
 lanes first and chunked repair/prefill work in the remaining capacity. It also
 chooses between measured resident, restore, recompute, and explicitly enabled
@@ -248,14 +255,14 @@ For model execution, `:query-view` and `:output-view` may be FP16 Raster
 then uploads only the small route descriptors and returns the resident output
 view after completion; query and attention tensors never cross the host.
 
-The current routed leaf is Raster's deliberately simple FP16 correctness
-reference. Page restoration and graph execution are integrated, but the existing
-decoder does not yet select this path automatically. Optimized attention-state
-append, asynchronous transfer queues, and execution of scheduler plans can enter
-through the narrow adapter seams without changing Datahike/Konserve identities or
-page ownership. The remaining decoder hot-path gap is a batched page-routed
-FP32-to-FP16 K/V append; the resident-view seam deliberately does not disguise
-that conversion as a host copy.
+The current routed attention and append leaves are deliberately simple FP16
+correctness references. Both run from caller-owned resident views and expose
+asynchronous events; no projected K/V or attention tensor crosses the host.
+Page restoration, append transactions, prospective attention routes, and graph
+execution are integrated, but the existing contiguous decoder does not yet
+select this path automatically. The remaining hot-path work is to split the
+generated layer at its projection/attention boundaries and execute scheduler
+batches through these runners, followed by optimized backend lowerings.
 
 ## Validation methodology
 

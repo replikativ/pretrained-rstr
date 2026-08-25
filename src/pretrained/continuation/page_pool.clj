@@ -321,6 +321,56 @@
           (reset! (:state pool) next-state)
           lease)))))
 
+(defn acquire-prospective-lease!
+  "Pin the post-append route snapshots named by `reservation-entries`.
+
+  Each entry is `{:continuation-id id :reservation reservation}` and must match
+  the route's current pending append exactly. The leased snapshot includes the
+  reserved page and increments its token count, while the live route remains
+  uncommitted. This lets an in-order GPU queue submit append followed by
+  attention without making unfinished state visible to other schedulers."
+  [pool reservation-entries]
+  (let [entries (vec reservation-entries)
+        continuation-ids (mapv :continuation-id entries)]
+    (when-not (seq entries)
+      (throw (ex-info "A prospective page lease requires append reservations" {})))
+    (when-not (= (count continuation-ids) (count (set continuation-ids)))
+      (throw (ex-info "Prospective lease continuation identities must be unique"
+                      {:continuation-ids continuation-ids})))
+    (locking pool
+      (let [state @(:state pool)
+            routes
+            (mapv
+             (fn [{:keys [continuation-id reservation]}]
+               (let [resident-route (get-in state [:routes continuation-id])]
+                 (when-not resident-route
+                   (throw (ex-info "Cannot lease a nonresident continuation"
+                                   {:continuation-id continuation-id})))
+                 (when-not (and reservation
+                                (= reservation (:pending resident-route)))
+                   (throw (ex-info "Prospective lease reservation is stale"
+                                   {:continuation-id continuation-id
+                                    :expected (:pending resident-route)
+                                    :actual reservation})))
+                 (-> resident-route
+                     (dissoc :pending)
+                     (update :token-count inc))))
+             entries)
+            id (UUID/randomUUID)
+            pages (vec (mapcat :pages routes))
+            lease (->PageLease pool id routes)
+            next-state (-> state
+                           (update :refcounts
+                                   #(reduce (fn [references page]
+                                              (update references page (fnil inc 0)))
+                                            % pages))
+                           (assoc-in [:leases id]
+                                     {:pages pages
+                                      :continuation-ids continuation-ids
+                                      :prospective? true}))]
+        (reset! (:state pool) next-state)
+        lease))))
+
 (defn release-lease!
   "Release a page lease and return true, or false when already released."
   [pool lease]
@@ -437,47 +487,85 @@
           (reset! (:state pool) next-state)
           pending)))))
 
+(defn- validate-reservation-entries!
+  [state reservation-entries]
+  (let [entries (vec reservation-entries)
+        continuation-ids (mapv :continuation-id entries)]
+    (when-not (seq entries)
+      (throw (ex-info "Append completion requires at least one reservation" {})))
+    (when-not (= (count continuation-ids) (count (set continuation-ids)))
+      (throw (ex-info "Append completion continuation identities must be unique"
+                      {:continuation-ids continuation-ids})))
+    (doseq [{:keys [continuation-id reservation]} entries]
+      (let [resident-route (get-in state [:routes continuation-id])
+            pending (:pending resident-route)]
+        (when-not resident-route
+          (throw (ex-info "Append reservation continuation is not resident"
+                          {:continuation-id continuation-id})))
+        (when-not (and reservation (= reservation pending))
+          (throw (ex-info "Append reservation is stale or belongs to another route"
+                          {:continuation-id continuation-id
+                           :expected pending :actual reservation})))))
+    entries))
+
+(defn commit-appends!
+  "Atomically commit a batch of successful append reservations.
+
+  `reservation-entries` contains maps with `:continuation-id` and
+  `:reservation`. Every reservation is revalidated before any route changes.
+  Returns the updated routes in entry order."
+  [pool reservation-entries]
+  (locking pool
+    (let [state @(:state pool)
+          entries (validate-reservation-entries! state reservation-entries)
+          next-state
+          (reduce
+           (fn [current {:keys [continuation-id]}]
+             (update-in current [:routes continuation-id]
+                        #(-> % (dissoc :pending) (update :token-count inc))))
+           state entries)]
+      (reset! (:state pool) next-state)
+      (mapv #(get-in next-state [:routes (:continuation-id %)]) entries))))
+
 (defn commit-append!
   "Commit a successful append reservation and return the updated route."
   [pool continuation-id reservation]
+  (first (commit-appends!
+          pool [{:continuation-id continuation-id :reservation reservation}])))
+
+(defn- abort-reservation
+  [state {:keys [continuation-id]}]
+  (let [resident-route (get-in state [:routes continuation-id])
+        {:keys [logical-page physical-page added-page? replaced-page]}
+        (:pending resident-route)
+        pages (cond
+                added-page? (pop (:pages resident-route))
+                replaced-page (assoc (:pages resident-route) logical-page replaced-page)
+                :else (:pages resident-route))]
+    (cond-> state
+      (or added-page? replaced-page) (release-page physical-page)
+      replaced-page (update-in [:refcounts replaced-page] (fnil inc 0))
+      true (assoc-in [:routes continuation-id]
+                     (assoc (dissoc resident-route :pending) :pages pages)))))
+
+(defn abort-appends!
+  "Atomically revert a batch of append reservations.
+
+  Every reservation is revalidated before any allocation or route metadata is
+  changed. Returns the restored routes in entry order."
+  [pool reservation-entries]
   (locking pool
     (let [state @(:state pool)
-          resident-route (get-in state [:routes continuation-id])
-          pending (:pending resident-route)]
-      (when-not (= reservation pending)
-        (throw (ex-info "Append reservation is stale or belongs to another route"
-                        {:continuation-id continuation-id
-                         :expected pending :actual reservation})))
-      (let [updated (-> resident-route
-                        (dissoc :pending)
-                        (update :token-count inc))]
-        (reset! (:state pool) (assoc-in state [:routes continuation-id] updated))
-        updated))))
+          entries (validate-reservation-entries! state reservation-entries)
+          next-state (reduce abort-reservation state entries)]
+      (reset! (:state pool) next-state)
+      (mapv #(get-in next-state [:routes (:continuation-id %)]) entries))))
 
 (defn abort-append!
   "Revert an append reservation and return the unchanged logical route."
   [pool continuation-id reservation]
-  (locking pool
-    (let [state @(:state pool)
-          resident-route (get-in state [:routes continuation-id])
-          pending (:pending resident-route)]
-      (when-not (= reservation pending)
-        (throw (ex-info "Append reservation is stale or belongs to another route"
-                        {:continuation-id continuation-id
-                         :expected pending :actual reservation})))
-      (let [{:keys [logical-page physical-page added-page? replaced-page]} pending
-            pages (cond
-                    added-page? (pop (:pages resident-route))
-                    replaced-page (assoc (:pages resident-route) logical-page replaced-page)
-                    :else (:pages resident-route))
-            next-state (cond-> state
-                         (or added-page? replaced-page) (release-page physical-page)
-                         replaced-page (update-in [:refcounts replaced-page] (fnil inc 0))
-                         true (assoc-in [:routes continuation-id]
-                                        (assoc (dissoc resident-route :pending)
-                                               :pages pages)))]
-        (reset! (:state pool) next-state)
-        (get-in next-state [:routes continuation-id])))))
+  (first (abort-appends!
+          pool [{:continuation-id continuation-id :reservation reservation}])))
 
 (defn- payload-elements
   [payload]

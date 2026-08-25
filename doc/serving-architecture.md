@@ -108,8 +108,8 @@ cannot evict dirty, pinned, protected, or actively leased routes.
 
 ### Raster execution contract
 
-Raster should accept one descriptor for a ragged batch rather than one recorded
-graph per request:
+The paged decoder should accept one descriptor for a ragged batch rather than
+one recorded graph per request:
 
 ```clojure
 {:tokens       int[B]
@@ -135,8 +135,8 @@ different descriptor on the next replay.
 The pretrained adapter can already bind FP16 query and output
 `ResidentBufferView`s directly into routed attention, so projection, attention,
 and output graphs can share allocations without tensor uploads or downloads.
-Completing decoder integration requires one additional Raster operation with an
-explicit ordered ABI:
+Raster 0.2.355 provides the routed append operation with this explicit ordered
+ABI:
 
 ```clojure
 {:k-rows       fp32[B,n-kv,head-dim]
@@ -146,13 +146,16 @@ explicit ordered ABI:
  :v-pages      fp16[physical-pages,page-size,n-kv,value-head-dim]}
 ```
 
-It converts projected rows with round-to-nearest-even and scatters each lane to
-its reserved slot. Its graph effect reads rows and slot mapping and writes both
-page pools, so Raster can order append before attention on the same queue. The
-operation must be batched, backend-neutral, bindable through resident views, and
-return an event before the page manager commits its append reservations. Page
-allocation, copy-on-write, generation checks, and route mutation remain cache
-manager responsibilities rather than kernel semantics.
+It converts projected rows with round-to-nearest-even and assigns each lane to
+its unique reserved slot. Its graph effect reads rows and slot mapping and
+writes both page pools, so Raster orders append before attention on the same
+queue. `pretrained.continuation.paged-append` binds resident projection views to
+that graph. An append batch holds the page-manager reservations across all
+layers; `pretrained.continuation.paged-attention` can pin the corresponding
+prospective routes while their writes are queued. Only successful completion of
+every layer event commits the batch. Page allocation, copy-on-write, generation
+checks, and route mutation remain cache-manager responsibilities rather than
+kernel semantics.
 
 ## Restore and checkpoint flows
 

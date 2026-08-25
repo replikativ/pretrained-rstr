@@ -172,3 +172,53 @@
                          (page-pool/leased-dense-route-values pool lease)))))
         (is (page-pool/release-lease! pool lease))
         (is (= 8 (page-pool/free-page-count pool)))))))
+
+(deftest prospective-leases-see-a-whole-batch-only-after-exact-reservation
+  (let [pool (fixture-pool
+              (atom {:free (apply sorted-set (range 8))
+                     :refcounts {}
+                     :leases {}
+                     :routes {}}))]
+    (page-pool/allocate-route! pool :a 3)
+    (page-pool/allocate-route! pool :b 4)
+    (let [entries (mapv (fn [continuation-id]
+                          {:continuation-id continuation-id
+                           :reservation (page-pool/reserve-append!
+                                         pool continuation-id)})
+                        [:a :b])
+          lease (page-pool/acquire-prospective-lease! pool entries)
+          values (page-pool/leased-dense-route-values
+                  pool lease {:pages-per-sequence 2})]
+      (is (= [4 5] (vec (:lengths values))))
+      (is (= [0 -1, 1 2] (vec (:page-table values))))
+      (is (= [3 4] (mapv :token-count [(page-pool/route pool :a)
+                                       (page-pool/route pool :b)]))
+          "the live routes stay uncommitted")
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"stale"
+                            (page-pool/acquire-prospective-lease!
+                             pool [(assoc (first entries) :reservation {})])))
+      (is (= [4 5]
+             (mapv :token-count (page-pool/commit-appends! pool entries))))
+      (is (page-pool/release-lease! pool lease)))))
+
+(deftest batched-abort-validates-every-reservation-before-changing-routes
+  (let [pool (fixture-pool
+              (atom {:free (apply sorted-set (range 8))
+                     :refcounts {}
+                     :leases {}
+                     :routes {}}))]
+    (page-pool/allocate-route! pool :a 0)
+    (page-pool/allocate-route! pool :b 0)
+    (let [entries (mapv (fn [continuation-id]
+                          {:continuation-id continuation-id
+                           :reservation (page-pool/reserve-append!
+                                         pool continuation-id)})
+                        [:a :b])]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"stale"
+                            (page-pool/abort-appends!
+                             pool (assoc-in entries [1 :reservation] {}))))
+      (is (every? :pending [(page-pool/route pool :a)
+                            (page-pool/route pool :b)]))
+      (is (= [0 0]
+             (mapv :token-count (page-pool/abort-appends! pool entries))))
+      (is (= 8 (page-pool/free-page-count pool))))))
