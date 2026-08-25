@@ -34,6 +34,13 @@
                     {:field field :value value})))
   (long value))
 
+(defn- checked-io-dtype
+  [field value]
+  (when-not (contains? #{:half :float} value)
+    (throw (ex-info "Paged-attention tensor dtype must be :half or :float"
+                    {:field field :value value})))
+  value)
+
 (defn- scoped-key
   [prefix role]
   (keyword (str prefix "-" (name role))))
@@ -63,19 +70,20 @@
     slab-layout))
 
 (defn reference-plan
-  "Build Raster's executable FP16 reference attention plan without touching a GPU.
+  "Build Raster's executable FP16-KV reference attention plan without touching a GPU.
 
   Required options are `:layer`, `:batch-size`, `:total-query-tokens`,
   `:q-heads`, `:kv-heads`, `:qk-head-dim`, `:value-head-dim`, and
   `:pages-per-sequence`. `:scale` defaults to `1/sqrt(qk-head-dim)`.
-  Optional `:query-view` and `:output-view` bind caller-owned FP16 Raster
-  resident views instead of allocating private tensor buffers.
+  `:query-dtype` and `:output-dtype` accept `:half` (the default) or `:float`.
+  Optional `:query-view` and `:output-view` bind caller-owned Raster resident
+  views of those dtypes instead of allocating private tensor buffers.
 
   Returns the semantic problem, verified graph, logical buffer identities and
   concrete allocation specs used by `open-runner!`."
   [pool {:keys [id layer batch-size total-query-tokens q-heads kv-heads
                 qk-head-dim value-head-dim pages-per-sequence scale key-prefix
-                query-view output-view]
+                query-view output-view query-dtype output-dtype]
          :as opts}]
   (when-not (page-pool/page-pool? pool)
     (throw (ex-info "Paged attention requires a DevicePagePool" {:pool pool})))
@@ -90,6 +98,8 @@
         qk-head-dim (checked-positive :qk-head-dim qk-head-dim)
         value-head-dim (checked-positive :value-head-dim value-head-dim)
         pages-per-sequence (checked-positive :pages-per-sequence pages-per-sequence)
+        query-dtype (checked-io-dtype :query-dtype (or query-dtype :half))
+        output-dtype (checked-io-dtype :output-dtype (or output-dtype :half))
         _ (slab pool :key layer (* kv-heads qk-head-dim))
         _ (slab pool :value layer (* kv-heads value-head-dim))
         prefix (or key-prefix (str "paged-attention-" (UUID/randomUUID)))
@@ -127,10 +137,10 @@
                   :page-size (:page-size pool)
                   :physical-pages (:physical-pages pool)
                   :scale (or scale (/ 1.0 (Math/sqrt (double qk-head-dim))))
-                  :q-dtype :half
+                  :q-dtype query-dtype
                   :k-dtype :half
                   :v-dtype :half
-                  :output-dtype :half
+                  :output-dtype output-dtype
                   :accumulator-dtype :float
                   :k-layout :page-major
                   :v-layout :page-major
@@ -151,10 +161,10 @@
           [:int (get-in specs [(:start-positions ids) :elements]) nil :input]}
           (nil? query-view)
           (assoc (:query keys)
-                 [:half (get-in specs [(:query ids) :elements]) nil :input])
+                 [query-dtype (get-in specs [(:query ids) :elements]) nil :input])
           (nil? output-view)
           (assoc (:output keys)
-                 [:half (get-in specs [(:output ids) :elements]) nil :output]))
+                 [output-dtype (get-in specs [(:output ids) :elements]) nil :output]))
         bindings {(:query ids) (or query-view (:query keys))
                   (:query-row-offsets ids) (:query-row-offsets keys)
                   (:query-positions ids) (:query-positions keys)
@@ -176,7 +186,9 @@
                      :layer layer
                      :batch-size batch-size
                      :total-query-tokens total-query-tokens
-                     :pages-per-sequence pages-per-sequence)}))
+                     :pages-per-sequence pages-per-sequence
+                     :query-dtype query-dtype
+                     :output-dtype output-dtype)}))
 
 (defn open-runner!
   "Allocate and bind a fixed-capacity Raster paged-attention reference runner.
@@ -208,21 +220,29 @@
             (gpu/free-buffer! session key)))
         (throw error)))))
 
-(defn- half-array
-  [values expected]
+(defn- tensor-array
+  [dtype values expected]
   (let [result
-        (cond
-          (instance? (Class/forName "[S") values) values
-          (instance? (Class/forName "[F") values)
-          (short-array (map #(Float/floatToFloat16 (float %)) values))
-          (sequential? values)
-          (short-array (map #(Float/floatToFloat16 (float %)) values))
-          :else
-          (throw (ex-info "Query values must be FP16 bits or numeric values"
-                          {:value-type (type values)})))]
-    (when-not (= expected (alength ^shorts result))
+        (case dtype
+          :half
+          (cond
+            (instance? (Class/forName "[S") values) values
+            (or (instance? (Class/forName "[F") values) (sequential? values))
+            (short-array (map #(Float/floatToFloat16 (float %)) values))
+            :else
+            (throw (ex-info "FP16 query values must be half bits or numeric values"
+                            {:value-type (type values)})))
+
+          :float
+          (cond
+            (instance? (Class/forName "[F") values) values
+            (sequential? values) (float-array values)
+            :else
+            (throw (ex-info "FP32 query values must be floats or numeric values"
+                            {:value-type (type values)}))))]
+    (when-not (= expected (alength result))
       (throw (ex-info "Query payload has the wrong element count"
-                      {:expected expected :actual (alength ^shorts result)})))
+                      {:expected expected :actual (alength result)})))
     result))
 
 (defn load-batch!
@@ -240,7 +260,7 @@
                   append-reservations]}]
   (locking runner
     (let [{:keys [closed? pending lease plan]} @(:state runner)
-          {:keys [batch-size total-query-tokens pages-per-sequence]}
+          {:keys [batch-size total-query-tokens pages-per-sequence query-dtype]}
           (:options plan)
           problem (:problem runner)
           resident-query? (some? (get-in plan [:options :query-view]))]
@@ -277,7 +297,8 @@
             q-elements (* total-query-tokens (:q-heads problem)
                           (:qk-head-dim problem))
             query-values (when-not resident-query?
-                           (half-array query-values q-elements))
+                           (tensor-array (or query-dtype :half)
+                                         query-values q-elements))
             keys (:buffer-keys runner)]
         (try
           (attention/validate-query-values! problem offsets positions)
@@ -288,7 +309,7 @@
             []
              (not resident-query?)
              (conj [(:query keys) query-values
-                    {:elements (alength ^shorts query-values)}])
+                    {:elements (alength query-values)}])
              true
              (into [[(:query-row-offsets keys) offsets {:elements (alength offsets)}]
                     [(:query-positions keys) positions {:elements (alength positions)}]
@@ -325,27 +346,34 @@
 (defn await!
   "Wait for `event`, release it, and return the attention result.
 
-  A private-output runner downloads and returns FP16 bits. A runner opened with
-  `:output-view` returns that resident view after establishing GPU completion;
-  no tensor data crosses to the host."
+  A private-output runner downloads and returns the configured output array
+  (FP16 bits or FP32 values). A runner opened with `:output-view` returns that
+  resident view after establishing GPU completion; no tensor data crosses to
+  the host."
   [runner event]
   (locking runner
     (when-not (= event (:pending @(:state runner)))
       (throw (ex-info "GPU event does not belong to this runner submission"
                       {:expected (:pending @(:state runner)) :actual event})))
-    (try
-      (gpu/await-event! (:session runner) event)
-      (or (get-in @(:state runner) [:plan :options :output-view])
-          (gpu/download (:session runner) (:output (:buffer-keys runner))))
-      (finally
-        (gpu/release-event! (:session runner) event)
-        (swap! (:state runner) assoc :pending nil)))))
+    (let [completed? (atom false)]
+      (try
+        (gpu/await-event! (:session runner) event)
+        (reset! completed? true)
+        (or (get-in @(:state runner) [:plan :options :output-view])
+            (gpu/download (:session runner) (:output (:buffer-keys runner))))
+        (finally
+          (gpu/release-event! (:session runner) event)
+          (when @completed?
+            (when-let [lease (:lease @(:state runner))]
+              (page-pool/release-lease! (:pool runner) lease)))
+          (swap! (:state runner) assoc :pending nil
+                 :lease (if @completed? nil (:lease @(:state runner)))))))))
 
 (defn run!
   "Load, execute, and synchronously return one batch's attention result.
 
-  The return shape follows `await!`: FP16 bits for private output, or the
-  caller-owned resident output view when one was configured."
+  The return shape follows `await!`: a typed host array for private output, or
+  the caller-owned resident output view when one was configured."
   [runner batch]
   (load-batch! runner batch)
   (await! runner (submit! runner)))

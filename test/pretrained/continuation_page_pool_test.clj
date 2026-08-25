@@ -22,8 +22,7 @@
    state))
 
 (deftest routes-share-full-pages-and-copy-on-write-the-tail
-  (let [downloads (atom [])
-        uploads (atom [])
+  (let [copies (atom [])
         views (atom [])
         pool (fixture-pool
               (atom {:free (apply sorted-set (range 8))
@@ -34,10 +33,10 @@
                     (let [view {:key key :opts opts}]
                       (swap! views conj view)
                       view))
-                  gpu/download-ranges!
-                  (fn [_ entries] (reset! downloads entries) (mapv second entries))
-                  gpu/upload-ranges!
-                  (fn [_ entries] (reset! uploads entries) (mapv second entries))]
+                  gpu/copy-range!
+                  (fn [_ source destination opts]
+                    (swap! copies conj [source destination opts])
+                    destination)]
       (let [root (page-pool/allocate-route! pool :root 6)
             fork (page-pool/fork-route! pool :root :fork)]
         (is (= [0 1] (:pages root) (:pages fork)))
@@ -47,7 +46,8 @@
             (is (= 1 (:replaced-page reservation)))
             (is (= 2 (:physical-page reservation)))
             (is (= 2 (:page-offset reservation)))
-            (is (= 4 (count @downloads) (count @uploads))))
+            (is (= 4 (count @copies)))
+            (is (every? #(= {:elements 8} (nth % 2)) @copies)))
           (let [committed (page-pool/commit-append! pool :fork reservation)]
             (is (= [0 2] (:pages committed)))
             (is (= 7 (:token-count committed)))
@@ -63,8 +63,7 @@
                      :refcounts {}
                      :routes {}}))]
     (with-redefs [gpu/buffer-view (fn [_ key opts] {:key key :opts opts})
-                  gpu/download-ranges! (fn [_ entries] (mapv second entries))
-                  gpu/upload-ranges! (fn [_ entries] (mapv second entries))]
+                  gpu/copy-range! (fn [_ _ destination _] destination)]
       (page-pool/allocate-route! pool :root 3)
       (page-pool/fork-route! pool :root :fork)
       (let [reservation (page-pool/reserve-append! pool :fork)
@@ -154,8 +153,7 @@
                      :leases {}
                      :routes {}}))]
     (with-redefs [gpu/buffer-view (fn [_ key opts] {:key key :opts opts})
-                  gpu/download-ranges! (fn [_ entries] (mapv second entries))
-                  gpu/upload-ranges! (fn [_ entries] (mapv second entries))]
+                  gpu/copy-range! (fn [_ _ destination _] destination)]
       (page-pool/allocate-route! pool :request 3)
       (let [lease (page-pool/acquire-lease! pool [:request])
             reservation (page-pool/reserve-append! pool :request)]
