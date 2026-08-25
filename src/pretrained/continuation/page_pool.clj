@@ -125,6 +125,44 @@
   [pool continuation-id]
   (get-in @(:state pool) [:routes continuation-id]))
 
+(defn residency-snapshot
+  "Return immutable route, reference, lease, and capacity data for policy decisions.
+
+  The result contains no mutable pool state. It is intended for worker-local
+  admission and eviction planners; callers must still revalidate a plan while
+  applying it because GPU work may acquire a lease concurrently."
+  [pool]
+  (locking pool
+    (let [{:keys [free refcounts routes leases]} @(:state pool)]
+      {:physical-pages (:physical-pages pool)
+       :page-size (:page-size pool)
+       :free-pages (set free)
+       :refcounts refcounts
+       :routes routes
+       :leases (or leases {})})))
+
+(defn touch-route!
+  "Record worker-local policy observations for a resident continuation.
+
+  `observations` is merged into the route's `:cache/policy` map. Policy metadata
+  never changes page identity or tensor contents. Returns the updated route and
+  throws when the continuation is not resident."
+  [pool continuation-id observations]
+  (when-not (map? observations)
+    (throw (ex-info "Route policy observations must be a map"
+                    {:continuation-id continuation-id
+                     :observations observations})))
+  (locking pool
+    (let [state @(:state pool)
+          resident-route (get-in state [:routes continuation-id])]
+      (when-not resident-route
+        (throw (ex-info "Cannot touch a nonresident continuation"
+                        {:continuation-id continuation-id})))
+      (let [updated (update resident-route :cache/policy
+                            #(merge (or % {}) observations))]
+        (reset! (:state pool) (assoc-in state [:routes continuation-id] updated))
+        updated))))
+
 (defn free-page-count
   "Return the number of currently unreferenced physical pages."
   [pool]
@@ -162,8 +200,8 @@
   records the absolute position of routed token zero."
   ([pool continuation-id token-count]
    (allocate-route! pool continuation-id token-count {}))
-  ([pool continuation-id token-count {:keys [start-position]
-                                      :or {start-position 0}}]
+  ([pool continuation-id token-count {:keys [start-position policy]
+                                      :or {start-position 0 policy {}}}]
    (let [token-count (long token-count)
          start-position (long start-position)]
      (when (or (nil? continuation-id) (neg? token-count) (neg? start-position))
@@ -171,6 +209,9 @@
                        {:continuation-id continuation-id
                         :token-count token-count
                         :start-position start-position})))
+     (when-not (map? policy)
+       (throw (ex-info "Resident route policy must be a map"
+                       {:continuation-id continuation-id :policy policy})))
      (locking pool
        (let [state @(:state pool)]
          (when (get-in state [:routes continuation-id])
@@ -178,10 +219,11 @@
                            {:continuation-id continuation-id})))
          (let [required (page-count token-count (:page-size pool))
                [pages next-state] (take-free-pages state required continuation-id)
-               resident-route {:continuation-id continuation-id
-                               :pages pages
-                               :token-count token-count
-                               :start-position start-position}]
+               resident-route (cond-> {:continuation-id continuation-id
+                                       :pages pages
+                                       :token-count token-count
+                                       :start-position start-position}
+                                (seq policy) (assoc :cache/policy policy))]
            (reset! (:state pool)
                    (assoc-in next-state [:routes continuation-id] resident-route))
            resident-route))))))
@@ -273,7 +315,9 @@
                                      #(reduce (fn [references page]
                                                 (update references page (fnil inc 0)))
                                               % pages))
-                             (assoc-in [:leases id] {:pages pages}))]
+                             (assoc-in [:leases id]
+                                       {:pages pages
+                                        :continuation-ids continuation-ids}))]
           (reset! (:state pool) next-state)
           lease)))))
 

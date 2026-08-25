@@ -3,6 +3,8 @@
   (:require [pretrained.continuation :as continuation]
             [pretrained.continuation.gpu :as continuation-gpu]
             [pretrained.continuation.manager :as manager]
+            [pretrained.continuation.residency :as residency]
+            [pretrained.continuation.scheduler :as scheduler]
             [pretrained.model-identity :as model-identity]))
 
 (defn- fingerprint
@@ -16,6 +18,25 @@
   (let [started (System/nanoTime)
         value (f)]
     {:value value :milliseconds (/ (- (System/nanoTime) started) 1.0e6)}))
+
+(defn plan-serving-iteration
+  "Plan one illustrative Gemma serving iteration and exact cache-source choice.
+
+  `requests` follow `pretrained.continuation.scheduler/request`. `candidates`
+  contain measured resident, restore, and recompute costs. This helper performs
+  no GPU work; it is intended for changing budgets and measurements at a REPL
+  before connecting the same decisions to the resident decoder executor."
+  [requests candidates opts]
+  {:batch (scheduler/plan-iteration opts requests)
+   :cache-source (scheduler/choose-cache-source candidates)})
+
+(defn plan-page-admission
+  "Explain whether a page-pool snapshot can admit a Gemma continuation.
+
+  Only durable, unpinned, unleased routes are considered for eviction. The
+  function is pure and does not alter the supplied snapshot."
+  [snapshot token-count opts]
+  (residency/plan-admission snapshot token-count opts))
 
 (defn run-cpu-roundtrip!
   "Run an uninterrupted/split continuation comparison and catalog the checkpoint.

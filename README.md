@@ -211,6 +211,13 @@ uses copy-on-write. Durable chunk size and device page size are independent: a
 packed query positions and dense page tables between submissions, allowing
 unrelated continuations to form one batch without changing graph pointers.
 
+`pretrained.continuation.scheduler` plans bounded continuous batches with decode
+lanes first and chunked repair/prefill work in the remaining capacity. It also
+chooses between measured resident, restore, recompute, and explicitly enabled
+approximate-repair paths. `pretrained.continuation.residency` admits routes under
+GPU pressure with explainable cost-aware eviction; dirty, pinned, and leased
+routes are never victims.
+
 ```clojure
 (require '[pretrained.attention-state :as attention-state]
          '[pretrained.continuation.manager :as cache]
@@ -224,7 +231,10 @@ unrelated continuations to form one batch without changing graph pointers.
    {:page-size 16 :physical-pages 1024 :dtype :half}))
 
 (cache/restore-paged-prefix!
- manager pool :request-a fingerprint prompt-ids)
+ manager pool :request-a fingerprint prompt-ids
+ {:admit? true
+  :policy {:durable? true :reuse-probability 0.6
+           :recompute-ms 18.0 :reload-ms 5.0 :last-access 42}})
 
 (def runner
   (paged-attn/open-runner!
@@ -241,10 +251,11 @@ view after completion; query and attention tensors never cross the host.
 The current routed leaf is Raster's deliberately simple FP16 correctness
 reference. Page restoration and graph execution are integrated, but the existing
 decoder does not yet select this path automatically. Optimized attention-state
-append, asynchronous transfer queues, and serving policy can replace the narrow
-adapter seams without changing Datahike/Konserve identities or page ownership.
-The remaining decoder hot-path gap is page-routed FP32-to-FP16 K/V append; the
-resident-view seam deliberately does not disguise that conversion as a host copy.
+append, asynchronous transfer queues, and execution of scheduler plans can enter
+through the narrow adapter seams without changing Datahike/Konserve identities or
+page ownership. The remaining decoder hot-path gap is a batched page-routed
+FP32-to-FP16 K/V append; the resident-view seam deliberately does not disguise
+that conversion as a host copy.
 
 ## Validation methodology
 
