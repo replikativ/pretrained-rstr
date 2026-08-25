@@ -212,7 +212,7 @@ packed query positions and dense page tables between submissions, allowing
 unrelated continuations to form one batch without changing graph pointers.
 
 `pretrained.continuation.paged-append` reserves one physical slot per batch
-lane and binds projected resident FP32 K/V rows directly to Raster 0.2.355's
+lane and binds projected resident FP32 K/V rows directly to Raster's
 routed FP16 assignment graph. The same reservation batch is reused across
 layers and becomes visible only after every layer write succeeds. Attention may
 lease its prospective post-append route and queue behind assignment on the same
@@ -250,19 +250,53 @@ routes are never victims.
          :pages-per-sequence 128}))
 ```
 
-For model execution, `:query-view` and `:output-view` may be FP16 Raster
+For model execution, `:query-view` and `:output-view` may be FP16 or FP32 Raster
 `ResidentBufferView`s owned by adjacent projection and output graphs. The runner
-then uploads only the small route descriptors and returns the resident output
-view after completion; query and attention tensors never cross the host.
+then uploads only small route descriptors and returns the resident output view
+after completion; query and attention tensors never cross the host.
 
-The current routed attention and append leaves are deliberately simple FP16
-correctness references. Both run from caller-owned resident views and expose
-asynchronous events; no projected K/V or attention tensor crosses the host.
-Page restoration, append transactions, prospective attention routes, and graph
-execution are integrated, but the existing contiguous decoder does not yet
-select this path automatically. The remaining hot-path work is to split the
-generated layer at its projection/attention boundaries and execute scheduler
-batches through these runners, followed by optimized backend lowerings.
+`pretrained.continuation.paged-decoder` executes a generated decoder layer in
+resident pre-attention and post-attention stages, replacing the old contiguous
+K/V assignment and attention interval. Bind with `:cache-mode :paged` to omit
+the displaced per-layer K/V and score buffers entirely:
+
+```clojure
+(require '[pretrained.loader :as loader]
+         '[pretrained.decoder-gpu :as decoder]
+         '[pretrained.continuation.page-pool :as pages]
+         '[pretrained.continuation.paged-decoder :as paged]
+         '[raster.gpu.core :as gpu])
+
+(def model (loader/from-pretrained "/models/gemma-3-270m-it"))
+(def dstate (decoder/bind-decode! model :maxpos 64 :cache-mode :paged))
+(def engine (paged/open! dstate :page-size 16 :physical-pages 128))
+(def tokenizer (:tokenizer model))
+(def prompt (vec ((:encode tokenizer) (:tok tokenizer)
+                  "The capital of France is")))
+
+(try
+  (let [tokens (paged/generate! engine :request-a prompt 4)]
+    ;; => [9079 236764 532 506], decoded as " Paris, and the"
+    (pages/fork-route! (:pool engine) :request-a :request-b)
+    tokens)
+  (finally
+    (paged/close! engine)
+    (gpu/close-session! (:sess dstate))))
+```
+
+The Gemma anchor verifies token-exact parity with the contiguous decoder, the
+absence of `kc*`, `vc*`, and `sc` allocations, shared-page fork semantics, and
+copy-on-write resume parity. Partial pages copy directly between resident
+Raster views (Level Zero unified allocation copy or OpenCL device-buffer copy),
+without JVM tensor staging.
+
+The routed attention leaf is still a portable correctness reference and this
+first model executor has one decode lane. The scheduler and attention/append
+adapters already describe multi-lane batches, but widening generated projection
+and post-attention stages for continuous model batching remains performance
+work. Durable chunks can already restore into this page pool through
+`restore-paged-prefix!`; exporting newly generated paged routes directly into
+the asynchronous durable checkpoint queue is not yet automatic.
 
 ## Validation methodology
 

@@ -6,12 +6,12 @@
  ;; compilable blocks + quant kernels stay in raster.
  ;;
  ;; raster is released on Clojars (Maven-resolvable; its POM declares TypedClojure).
- ;; 0.2.355 adds routed FP32-to-FP16 K/V assignment. Together with stable
- ;; resident views, routed FP16 paged attention, compositional indexed attention,
+ ;; 0.2.359 adds mixed FP32 attention boundaries over FP16 KV and direct resident
+ ;; range copies. Together with routed attention, compositional indexed attention,
  ;; and measured runtime schedule selection, it forms the execution substrate
  ;; for durable GPU KV continuation restore and reuse.
  ;; The :dev alias overrides raster with the sibling checkout for local work.
- :deps {org.replikativ/raster {:mvn/version "0.2.355"}
+ :deps {org.replikativ/raster {:mvn/version "0.2.359"}
         org.replikativ/boring {:mvn/version "0.1.27"}
         org.replikativ/hasch {:mvn/version "0.4.102"}
         org.replikativ/konserve {:mvn/version "0.9.379"}

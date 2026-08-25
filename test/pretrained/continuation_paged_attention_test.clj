@@ -60,6 +60,8 @@
                    :qk-head-dim 8
                    :value-head-dim 8
                    :pages-per-sequence 2
+                   :query-dtype :float
+                   :output-dtype :float
                    :query-view query-view
                    :output-view output-view})]
         (testing "caller-owned tensor views replace only private tensor allocations"
@@ -67,6 +69,8 @@
                           (get (:bindings plan) (get-in plan [:ids :query]))))
           (is (identical? output-view
                           (get (:bindings plan) (get-in plan [:ids :output]))))
+          (is (= :float (get-in plan [:problem :q-dtype])))
+          (is (= :float (get-in plan [:problem :output-dtype])))
           (is (= #{:int} (set (map first (vals (:allocations plan))))))
           (is (= (set (keys (:allocations plan))) (:owned-buffer-keys plan))))))))
 
@@ -117,7 +121,8 @@
              (mapv first @uploads)))
       (is (identical? output-view
                       (paged-attention/await! runner
-                                              (paged-attention/submit! runner)))))))
+                                              (paged-attention/submit! runner))))
+      (is (zero? (:active-leases (page-pool/stats page-pool)))))))
 
 (deftest runner-composes-page-routes-and-uses-raster-events
   (let [page-pool (pool)

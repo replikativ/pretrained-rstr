@@ -335,14 +335,16 @@
          (into {} (for [l (range 1 (inc (:n-layers m)))]
                     [(keyword (str "r" l)) [:float (long (:d-model m)) nil :scratch]]))))
 
-(defn- buffer-specs [m qw maxpos]
+(defn- buffer-specs [m qw maxpos cache-mode]
   (apply merge (scratch-specs m)
-         ;; attention score/prob scratch: n-q rows strided by maxpos (parallel decode attention)
-         {:sc [:float (* (long (:n-q m)) (long maxpos)) nil :scratch]}
+         (when (= :contiguous cache-mode)
+           ;; attention score/prob scratch: n-q rows strided by maxpos
+           {:sc [:float (* (long (:n-q m)) (long maxpos)) nil :scratch]})
          (io-specs m maxpos) (head-specs m qw)
          (concat (for [l (range (:n-layers m))] (weight-specs m qw l))
                  (for [l (range (:n-layers m))] (norm-specs m l))
-                 (for [l (range (:n-layers m))] (kv-specs m l maxpos)))))
+                 (when (= :contiguous cache-mode)
+                   (for [l (range (:n-layers m))] (kv-specs m l maxpos))))))
 
 (defn- layer-theta
   "Per-layer rope base from descriptor flags: :dual = global theta on global layers
@@ -359,6 +361,41 @@
 
 (defn- scalar-args [prog kvs]
   (mapv (fn [p] (get kvs (name p))) (:all-params prog)))
+
+(defn- output-names
+  [step]
+  (into #{}
+        (keep (fn [{:keys [name kind]}]
+                (when (contains? #{:output :inout} kind)
+                  (clojure.core/name name))))
+        (:abi step)))
+
+(defn- layer-step-partition
+  [layer-prog]
+  (let [steps (:steps layer-prog)
+        outputs (mapv output-names steps)
+        cache-indices (keep-indexed
+                       (fn [index names]
+                         (when (some names ["kc" "vc"]) index))
+                       outputs)
+        attention-end (first (keep-indexed
+                              (fn [index names]
+                                (when (contains? names "at") index))
+                              outputs))]
+    (when-not (and (= #{"kc" "vc"}
+                      (set (filter #{"kc" "vc"} (mapcat identity outputs))))
+                   (seq cache-indices)
+                   attention-end
+                   (< (first cache-indices) attention-end))
+      (throw (ex-info "Generated decoder layer has no replaceable KV-attention interval"
+                      {:outputs outputs})))
+    {:pre (subvec steps 0 (first cache-indices))
+     :replaced (subvec steps (first cache-indices) (inc attention-end))
+     :post (subvec steps (inc attention-end))}))
+
+(defn- layer-phase-key
+  [layer step]
+  (keyword (str "L" layer "_" (name (:phase step)))))
 
 (defn embed-row ^floats [m token]
   (let [d (long (:d-model m))
@@ -631,10 +668,18 @@
 (defn bind-decode!
   "Compile the layer + head programs, Q4K-quantize the weights, allocate resident buffers, bind
   all layers + head into one command graph. `:device-id` defaults to `:ze:0`;
-  use an OpenCL device such as `:ocl:0` for NVIDIA or AMD. Returns a decode state."
-  [m & {:keys [maxpos layer-var head-var qw rms-style prefill-T steer device-id]
-        :or {maxpos 64 rms-style :map-void device-id :ze:0}}]
+  use an OpenCL device such as `:ocl:0` for NVIDIA or AMD. `:cache-mode :paged`
+  prepares only the stages around attention and omits contiguous K/V and score
+  buffers; attach it with `pretrained.continuation.paged-decoder/open!`.
+  Returns a decode state."
+  [m & {:keys [maxpos layer-var head-var qw rms-style prefill-T steer device-id cache-mode]
+        :or {maxpos 64 rms-style :map-void device-id :ze:0 cache-mode :contiguous}}]
   (let [_ (gpu/backend-type device-id)
+        _ (when-not (contains? #{:contiguous :paged} cache-mode)
+            (throw (ex-info "Unknown decoder cache mode" {:cache-mode cache-mode})))
+        _ (when (and (= :paged cache-mode) prefill-T)
+            (throw (ex-info "Paged decode does not yet support the contiguous prefill graph"
+                            {:cache-mode cache-mode :prefill-T prefill-T})))
         eps (:eps m) scale (:attn-scale m)
         ;; Phase-2b: `steer` = {layer-idx ^floats vec} — a per-layer activation-addition at
         ;; :resid-post (steering / concept injection). When present, generate the steer-variant
@@ -650,13 +695,14 @@
                                               (str "layer (rms-style " rms-style ")") fn-hint)
         head-prog  (compile-resident-or-throw head-var device-id "head")
         tail-prog  (compile-resident-or-throw #'decode-tail! device-id "decode-tail!")
+        layer-partition (layer-step-partition layer-prog)
         tail-args  (scalar-args tail-prog {"vocab" (long (:vocab m)) "d" (long (:d-model m))})
         qw (or qw (gpu-quantize m))
         steer-specs (when steer?
                       (into {} (for [l (range (:n-layers m))]
                                  [(keyword (str "L" l "steer"))
                                   [:float d (or (get steer l) (float-array d)) :constant]])))
-        specs (merge (buffer-specs m qw maxpos)
+        specs (merge (buffer-specs m qw maxpos cache-mode)
                      steer-specs
                      {:emb    [:float (* (long (:vocab m)) (long (:d-model m))) (prescaled-embed m) :constant]
                       :tokbuf [:int 1 nil :output]})
@@ -684,7 +730,9 @@
     (doseq [l (range (:n-layers m))]
       (let [args (scalar-args layer-prog {"eps" eps "theta" (layer-theta m l) "scale" scale
                                           "maxpos" (long maxpos)})]
-        (doseq [step (:steps layer-prog)]
+        (doseq [step (if (= :paged cache-mode)
+                       (into (:pre layer-partition) (:post layer-partition))
+                       (:steps layer-prog))]
           (let [ph (keyword (str "L" l "_" (name (:phase step))))]
             (gpu/bind-step! sess (assoc step :phase ph) args (fn [a] (pbk norm-names l (name a))))
             (swap! phases conj ph)))))
@@ -698,7 +746,8 @@
       (let [ph (keyword (str "T_" (name (:phase step))))]
         (gpu/bind-step! sess (assoc step :phase ph) tail-args (fn [a] (keyword (name a))))
         (swap! phases conj ph)))
-    (gpu/record-graph! sess @phases :decode)
+    (when (= :contiguous cache-mode)
+      (gpu/record-graph! sess @phases :decode))
     ;; ---- optional batched PREFILL graph (phase 2a) ----
     ;; The embed-layer program at block size prefill-T, bound into the SAME
     ;; session with its roped-keys/values args pointing DIRECTLY at the decode
@@ -759,6 +808,17 @@
                 (swap! pphases conj ph)))))
         (gpu/record-graph! sess @pphases :prefill)))
     {:sess sess :model m :maxpos maxpos :prefill-T prefill-T
+     :cache-mode cache-mode
+     :phase-layout
+     {:layers
+      (mapv (fn [layer]
+              (into {}
+                    (map (fn [[stage steps]]
+                           [stage (mapv #(layer-phase-key layer %) steps)]))
+                    layer-partition))
+            (range (:n-layers m)))
+      :head (mapv #(keyword (str "H_" (name (:phase %)))) (:steps head-prog))
+      :tail (mapv #(keyword (str "T_" (name (:phase %)))) (:steps tail-prog))}
      :device-id device-id}))
 
 (defn prefill-rows!

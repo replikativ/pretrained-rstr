@@ -409,35 +409,15 @@
                         :shape [elements]
                         :id [key physical-page]}))))
 
-(defn- host-array
-  [dtype elements]
-  (case dtype
-    :half (short-array elements)
-    :float (float-array elements)))
-
 (defn- copy-page!
   [pool source-page destination-page]
-  (let [copies
-        (vec
-         (for [slab (:slabs (:layout pool))
-               layer (range (:count slab))
-               :let [elements (* (:page-size pool) (:elements-per-token slab))]]
-           {:source (page-view pool (:name slab) layer source-page)
-            :destination (page-view pool (:name slab) layer destination-page)
-            :host (host-array (:dtype pool) elements)
-            :elements elements}))]
-    ;; Raster does not yet expose device-to-device page copies. This correctness
-    ;; fallback is deliberately isolated so a future copy graph can replace it.
-    (gpu/download-ranges!
-     (:session pool)
-     (mapv (fn [{:keys [source host elements]}]
-             [source host {:elements elements}])
-           copies))
-    (gpu/upload-ranges!
-     (:session pool)
-     (mapv (fn [{:keys [destination host elements]}]
-             [destination host {:elements elements}])
-           copies))))
+  (doseq [slab (:slabs (:layout pool))
+          layer (range (:count slab))
+          :let [elements (* (:page-size pool) (:elements-per-token slab))]]
+    (gpu/copy-range! (:session pool)
+                     (page-view pool (:name slab) layer source-page)
+                     (page-view pool (:name slab) layer destination-page)
+                     {:elements elements})))
 
 (defn reserve-append!
   "Reserve the physical slot for one append and return its page/offset.

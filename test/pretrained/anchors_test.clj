@@ -131,6 +131,53 @@
       (is (.contains ^String (decode tok out) "Paris")
           "greedy GPU decode answers Paris (non-degenerate, non-zero logits)"))))
 
+(deftest ^:anchors ^:gpu gemma-paged-decode-and-fork-anchor
+  (if-not (and (have? "gemma-3-270m-it")
+               (.exists (java.io.File. (mdir "gemma-3-270m-it")))
+               (gpu-up?))
+    (println "SKIP Gemma paged decode anchor (weights or GPU not present)")
+    (let [from (requiring-resolve 'pretrained.loader/from-pretrained)
+          bind (requiring-resolve 'pretrained.decoder-gpu/bind-decode!)
+          open-paged (requiring-resolve 'pretrained.continuation.paged-decoder/open!)
+          generate (requiring-resolve 'pretrained.continuation.paged-decoder/generate!)
+          prime (requiring-resolve 'pretrained.continuation.paged-decoder/prime-token!)
+          step (requiring-resolve 'pretrained.continuation.paged-decoder/step!)
+          close-paged (requiring-resolve 'pretrained.continuation.paged-decoder/close!)
+          fork (requiring-resolve 'pretrained.continuation.page-pool/fork-route!)
+          route (requiring-resolve 'pretrained.continuation.page-pool/route)
+          stats (requiring-resolve 'pretrained.continuation.page-pool/stats)
+          buffer (requiring-resolve 'raster.gpu.core/buffer)
+          close-session (requiring-resolve 'raster.gpu.core/close-session!)
+          g (from (mdir "gemma-3-270m-it"))
+          {:keys [tok encode decode]} (:tokenizer g)
+          prompt (vec (encode tok "The capital of France is"))
+          dstate (volatile! nil)
+          decoder (volatile! nil)]
+      (try
+        (vreset! dstate (bind g :maxpos 64 :cache-mode :paged))
+        (vreset! decoder (open-paged @dstate :page-size 16 :physical-pages 8))
+        (let [pool (:pool @decoder)
+              output (generate @decoder :base prompt 4)]
+          (is (= [9079 236764 532 506] output))
+          (is (.contains ^String (decode tok output) "Paris"))
+          (testing "paged-only binding omits the displaced contiguous state"
+            (is (nil? (buffer (:sess @dstate) :kc0)))
+            (is (nil? (buffer (:sess @dstate) :vc0)))
+            (is (nil? (buffer (:sess @dstate) :sc))))
+          (fork pool :base :branch)
+          (prime @decoder (last output))
+          (let [base-next (step @decoder :base 9)]
+            (prime @decoder (last output))
+            (let [branch-next (step @decoder :branch 9)]
+              (is (= base-next branch-next))
+              (is (not= (:pages (route pool :base))
+                        (:pages (route pool :branch)))
+                  "a shared partial page becomes independent on append")
+              (is (zero? (:active-leases (stats pool)))))))
+        (finally
+          (when @decoder (close-paged @decoder))
+          (when @dstate (close-session (:sess @dstate))))))))
+
 (deftest ^:anchors ^:gpu gemma-gpu-continuation-roundtrip-anchor
   (if-not (and (have? "gemma-3-270m-it") (.exists (java.io.File. (mdir "gemma-3-270m-it")))
                (gpu-up?))
