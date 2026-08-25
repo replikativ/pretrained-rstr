@@ -81,6 +81,12 @@ count, pending token, sampling state, deadline/priority, and logical page table.
 Sampling state is part of a resumable request but not part of reusable attention
 state: many samplers may safely share the same exact prefix pages.
 
+The first planner implementation is `pretrained.continuation.scheduler`. Its
+iteration plan is pure and replayable: decode lanes consume one token first,
+then bounded repair and prefill chunks consume the remaining token and sequence
+budgets. Cache-source selection is also explicit; modular repair is ineligible
+unless the caller supplies both an opt-in and a minimum quality threshold.
+
 ### GPU cache manager
 
 One manager per device owns physical pages and never delegates allocation to
@@ -93,6 +99,12 @@ The manager exposes reservations, page-table installation, pin/unpin, and
 asynchronous load/evict operations. Transfers use a dedicated CUDA/Level Zero
 stream and events. A request becomes runnable only after its required page events
 complete; unrelated lanes continue decoding.
+
+`pretrained.continuation.residency` now implements the first deterministic
+admission evaluator over page-pool snapshots. It ranks durable routes by expected
+saved compute, lower-tier reload cost, sharing/SLO bonuses, and recency. Planning
+simulates shared-page refcounts; application revalidates under the pool lock and
+cannot evict dirty, pinned, protected, or actively leased routes.
 
 ### Raster execution contract
 

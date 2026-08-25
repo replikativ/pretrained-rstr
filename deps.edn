@@ -6,11 +6,12 @@
  ;; compilable blocks + quant kernels stay in raster.
  ;;
  ;; raster is released on Clojars (Maven-resolvable; its POM declares TypedClojure).
- ;; 0.2.343 provides stable resident buffer views, verified asynchronous kernel
- ;; graphs, uniform kernel calls, and routed FP16 paged attention. These form the
- ;; execution substrate for durable GPU KV continuation restore and reuse.
+ ;; 0.2.351 provides stable resident views, verified asynchronous kernel graphs,
+ ;; routed FP16 paged attention, compositional indexed attention, and measured
+ ;; runtime schedule selection. These form the execution substrate for durable
+ ;; GPU KV continuation restore and reuse.
  ;; The :dev alias overrides raster with the sibling checkout for local work.
- :deps {org.replikativ/raster {:mvn/version "0.2.343"}
+ :deps {org.replikativ/raster {:mvn/version "0.2.351"}
         org.replikativ/boring {:mvn/version "0.1.27"}
         org.replikativ/hasch {:mvn/version "0.4.102"}
         org.replikativ/konserve {:mvn/version "0.9.379"}

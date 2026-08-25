@@ -8,6 +8,7 @@
             [pretrained.continuation.chunk-store :as chunk-store]
             [pretrained.continuation.gpu :as continuation-gpu]
             [pretrained.continuation.page-pool :as page-pool]
+            [pretrained.continuation.residency :as residency]
             [pretrained.continuation.store :as store])
   (:import [java.io Closeable]
            [java.nio.file Files StandardCopyOption]
@@ -303,39 +304,63 @@
   scatter into arbitrary physical pages. On any failure the partial route and
   all of its page references are released. Returns the ordinary lookup result
   with `:resident-route`; uncached prompt suffix evaluation remains the caller's
-  model-execution responsibility."
-  [^Manager manager pool continuation-id model-fingerprint tokens]
-  (let [{:keys [matched cached-token-count] :as lookup-result}
-        (lookup-chunk-prefix manager model-fingerprint tokens)
-        resident-route (page-pool/allocate-route!
-                        pool continuation-id cached-token-count)]
-    (try
-      (doseq [entry matched]
-        (chunk-store/with-mmap-payload
-         (:chunk-store manager) (:kv/store-key entry)
-         (fn [payload]
-           (when-not (and (= :float32 (:element-type payload))
-                          (= :little-endian (:byte-order payload)))
-             (throw (ex-info "Stored KV chunk is not a little-endian FP32 payload"
-                             {:store-key (:kv/store-key entry)
-                              :element-type (:element-type payload)
-                              :byte-order (:byte-order payload)})))
-           (page-pool/restore-chunk!
-            pool continuation-id
-            {:chunk/start (:kv/start-token entry)
-             :chunk/token-count (:kv/token-count entry)
-             :chunk/layout {:dtype :float32
-                            :attention-state (:layout pool)}}
-            (:segment payload)))))
-      (swap! (:metrics manager)
-             (fn [metrics]
-               (-> metrics
-                   (update :restored-chunks + (count matched))
-                   (update :restored-bytes + (reduce + 0 (map :kv/bytes matched))))))
-      (assoc lookup-result :resident-route resident-route)
-      (catch Throwable error
-        (page-pool/release-route! pool continuation-id)
-        (throw error)))))
+  model-execution responsibility.
+
+  The optional `opts` arity enables `:admit?`. A cost-aware admission then evicts
+  only durable, unpinned, unleased routes and installs `:policy` on the restored
+  route. `:protected-continuation-ids` excludes active working-set routes. When
+  admission is disabled, allocation retains the original fail-on-pressure
+  behavior."
+  ([^Manager manager pool continuation-id model-fingerprint tokens]
+   (restore-paged-prefix! manager pool continuation-id model-fingerprint tokens
+                          {:policy {}}))
+  ([^Manager manager pool continuation-id model-fingerprint tokens
+    {:keys [admit? policy protected-continuation-ids]
+     :or {admit? false policy {:durable? true}
+          protected-continuation-ids #{}}}]
+   (let [{:keys [matched cached-token-count] :as lookup-result}
+         (lookup-chunk-prefix manager model-fingerprint tokens)
+         admission (when admit?
+                     (residency/admit-route!
+                      pool continuation-id cached-token-count
+                      {:policy policy
+                       :protected-continuation-ids protected-continuation-ids}))
+         _ (when (and admission (not (:admissible? admission)))
+             (throw (ex-info "Cached prefix cannot be admitted to the GPU page pool"
+                             (dissoc admission :resident-route))))
+         resident-route (if admission
+                          (:resident-route admission)
+                          (page-pool/allocate-route!
+                           pool continuation-id cached-token-count
+                           {:policy policy}))]
+     (try
+       (doseq [entry matched]
+         (chunk-store/with-mmap-payload
+          (:chunk-store manager) (:kv/store-key entry)
+          (fn [payload]
+            (when-not (and (= :float32 (:element-type payload))
+                           (= :little-endian (:byte-order payload)))
+              (throw (ex-info "Stored KV chunk is not a little-endian FP32 payload"
+                              {:store-key (:kv/store-key entry)
+                               :element-type (:element-type payload)
+                               :byte-order (:byte-order payload)})))
+            (page-pool/restore-chunk!
+             pool continuation-id
+             {:chunk/start (:kv/start-token entry)
+              :chunk/token-count (:kv/token-count entry)
+              :chunk/layout {:dtype :float32
+                             :attention-state (:layout pool)}}
+             (:segment payload)))))
+       (swap! (:metrics manager)
+              (fn [metrics]
+                (-> metrics
+                    (update :restored-chunks + (count matched))
+                    (update :restored-bytes + (reduce + 0 (map :kv/bytes matched))))))
+       (cond-> (assoc lookup-result :resident-route resident-route)
+         admission (assoc :admission (dissoc admission :resident-route)))
+       (catch Throwable error
+         (page-pool/release-route! pool continuation-id)
+         (throw error))))))
 
 (defn- publish-file-with!
   [^Manager manager snapshot writer]
