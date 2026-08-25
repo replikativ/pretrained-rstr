@@ -229,11 +229,15 @@
   "Validate and install one packed query batch and its continuation routes.
 
   `batch` contains `:continuation-ids`, `:query-values`, `:row-offsets`, and
-  `:positions`. Omit `:query-values` when the runner was opened with
+  `:positions`. Optional `:append-reservations` must be aligned with the
+  continuation identities and loads prospective post-append routes. This is
+  safe when append and attention are submitted in that order on Raster's
+  in-order session queue. Omit `:query-values` when the runner was opened with
   `:query-view`; the producer must have populated that resident view before
   submission. Its capacities must exactly match the runner. No graph may be in
   flight while these reusable descriptor buffers are changed. Returns `runner`."
-  [runner {:keys [continuation-ids query-values row-offsets positions]}]
+  [runner {:keys [continuation-ids query-values row-offsets positions
+                  append-reservations]}]
   (locking runner
     (let [{:keys [closed? pending lease plan]} @(:state runner)
           {:keys [batch-size total-query-tokens pages-per-sequence]}
@@ -248,12 +252,23 @@
       (when-not (= batch-size (count continuation-ids))
         (throw (ex-info "Continuation batch has the wrong lane count"
                         {:expected batch-size :actual (count continuation-ids)})))
+      (when (and append-reservations
+                 (not= (vec continuation-ids)
+                       (mapv :continuation-id append-reservations)))
+        (throw (ex-info "Append reservations do not align with the attention batch"
+                        {:continuation-ids (vec continuation-ids)
+                         :reservation-ids
+                         (mapv :continuation-id append-reservations)})))
       (when (= resident-query? (some? query-values))
         (throw (ex-info (if resident-query?
                           "Resident-query runner does not accept host query values"
                           "Private-query runner requires host query values")
                         {:resident-query? resident-query?})))
-      (let [new-lease (page-pool/acquire-lease! (:pool runner) continuation-ids)
+      (let [new-lease (if append-reservations
+                        (page-pool/acquire-prospective-lease!
+                         (:pool runner) append-reservations)
+                        (page-pool/acquire-lease!
+                         (:pool runner) continuation-ids))
             offsets (int-array row-offsets)
             positions (int-array positions)
             route-values (page-pool/leased-dense-route-values

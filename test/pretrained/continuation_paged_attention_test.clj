@@ -179,3 +179,67 @@
         (is (identical? output (paged-attention/await! runner event)))
         (is (= [submitted] @released))
         (is (nil? (:pending @(:state runner))))))))
+
+(deftest runner-can-load-prospective-post-append-routes
+  (let [page-pool (pool)
+        uploads (atom nil)
+        runner (paged-attention/->PagedAttentionRunner
+                ::session page-pool
+                (:problem
+                 (paged-attention/reference-plan
+                  page-pool
+                  {:id :prospective
+                   :key-prefix "prospective"
+                   :layer 0
+                   :batch-size 2
+                   :total-query-tokens 2
+                   :q-heads 4
+                   :kv-heads 2
+                   :qk-head-dim 8
+                   :value-head-dim 8
+                   :pages-per-sequence 2}))
+                ::handle
+                {:query :q
+                 :query-row-offsets :q-offsets
+                 :query-positions :q-positions
+                 :page-table :page-table
+                 :lengths :lengths
+                 :start-positions :starts
+                 :output :out}
+                ::graph
+                (atom {:closed? false :pending nil :lease nil
+                       :plan {:options {:batch-size 2
+                                        :total-query-tokens 2
+                                        :pages-per-sequence 2}}}))]
+    (page-pool/allocate-route! page-pool :a 5)
+    (page-pool/allocate-route! page-pool :b 3)
+    (let [entries (mapv (fn [continuation-id]
+                          {:continuation-id continuation-id
+                           :reservation (page-pool/reserve-append!
+                                         page-pool continuation-id)})
+                        [:a :b])]
+      (with-redefs [gpu/upload-ranges!
+                    (fn [_ values] (reset! uploads values) (mapv second values))]
+        (paged-attention/load-batch!
+         runner
+         {:continuation-ids [:a :b]
+          :append-reservations entries
+          :query-values (repeat (* 2 4 8) 0.25)
+          :row-offsets [0 1 2]
+          :positions [5 3]})
+        (is (= [6 4] (vec (second (nth @uploads 4))))
+            "attention sees each successfully reserved token")
+        (is (= [5 3] (mapv :token-count
+                           [(page-pool/route page-pool :a)
+                            (page-pool/route page-pool :b)]))
+            "reservation loading does not publish the append")
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"do not align"
+                              (paged-attention/load-batch!
+                               runner
+                               {:continuation-ids [:a :b]
+                                :append-reservations (vec (reverse entries))
+                                :query-values (repeat (* 2 4 8) 0.25)
+                                :row-offsets [0 1 2]
+                                :positions [5 3]}))))
+      (page-pool/release-lease! page-pool (:lease @(:state runner)))
+      (page-pool/abort-appends! page-pool entries))))
