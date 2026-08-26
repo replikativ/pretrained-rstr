@@ -193,6 +193,26 @@
       (is (= [0 0]
              (vec ^ints (second (nth @uploads 2))))))))
 
+(deftest inactive-lanes-neither-reserve-nor-publish-pages
+  (let [{:keys [pool decoder]} (fixture)
+        decoder (assoc-in decoder [:decode-state :batch-size] 3)
+        uploads (atom nil)]
+    (paged-decoder/allocate-continuation! decoder :middle)
+    (with-redefs [gpu/upload-ranges! (fn [_ entries] (reset! uploads entries))
+                  gpu-link/run! (fn [_] nil)
+                  gpu/download (fn [_ _] (int-array [40 41 42]))]
+      (is (= [{:lane 1 :continuation-id :middle :position 0 :token 41}]
+             (paged-decoder/step-lanes!
+              decoder [{:lane 1 :continuation-id :middle :position 0}])))
+      (is (= 1 (:token-count (page-pool/route pool :middle))))
+      (is (= [-1 0 -1] (vec ^ints (second (first @uploads))))
+          "only the occupied lane receives an append destination")
+      (is (= [0 1 0] (vec ^ints (second (nth @uploads 4))))
+          "inactive attention routes have zero logical length")
+      (is (= [-1 -1 0 -1 -1 -1]
+             (vec ^ints (second (nth @uploads 3))))
+          "inactive page-table rows contain only ignored padding"))))
+
 (deftest fixed-batch-primes-equal-work-suffixes-at-independent-positions
   (let [{:keys [pool decoder]} (fixture)
         decoder (assoc-in decoder [:decode-state :batch-size] 2)

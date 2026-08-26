@@ -116,6 +116,138 @@
           (dissoc :scheduled/tokens)
           (assoc :request/remaining-tokens remaining)))))
 
+(defn plan-decode-lanes
+  "Retain and refill a worker's fixed-capacity decode lanes.
+
+  `previous-lanes` is a vector of request maps or nil, indexed by physical
+  execution lane. `requests` contains the current runnable queue. Decode
+  requests already occupying a lane retain it; vacancies are filled by arrival
+  and stable request identity. The result contains the complete `:lanes`, newly
+  assigned `:refill`, removed `:retired`, unassigned `:deferred`, and the active
+  continuation identities that GPU residency must protect from eviction."
+  [capacity previous-lanes requests]
+  (when-not (and (integer? capacity) (pos? capacity))
+    (throw (ex-info "Decode lane capacity must be a positive integer"
+                    {:capacity capacity})))
+  (let [capacity (long capacity)
+        previous-lanes (vec previous-lanes)
+        _ (when (> (count previous-lanes) capacity)
+            (throw (ex-info "Previous lane table exceeds decoder capacity"
+                            {:capacity capacity :lane-count (count previous-lanes)})))
+        previous-lanes (into previous-lanes
+                             (repeat (- capacity (count previous-lanes)) nil))
+        runnable (->> requests
+                      (mapv request)
+                      (filterv #(= :decode (:request/phase %))))
+        by-id (into {} (map (juxt :request/id identity)) runnable)
+        retained
+        (mapv (fn [lane prior]
+                (when-let [current (and prior (get by-id (:request/id prior)))]
+                  (assoc current :lane/index lane)))
+              (range capacity) previous-lanes)
+        retained-ids (into #{} (keep :request/id) retained)
+        waiting (->> runnable
+                     (remove #(contains? retained-ids (:request/id %)))
+                     (sort-by (juxt :request/arrival (comp str :request/id))))
+        [lanes remaining]
+        (reduce (fn [[lanes waiting] lane]
+                  (if (or (get lanes lane) (empty? waiting))
+                    [lanes waiting]
+                    [(assoc lanes lane (assoc (first waiting) :lane/index lane))
+                     (next waiting)]))
+                [retained waiting]
+                (range capacity))
+        refill (filterv #(and % (not (contains? retained-ids (:request/id %)))) lanes)
+        lane-ids (into #{} (keep :request/id) lanes)
+        retired (filterv #(and % (not (contains? lane-ids (:request/id %))))
+                         previous-lanes)
+        protected (into #{}
+                        (keep #(or (:request/continuation-id %)
+                                   (:request/id %)))
+                        lanes)]
+    {:lanes lanes
+     :retained (filterv some? retained)
+     :refill refill
+     :retired retired
+     :deferred (vec remaining)
+     :protected-continuation-ids protected}))
+
+(defn decode-submission
+  "Translate a lane plan into paged-decoder work and selective priming rows.
+
+  Active requests require `:request/continuation-id` and non-negative
+  `:request/position`; newly filled lanes additionally require
+  `:request/pending-token`. The returned maps can be passed directly to
+  `paged-decoder/prime-lanes!` and `paged-decoder/step-lanes!`."
+  [{:keys [lanes refill] :as plan}]
+  (let [active (filterv some? lanes)
+        refill-ids (into #{} (map :request/id) refill)]
+    (doseq [{:request/keys [id continuation-id position pending-token] :as item} active]
+      (when (nil? continuation-id)
+        (throw (ex-info "Decode lane requires a continuation identity"
+                        {:request item})))
+      (when-not (and (integer? position) (not (neg? position)))
+        (throw (ex-info "Decode lane requires a non-negative position"
+                        {:request item})))
+      (when (and (contains? refill-ids id) (nil? pending-token))
+        (throw (ex-info "A refilled decode lane requires a pending token"
+                        {:request item}))))
+    {:lane-work
+     (mapv (fn [{:keys [lane/index]
+                 :request/keys [continuation-id position]}]
+             {:lane index :continuation-id continuation-id :position position})
+           active)
+     :prime-lanes
+     (into []
+           (comp (filter #(contains? refill-ids (:request/id %)))
+                 (map (fn [{:keys [lane/index]
+                            :request/keys [pending-token]}]
+                        {:lane index :token pending-token})))
+           active)
+     :protected-continuation-ids (:protected-continuation-ids plan)}))
+
+(defn complete-decode-iteration
+  "Apply lane-ordered decoder results and identify retained/completed requests.
+
+  Every active lane must have one `{:lane index :token token-id}` result.
+  Remaining-token budgets decrease by one, positions advance by one, and the
+  emitted token becomes the next pending token. A request completes on exhausted
+  budget or an id in `:eos-ids`. The returned lane table can be supplied as
+  `previous-lanes` to the next `plan-decode-lanes` call."
+  ([plan results] (complete-decode-iteration plan results {}))
+  ([{:keys [lanes]} results {:keys [eos-ids] :or {eos-ids #{}}}]
+   (let [results (vec results)
+         by-lane (into {} (map (juxt :lane identity)) results)
+         active-lanes (into #{} (keep :lane/index) lanes)]
+     (when-not (and (= (count results) (count by-lane))
+                    (= active-lanes (set (keys by-lane))))
+       (throw (ex-info "Decode results do not cover active lanes exactly"
+                       {:active-lanes active-lanes
+                        :result-lanes (mapv :lane results)})))
+     (let [updated
+           (mapv (fn [item]
+                   (when item
+                     (let [token (:token (get by-lane (:lane/index item)))]
+                       (when-not (integer? token)
+                         (throw (ex-info "Decode result requires an integer token"
+                                         {:lane (:lane/index item) :token token})))
+                       (-> item
+                           (update :request/remaining-tokens dec)
+                           (update :request/position inc)
+                           (assoc :request/pending-token token
+                                  :iteration/token token)))))
+                 lanes)
+           complete? #(and %
+                           (or (zero? (:request/remaining-tokens %))
+                               (contains? eos-ids (:iteration/token %))))
+           completed (filterv complete? updated)
+           next-lanes (mapv #(when-not (complete? %) (dissoc % :iteration/token))
+                            updated)]
+       {:lanes next-lanes
+        :runnable (into [] (comp (filter some?) (map #(dissoc % :iteration/token)))
+                        updated)
+        :completed completed}))))
+
 (defn choose-cache-source
   "Choose the lowest-latency eligible way to establish a prompt continuation.
 
