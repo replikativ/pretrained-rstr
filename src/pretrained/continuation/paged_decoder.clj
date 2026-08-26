@@ -10,14 +10,15 @@
             [pretrained.continuation.paged-append :as paged-append]
             [pretrained.continuation.paged-attention :as paged-attention]
             [pretrained.decoder-gpu :as decoder-gpu]
-            [raster.gpu.core :as gpu])
+            [raster.gpu.core :as gpu]
+            [raster.gpu.link :as gpu-link])
   (:import [java.io Closeable]
            [java.util UUID]))
 
 (declare close!)
 
 (defrecord PagedDecoder
-           [decode-state pool append-runners attention-runners graph-keys state]
+           [decode-state pool append-runners attention-runners executables state]
   Closeable
   (close [decoder]
     (close! decoder)))
@@ -39,16 +40,18 @@
   (when (:closed? @(:state decoder))
     (throw (ex-info "Paged decoder is closed" {}))))
 
-(defn- phase-layout!
+(defn- staged-executables!
   [decode-state]
-  (let [layout (:phase-layout decode-state)
-        layers (:layers layout)]
+  (let [execution (:stage-executables decode-state)
+        layers (:layers execution)]
     (when-not (and (= (:n-layers (:model decode-state)) (count layers))
-                   (every? #(and (seq (:pre %)) (seq (:post %))) layers)
-                   (seq (:head layout)) (seq (:tail layout)))
-      (throw (ex-info "Decode state has no complete staged phase layout"
-                      {:phase-layout layout})))
-    layout))
+                   (every? #(and (gpu-link/linked-executable? (:pre %))
+                                 (gpu-link/linked-executable? (:post %)))
+                           layers)
+                   (gpu-link/linked-executable? (:head-tail execution)))
+      (throw (ex-info "Decode state has no complete staged LinkPlan execution"
+                      {:stage-executables execution})))
+    execution))
 
 (defn open!
   "Attach paged K/V execution to a resident state returned by `bind-decode!`.
@@ -67,7 +70,7 @@
     (throw (ex-info "Paged decoder requires bind-decode! with :cache-mode :paged"
                     {:cache-mode (:cache-mode decode-state)})))
   (let [{:keys [sess model maxpos]} decode-state
-        layout (phase-layout! decode-state)
+        executables (staged-executables! decode-state)
         page-size (checked-positive :page-size page-size)
         pages-per-sequence (long (quot (+ (long maxpos) (dec page-size)) page-size))
         physical-pages (checked-positive :physical-pages
@@ -89,18 +92,8 @@
                                              :id [prefix :value]})
         output-view (gpu/buffer-view sess :at {:shape [q-elements]
                                                :id [prefix :output]})
-        graph-keys
-        (mapv (fn [layer-index {:keys [pre post]}]
-                (let [pre-key [::pre prefix layer-index]
-                      post-key [::post prefix layer-index]]
-                  (gpu/record-graph! sess pre pre-key)
-                  (gpu/record-graph! sess post post-key)
-                  {:pre pre-key :post post-key}))
-              (range) (:layers layout))
-        head-tail-key [::head-tail prefix]
         append-runners (atom [])
         attention-runners (atom [])]
-    (gpu/record-graph! sess (into (:head layout) (:tail layout)) head-tail-key)
     (try
       (doseq [layer (range (:n-layers model))]
         (swap! append-runners conj
@@ -133,7 +126,7 @@
         :pool pool
         :append-runners @append-runners
         :attention-runners @attention-runners
-        :graph-keys {:layers graph-keys :head-tail head-tail-key}
+        :executables executables
         :state (atom {:closed? false})})
       (catch Throwable error
         (doseq [runner (concat @attention-runners @append-runners)]
@@ -187,10 +180,10 @@
     (gpu/upload! sess :clenbuf (long-array [(inc (long position))]))
     (let [batch (paged-append/reserve-batch! (:pool decoder) [continuation-id])]
       (try
-        (doseq [[layer-graphs append-runner attention-runner]
-                (map vector (get-in decoder [:graph-keys :layers])
+        (doseq [[layer-execution append-runner attention-runner]
+                (map vector (get-in decoder [:executables :layers])
                      (:append-runners decoder) (:attention-runners decoder))]
-          (gpu/replay! sess (:pre layer-graphs))
+          (gpu-link/run! (:pre layer-execution))
           (paged-append/run! append-runner batch)
           (paged-attention/run!
            attention-runner
@@ -198,9 +191,9 @@
             :append-reservations (paged-append/reservation-entries batch)
             :row-offsets [0 1]
             :positions [position]})
-          (gpu/replay! sess (:post layer-graphs)))
+          (gpu-link/run! (:post layer-execution)))
         (paged-append/commit-batch! batch)
-        (gpu/replay! sess (get-in decoder [:graph-keys :head-tail]))
+        (gpu-link/run! (get-in decoder [:executables :head-tail]))
         (long (aget ^ints (gpu/download sess :tokbuf) 0))
         (catch Throwable error
           (when (= :reserved @(:state batch))
@@ -248,7 +241,8 @@
           output)))))
 
 (defn close!
-  "Release runner graphs and descriptors. Idempotent; does not close the session."
+  "Release routed-attention runners. Idempotent; does not close the decode
+  state's LinkPlan executables or session."
   [decoder]
   (locking decoder
     (when-not (:closed? @(:state decoder))
