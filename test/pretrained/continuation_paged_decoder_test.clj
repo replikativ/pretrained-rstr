@@ -191,3 +191,22 @@
     (paged-decoder/allocate-continuation! decoder :request :start-position 9)
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"does not extend"
                           (paged-decoder/step! decoder :request 8)))))
+
+(deftest restored-prompts-compute-only-the-uncached-suffix
+  (let [{:keys [pool decoder]} (fixture)
+        calls (atom [])]
+    (page-pool/allocate-route! pool :request 2)
+    (with-redefs [paged-decoder/decode-token!
+                  (fn [_ continuation-id token position]
+                    (swap! calls conj [:decode continuation-id token position]))
+                  paged-decoder/prime-token!
+                  (fn [engine token]
+                    (swap! calls conj [:prime token])
+                    engine)]
+      (is (identical? decoder
+                      (paged-decoder/prime-prompt!
+                       decoder :request [10 11 12 13 14])))
+      (is (= [[:decode :request 12 2]
+              [:decode :request 13 3]
+              [:prime 14]]
+             @calls)))))

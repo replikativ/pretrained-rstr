@@ -397,39 +397,60 @@
   (prime-token! decoder token)
   (step! decoder continuation-id position))
 
+(defn prime-prompt!
+  "Compute only the uncached suffix of `prompt` and leave its final token pending.
+
+  `continuation-id` may name an empty route or a restored exact prefix. Its
+  token count must not exceed `dec(count(prompt))`, and prompt routes currently
+  start at absolute position zero. Existing page rows are never recomputed.
+  Returns the decoder after priming the pending token's resident embedding."
+  [decoder continuation-id prompt]
+  (require-open! decoder)
+  (when-not (seq prompt)
+    (throw (ex-info "Paged prompt priming requires a nonempty prompt" {})))
+  (let [resident-route
+        (or (page-pool/route (:pool decoder) continuation-id)
+            (allocate-continuation! decoder continuation-id))
+        cached-count (long (:token-count resident-route))
+        processed-count (dec (count prompt))]
+    (when-not (zero? (long (:start-position resident-route)))
+      (throw (ex-info "Paged prompt priming requires a zero absolute start position"
+                      {:continuation-id continuation-id
+                       :start-position (:start-position resident-route)})))
+    (when (> cached-count processed-count)
+      (throw (ex-info "Resident prefix is longer than the prompt's processed prefix"
+                      {:continuation-id continuation-id
+                       :cached-token-count cached-count
+                       :processed-token-count processed-count})))
+    (doseq [position (range cached-count processed-count)]
+      (decode-token! decoder continuation-id (nth prompt position) position))
+    (prime-token! decoder (last prompt))))
+
 (defn generate!
   "Greedily generate up to `max-new` ids using a paged continuation route.
 
-  The route must be empty. Prompt tokens except the last are first committed to
-  K/V; the last token is then processed by the rollout. Generation stops at an
-  id in `eos-ids` or at the decode state's maximum position."
+  The route may be empty or contain an exact restored prefix. Only the missing
+  prompt suffix is committed to K/V; the last token is then processed by the
+  rollout. Generation stops at an id in `eos-ids` or at the decode state's
+  maximum position."
   [decoder continuation-id prompt max-new & {:keys [eos-ids]
                                              :or {eos-ids #{}}}]
   (require-open! decoder)
   (when-not (seq prompt)
     (throw (ex-info "Paged generation requires a nonempty prompt" {})))
-  (let [route (or (page-pool/route (:pool decoder) continuation-id)
-                  (allocate-continuation! decoder continuation-id))]
-    (when-not (zero? (:token-count route))
-      (throw (ex-info "Paged generation requires an empty continuation route"
-                      {:continuation-id continuation-id
-                       :token-count (:token-count route)})))
-    (let [start (long (:start-position route))
-          prefix-count (dec (count prompt))]
-      (doseq [offset (range prefix-count)]
-        (decode-token! decoder continuation-id (nth prompt offset) (+ start offset)))
-      (prime-token! decoder (last prompt))
-      (loop [position (+ start prefix-count)
+  (let [prefix-count (dec (count prompt))]
+    (prime-prompt! decoder continuation-id prompt)
+    (loop [position prefix-count
              output []]
-        (if (and (< (count output) (long max-new))
-                 (< (:token-count (page-pool/route (:pool decoder) continuation-id))
-                    (long (:maxpos (:decode-state decoder)))))
-          (let [token (step! decoder continuation-id position)
-                output (conj output token)]
-            (if (contains? eos-ids token)
-              output
-              (recur (inc position) output)))
-          output)))))
+      (if (and (< (count output) (long max-new))
+               (< (:token-count (page-pool/route (:pool decoder) continuation-id))
+                  (long (:maxpos (:decode-state decoder)))))
+        (let [token (step! decoder continuation-id position)
+              output (conj output token)]
+          (if (contains? eos-ids token)
+            output
+            (recur (inc position) output)))
+        output))))
 
 (defn close!
   "Release the composite paged executable and its route descriptors. Idempotent;
