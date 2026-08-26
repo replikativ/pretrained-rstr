@@ -187,14 +187,8 @@
                 manager (mapv #(chunk/cpu-tensor-chunk state %) missing))]
     (publish-chunks! manager (:continuation/model-fingerprint state) stored)))
 
-(defn checkpoint-gpu-chunks-async!
-  "Capture only missing GPU chunks on bounded background workers.
-
-  The call itself never performs GPU, storage, or Datahike work. Capture performs
-  the unavoidable device-to-host copy and durable local Konserve writes; the
-  second worker publishes one Datahike transaction. Queue saturation rejects the
-  cache operation without slowing inference."
-  [^Manager manager state]
+(defn- submit-chunk-checkpoint!
+  [^Manager manager context]
   (let [captured (CompletableFuture.)
         published (CompletableFuture.)
         ticket {:accepted? true :captured captured :published published}
@@ -204,13 +198,11 @@
         capture-task
         (fn []
           (try
-            (let [model-fingerprint (:continuation/model-fingerprint state)
-                  plan (:chunks (chunk/continuation-plan state (:chunk-size manager)))
+            (let [{:keys [model-fingerprint plan export]} (context)
                   missing (missing-chunk-descriptors manager model-fingerprint plan)
                   _ (record-chunk-plan! manager plan missing)
                   stored (persist-chunks!
-                          manager (mapv #(continuation-gpu/export-gpu-chunk state %)
-                                        missing))
+                          manager (mapv export missing))
                   publish-task
                   (fn []
                     (try
@@ -240,6 +232,45 @@
           (swap! (:metrics manager) update :capture-rejected inc)
           (reject! error)
           (assoc ticket :accepted? false))))))
+
+(defn checkpoint-gpu-chunks-async!
+  "Capture only missing contiguous GPU chunks on bounded background workers.
+
+  The call itself never performs GPU, storage, or Datahike work. Capture performs
+  the unavoidable device-to-host copy and durable local Konserve writes; the
+  second worker publishes one Datahike transaction. Queue saturation rejects the
+  cache operation without slowing inference."
+  [^Manager manager state]
+  (submit-chunk-checkpoint!
+   manager
+   (fn []
+     {:model-fingerprint (:continuation/model-fingerprint state)
+      :plan (:chunks (chunk/continuation-plan state (:chunk-size manager)))
+      :export #(continuation-gpu/export-gpu-chunk state %)})))
+
+(defn checkpoint-paged-chunks-async!
+  "Capture a resident paged route through the bounded durable chunk pipeline.
+
+  `tokens` contains the exact token history for the route. The route's current
+  logical token count defines the processed prefix; a later pending token may be
+  present in `tokens`. The accepted capture worker leases and gathers physical
+  FP16 pages, converts them to the existing portable FP32 chunk format, writes
+  through the local/tiered Konserve store, and publishes Datahike only after
+  durability. Queue saturation rejects the optional checkpoint immediately."
+  [^Manager manager pool continuation-id model-fingerprint tokens]
+  (let [tokens (vec tokens)]
+    (submit-chunk-checkpoint!
+     manager
+     (fn []
+       (let [resident-route
+             (or (page-pool/route pool continuation-id)
+                 (throw (ex-info "Cannot checkpoint a nonresident paged continuation"
+                                 {:continuation-id continuation-id})))
+             processed (long (:token-count resident-route))]
+         {:model-fingerprint model-fingerprint
+          :plan (chunk/plan tokens processed (:chunk-size manager))
+          :export #(page-pool/export-chunk
+                    pool continuation-id model-fingerprint %)})))))
 
 (defn lookup-chunk-prefix
   "Return planned chunks, present entries, and the longest reusable KV prefix."

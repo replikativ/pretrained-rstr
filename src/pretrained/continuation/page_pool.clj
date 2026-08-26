@@ -671,6 +671,86 @@
       (gpu/upload-ranges! (:session pool) entries)
       resident-route)))
 
+(defn export-chunk
+  "Gather one immutable route range into the durable FP32 chunk format.
+
+  The route is leased for the complete device-to-host transfer, so eviction,
+  release, and copy-on-write cannot recycle its pages while capture is in
+  flight. Physical page boundaries are independent of the requested durable
+  chunk. Current exact-prefix identity assumes absolute positions start at zero;
+  compacted nonzero-position routes are rejected until position semantics are
+  included in the content identity."
+  [pool continuation-id model-fingerprint descriptor]
+  (when-not (= :half (:dtype pool))
+    (throw (ex-info "Paged chunk export currently requires an FP16 page pool"
+                    {:pool-dtype (:dtype pool)})))
+  (let [lease (acquire-lease! pool [continuation-id])]
+    (try
+      (let [resident-route (first (:routes lease))
+            start (long (:chunk/start descriptor))
+            token-count (long (:chunk/token-count descriptor))
+            end (+ start token-count)
+            _ (when-not (zero? (long (:start-position resident-route)))
+                (throw (ex-info "Durable prefix export requires a zero absolute start position"
+                                {:continuation-id continuation-id
+                                 :start-position (:start-position resident-route)})))
+            _ (when (or (neg? start) (not (pos? token-count))
+                        (> end (:token-count resident-route)))
+                (throw (ex-info "Chunk range is outside the resident continuation"
+                                {:start start :token-count token-count
+                                 :resident-tokens (:token-count resident-route)})))
+            plan (attention-state/payload-plan (:layout pool) token-count)
+            payload-elements (reduce + 0 (map :elements plan))
+            halfs (short-array payload-elements)
+            slab-by-name (into {} (map (juxt :name identity))
+                               (:slabs (:layout pool)))
+            entries
+            (vec
+             (mapcat
+              (fn [{:keys [slab layer element-offset]}]
+                (let [slab-layout (get slab-by-name slab)
+                      per-token (:elements-per-token slab-layout)]
+                  (loop [relative-token 0
+                         transfers []]
+                    (if (= relative-token token-count)
+                      transfers
+                      (let [logical-token (+ start relative-token)
+                            logical-page (quot logical-token (:page-size pool))
+                            offset-in-page (rem logical-token (:page-size pool))
+                            physical-page (nth (:pages resident-route) logical-page)
+                            transfer-tokens (min (- token-count relative-token)
+                                                 (- (:page-size pool) offset-in-page))]
+                        (recur
+                         (+ relative-token transfer-tokens)
+                         (conj transfers
+                               [(page-view pool slab layer physical-page)
+                                halfs
+                                {:src-element (* offset-in-page per-token)
+                                 :dst-element (+ element-offset
+                                                 (* relative-token per-token))
+                                 :elements (* transfer-tokens per-token)}])))))))
+              plan))]
+        (gpu/download-ranges! (:session pool) entries)
+        (let [payload (float-array payload-elements)]
+          (dotimes [index payload-elements]
+            (aset payload index (Float/float16ToFloat (aget halfs index))))
+          (cond->
+           (merge descriptor
+                  {:chunk/version 2
+                   :chunk/model-fingerprint model-fingerprint
+                   :chunk/layout
+                   {:dtype :float32
+                    :byte-order (if (= ByteOrder/LITTLE_ENDIAN
+                                       (ByteOrder/nativeOrder))
+                                  :little-endian :big-endian)
+                    :attention-state (:layout pool)}
+                   :chunk/slabs plan
+                   :chunk/payload payload})
+            (apply = (map :elements plan))
+            (assoc :chunk/elements-per-slab (:elements (first plan))))))
+      (finally
+        (release-lease! pool lease)))))
+
 (defn append-token!
   "Append one complete host-visible attention-state token to a resident route.
 

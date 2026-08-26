@@ -107,6 +107,40 @@
                (mapv #(get-in % [2 :src-element]) @uploads)))
         (is (every? #(= 4 (get-in % [2 :elements])) @uploads))))))
 
+(deftest resident-pages-gather-into-the-portable-durable-chunk-layout
+  (let [downloads (atom nil)
+        pool (fixture-pool
+              (atom {:free (sorted-set 0 2 4 6)
+                     :refcounts {1 1, 3 1, 5 1, 7 1}
+                     :leases {}
+                     :routes {:continuation
+                              {:continuation-id :continuation
+                               :pages [5 1]
+                               :token-count 7
+                               :start-position 0}}}))
+        descriptor {:chunk/start 2 :chunk/token-count 4}]
+    (with-redefs [gpu/buffer-view (fn [_ key opts] {:key key :opts opts})
+                  gpu/download-ranges!
+                  (fn [_ entries]
+                    (reset! downloads entries)
+                    (doseq [[_ ^shorts destination {:keys [dst-element elements]}] entries
+                            index (range elements)]
+                      (let [destination-index (+ dst-element index)]
+                        (aset destination destination-index
+                              (Float/floatToFloat16
+                               (float (inc destination-index))))))
+                    (mapv second entries))]
+      (let [chunk (page-pool/export-chunk
+                   pool :continuation "fixture-paged-v1" descriptor)]
+        (is (= 2 (:chunk/version chunk)))
+        (is (= "fixture-paged-v1" (:chunk/model-fingerprint chunk)))
+        (is (= :float32 (get-in chunk [:chunk/layout :dtype])))
+        (is (= (mapv float (range 1 33))
+               (vec (:chunk/payload chunk))))
+        (is (= 8 (count @downloads))
+            "every slab/layer splits at the physical page boundary")
+        (is (zero? (:active-leases (page-pool/stats pool))))))))
+
 (deftest dense-routes-compose-unrelated-continuations-into-a-batch
   (let [pool (fixture-pool
               (atom {:free (sorted-set 6 7)

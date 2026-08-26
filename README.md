@@ -307,9 +307,12 @@ The routed attention leaf is still a portable correctness reference and this
 first model executor has one decode lane. The scheduler and attention/append
 adapters already describe multi-lane batches, but widening generated projection
 and post-attention stages for continuous model batching remains performance
-work. Durable chunks can already restore into this page pool through
-`restore-paged-prefix!`; exporting newly generated paged routes directly into
-the asynchronous durable checkpoint queue is not yet automatic.
+work. Durable chunks restore through `restore-paged-prefix!`. Newly generated
+paged routes enter the same Hasch-chain/Konserve/Datahike pipeline through
+`checkpoint-paged-chunks-async!`: capture leases an immutable route snapshot,
+gathers arbitrary physical page spans on the bounded worker, and publishes only
+after tiered-store durability. Scheduling when to request that optional capture
+remains a serving-policy decision.
 
 ## Validation methodology
 
