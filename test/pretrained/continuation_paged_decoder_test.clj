@@ -137,6 +137,7 @@
         captured (atom nil)]
     (with-redefs [gpu/alloc! (fn [& _] nil)
                   gpu/buffer (fn [_ _] (Object.))
+                  gpu/free-buffer! (fn [& _] nil)
                   gpu-link/instantiate!
                   (fn [plan _]
                     (reset! captured plan)
@@ -144,7 +145,7 @@
       (let [result
             (#'paged-decoder/linked-paged-executable!
              decode-state pool 2 "fixture"
-             (view :qr) (view :kr) (view :v) (view :at))]
+             (view :qr) (view :positions) (view :kr) (view :v) (view :at))]
         (is (= ::composite (:executable result)))
         (is (= 5 (count (:instances @captured))))
         (is (= [:pre :head]
@@ -168,7 +169,7 @@
                                  (int-array [42]))]
       (is (= 42 (paged-decoder/step! decoder :request 0)))
       (is (= 1 (:token-count (page-pool/route pool :request))))
-      (is (= [[:upload [:posbuf :clenbuf :slots :row-offsets :positions
+      (is (= [[:upload [:clenbuf :slots :row-offsets :positions
                         :page-table :lengths :start-positions]]
               [:run :paged-executable] [:download :tokbuf]]
              @calls)))))

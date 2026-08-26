@@ -146,7 +146,8 @@
           {} maps))
 
 (defn- linked-paged-executable!
-  [decode-state pool pages-per-sequence prefix query-view key-view value-view output-view]
+  [decode-state pool pages-per-sequence prefix query-view positions-view
+   key-view value-view output-view]
   (let [{:keys [sess model device-id]} decode-state
         staged (staged-executables! decode-state)
         slot-prefix (str prefix "-append")
@@ -178,6 +179,7 @@
                        :query-dtype :float
                        :output-dtype :float
                        :query-view query-view
+                       :query-positions-view positions-view
                        :output-view output-view}))
               (range (:n-layers model)))
         descriptor-specs
@@ -204,6 +206,7 @@
               [(:plan (:head-tail staged))]))
             stage-nodes (merge-first (map :nodes stage-plans))
             graph-roles (merge (zipmap descriptor-keys (repeat :input))
+                               {(:key positions-view) :input}
                                (zipmap page-keys (repeat :state))
                                (zipmap [(:key query-view) (:key key-view)
                                         (:key value-view) (:key output-view)]
@@ -297,6 +300,8 @@
         kv-elements (* (long (:n-kv model)) (long (:head-dim model)))
         query-view (gpu/buffer-view sess :qr {:shape [q-elements]
                                               :id [prefix :query]})
+        positions-view (gpu/buffer-view sess :positions {:shape [1]
+                                                         :id [prefix :positions]})
         key-view (gpu/buffer-view sess :kr {:shape [kv-elements]
                                             :id [prefix :key]})
         value-view (gpu/buffer-view sess :v {:shape [kv-elements]
@@ -306,7 +311,7 @@
     (let [{:keys [executable descriptor-keys owned-buffer-keys]}
           (linked-paged-executable!
            decode-state pool pages-per-sequence prefix
-           query-view key-view value-view output-view)]
+           query-view positions-view key-view value-view output-view)]
       (map->PagedDecoder
        {:decode-state decode-state
         :pool pool
@@ -370,8 +375,7 @@
                   keys (:descriptor-keys decoder)]
               (gpu/upload-ranges!
                sess
-               [[:posbuf (long-array [position]) {:elements 1}]
-                [:clenbuf (long-array [(inc (long position))]) {:elements 1}]
+               [[:clenbuf (long-array [(inc (long position))]) {:elements 1}]
                 [(:slots keys) (paged-append/slot-values batch) {:elements 1}]
                 [(:row-offsets keys) (int-array [0 1]) {:elements 2}]
                 [(:positions keys) (int-array [(int position)]) {:elements 1}]

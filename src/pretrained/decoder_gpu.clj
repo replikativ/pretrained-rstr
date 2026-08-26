@@ -3,7 +3,8 @@
 
   Same descriptor + model map; instead of the CPU spin-pool, the whole decoder layer is
   compiled ONCE into a Level-Zero command graph (compile-gpu-program) over resident buffers
-  (weights :constant, KV :state) and replayed per token. Device-side position (posbuf/clenbuf)
+  (weights :constant, KV :state) and replayed per token. Device-side position
+  (`positions` for RoPE, legacy posbuf/clenbuf for contiguous append/attention)
   so the graph binds once and the host only writes the token + replays.
 
   The decoder layer + head deftms are GENERATED from the model's descriptor flags
@@ -60,7 +61,7 @@
 ;; ---------------------------------------------------------------------------
 ;; On-device decode tail: argmax(logits) → tokbuf, embedding gather → next r0.
 ;; Appended to the resident graph so a replay produces the NEXT token's residual input on-device —
-;; the host uploads only the 16-byte position and downloads the 4-byte token id (no 1MB logits
+;; the host uploads only position metadata and downloads the 4-byte token id (no 1MB logits
 ;; download, no embedding upload). The embedding table is bound PRE-SCALED by sqrt(d) (double-math
 ;; host-side, bit-identical to embed-row) so the gather is a pure copy. Argmax ties are resolved
 ;; by whichever work-item writes last (CPU argmax picks the first index) — irrelevant for logits.
@@ -125,7 +126,7 @@
   forms (and their params); dims are baked as literals. rms-style :fn = Stage-A
   parallel-reduce rms (fast); :map-void = serial rms (the oracle anchor)."
   [m nm rms-style steer?]
-  (let [{:keys [d dp dff dffp qd qdp kvrow nq nkv hd group nsb-d nsb-qd nsb-dff]} (dims-of m)
+  (let [{:keys [d dp dff dffp qd qdp kvrow nq nkv hd group]} (dims-of m)
         flags (get-in m [:desc :flags])
         qk? (boolean (:qk-norm flags))
         sand? (boolean (:sandwich-norms flags))
@@ -161,36 +162,37 @@
                      ;; resid-post (activation addition). Injected ONLY when steer? — empty →
                      ;; identical program (compile-time switch, fast path untouched).
                      (when steer? ['steer :- (af :f)])
-                     ['posbuf :- (af :l) 'clenbuf :- (af :l) 'submax :- (af :f)
+                     ['posbuf :- (af :l) 'positions :- (af :i)
+                      'clenbuf :- (af :l) 'submax :- (af :f)
                       'maxpos :- 'Long 'eps :- 'Double 'theta :- 'Double 'scale :- 'Double]))
         body (remove nil?
               [(rms1 'r-in 'inln 'h)
-               (list 'qk/quant-act-q8k-gpu! 'h 'qinp 'qins 'qinb 'submax nsb-d)
-               (list 'qk/qmatmul-q4k-dp4a! 'qinp 'qins 'qinb 'wqp 'wqda 'wqdb 'wqaq 'wqbq 'q dp qd)
-               (list 'qk/qmatmul-q4k-dp4a! 'qinp 'qins 'qinb 'wkp 'wkda 'wkdb 'wkaq 'wkbq 'k dp kvrow)
-               (list 'qk/qmatmul-q4k-dp4a! 'qinp 'qins 'qinb 'wvp 'wvda 'wvdb 'wvaq 'wvbq 'v dp kvrow)
+               (list 'qk/quant-act-q8k-rows-gpu! 'h 'qinp 'qins 'qinb 'submax dp 1)
+               (list 'qk/qmatmul-q4k-dp4a-rows! 'qinp 'qins 'qinb 'wqp 'wqda 'wqdb 'wqaq 'wqbq 'q dp qd 1)
+               (list 'qk/qmatmul-q4k-dp4a-rows! 'qinp 'qins 'qinb 'wkp 'wkda 'wkdb 'wkaq 'wkbq 'k dp kvrow 1)
+               (list 'qk/qmatmul-q4k-dp4a-rows! 'qinp 'qins 'qinb 'wvp 'wvda 'wvdb 'wvaq 'wvbq 'v dp kvrow 1)
                (when qk? (list 'nn/rms-norm! 'q 'qln 'qn nq hd 'eps go))
                (when qk? (if (and (= rms-style :fn) (= nkv 1))
                            (list 'nn/rms-norm-1row! 'k 'kln 'kn hd 'eps go)
                            (list 'nn/rms-norm! 'k 'kln 'kn nkv hd 'eps go)))
-               (list 'attn/rope-pos-buf! (if qk? 'qn 'q) 'qr nq hd 'theta 'posbuf)
-               (list 'attn/rope-pos-buf! (if qk? 'kn 'k) 'kr nkv hd 'theta 'posbuf)
+               (list 'attn/rope-pos-rows-buf! (if qk? 'qn 'q) 'qr 1 nq hd 'theta 'positions)
+               (list 'attn/rope-pos-rows-buf! (if qk? 'kn 'k) 'kr 1 nkv hd 'theta 'positions)
                (list 'attn/kv-append-buf! 'kr 'kc kvrow 'posbuf)
                (list 'attn/kv-append-buf! 'v 'vc kvrow 'posbuf)
                ;; concrete-float layer → cast the Double `scale` to float at the call
                ;; boundary (gqa's scale is :- T; float×double would not lower to GPU C).
                (list 'attn/gqa-decode-attention-buf! 'qr 'kc 'vc 'at 'sc 'clenbuf nq group nkv hd 'maxpos (list 'float 'scale))
-               (list 'qk/quant-act-q8k-gpu! 'at 'qap 'qas 'qab 'submax nsb-qd)
-               (list 'qk/qmatmul-q4k-dp4a! 'qap 'qas 'qab 'wop 'woda 'wodb 'woaq 'wobq 'o qdp d)
+               (list 'qk/quant-act-q8k-rows-gpu! 'at 'qap 'qas 'qab 'submax qdp 1)
+               (list 'qk/qmatmul-q4k-dp4a-rows! 'qap 'qas 'qab 'wop 'woda 'wodb 'woaq 'wobq 'o qdp d 1)
                (when sand? (rms1 'o 'paln 'o2))
                (list 'nn/residual-add! 'r-in (if sand? 'o2 'o) 'xmid d)
                (rms1 'xmid 'pfln 'f)
-               (list 'qk/quant-act-q8k-gpu! 'f 'qfp 'qfs 'qfb 'submax nsb-d)
-               (list 'qk/qmatmul-q4k-dp4a! 'qfp 'qfs 'qfb 'wgp 'wgda 'wgdb 'wgaq 'wgbq 'gate dp dff)
-               (list 'qk/qmatmul-q4k-dp4a! 'qfp 'qfs 'qfb 'wup 'wuda 'wudb 'wuaq 'wubq 'up dp dff)
+               (list 'qk/quant-act-q8k-rows-gpu! 'f 'qfp 'qfs 'qfb 'submax dp 1)
+               (list 'qk/qmatmul-q4k-dp4a-rows! 'qfp 'qfs 'qfb 'wgp 'wgda 'wgdb 'wgaq 'wgbq 'gate dp dff 1)
+               (list 'qk/qmatmul-q4k-dp4a-rows! 'qfp 'qfs 'qfb 'wup 'wuda 'wudb 'wuaq 'wubq 'up dp dff 1)
                (list act-mul 'gate 'up 'hh dff)
-               (list 'qk/quant-act-q8k-gpu! 'hh 'qhp 'qhs 'qhb 'submax nsb-dff)
-               (list 'qk/qmatmul-q4k-dp4a! 'qhp 'qhs 'qhb 'wdp 'wdda 'wddb 'wdaq 'wdbq 'down dffp d)
+               (list 'qk/quant-act-q8k-rows-gpu! 'hh 'qhp 'qhs 'qhb 'submax dffp 1)
+               (list 'qk/qmatmul-q4k-dp4a-rows! 'qhp 'qhs 'qhb 'wdp 'wdda 'wddb 'wdaq 'wdbq 'down dffp d 1)
                (when sand? (rms1 'down 'pffln 'down2))
                (list 'nn/residual-add! 'xmid (if sand? 'down2 'down) 'r-out d)
                ;; inject the steering add at :resid-post (reuses residual-add!, a known-good
@@ -199,7 +201,7 @@
     (list 'raster.core/deftm nm params :- 'Void (cons 'do body))))
 
 (defn- head-form [m nm]
-  (let [{:keys [d dp nsb-d]} (dims-of m)
+  (let [{:keys [d dp]} (dims-of m)
         go (double (get-in m [:desc :flags :norm :gain-offset] 0.0))
         vocab (long (:vocab m))]
     (list 'raster.core/deftm nm
@@ -211,8 +213,8 @@
           :- 'Void
           (list 'do
                 (list 'nn/rms-norm! 'r-fin 'finalln 'fh 1 d 'eps go)
-                (list 'qk/quant-act-q8k-gpu! 'fh 'hqp 'hqs 'hqb 'submax nsb-d)
-                (list 'qk/qmatmul-q4k-dp4a! 'hqp 'hqs 'hqb 'lmp 'lmda 'lmdb 'lmaq 'lmbq 'logits dp vocab)))))
+                (list 'qk/quant-act-q8k-rows-gpu! 'fh 'hqp 'hqs 'hqb 'submax dp 1)
+                (list 'qk/qmatmul-q4k-dp4a-rows! 'hqp 'hqs 'hqb 'lmp 'lmda 'lmdb 'lmaq 'lmbq 'logits dp vocab 1)))))
 
 (defn eval-gen! [nm form]
   (or (get @gen-cache nm)
@@ -403,7 +405,8 @@
 
 (defn- io-specs [m maxpos]
   (merge {:r0 [:float (long (:d-model m)) nil :state]
-          :posbuf [:long 1 nil :input] :clenbuf [:long 1 nil :input]}
+          :posbuf [:long 1 nil :input] :positions [:int 1 nil :input]
+          :clenbuf [:long 1 nil :input]}
          (into {} (for [l (range 1 (inc (:n-layers m)))]
                     [(keyword (str "r" l)) [:float (long (:d-model m)) nil :scratch]]))))
 
@@ -1013,6 +1016,7 @@
   ^floats [dstate ^floats row pos]
   (let [{:keys [sess]} dstate]
     (gpu/upload! sess :posbuf (long-array [pos]))
+    (gpu/upload! sess :positions (int-array [(int pos)]))
     (gpu/upload! sess :clenbuf (long-array [(inc pos)]))
     (gpu/upload! sess :r0 row)
     (run-contiguous-decode! dstate)
@@ -1085,13 +1089,14 @@
       (throw (ex-info "Resident decode reached its maximum position"
                       {:position pos :max-position maxpos})))
     (gpu/upload! sess :posbuf (long-array [pos]))
+    (gpu/upload! sess :positions (int-array [(int pos)]))
     (gpu/upload! sess :clenbuf (long-array [(inc (long pos))]))
     (run-contiguous-decode! dstate)
     (long (aget ^ints (gpu/download sess :tokbuf) 0))))
 
 (defn generate-resident
   "Greedy autoregressive rollout fully on-device: after priming the prompt, each step uploads
-  only the 16-byte position, replays the graph (layers + head + argmax/embed-gather tail), and
+  only position metadata, replays the graph (layers + head + argmax/embed-gather tail), and
   downloads the 4-byte token id — the tail writes the next r0 on-device, so no logits download
   and no embedding upload. Rolls out up to `max-new` tokens, stopping early when the generated
   id is in `eos-ids` (the stop token is included in the result) or when the KV cache (maxpos)
@@ -1104,6 +1109,7 @@
     (loop [p p0 out []]
       (if (and (< (count out) max-new) (< p (long maxpos)))
         (do (gpu/upload! sess :posbuf (long-array [p]))
+            (gpu/upload! sess :positions (int-array [(int p)]))
             (gpu/upload! sess :clenbuf (long-array [(inc p)]))
             (run-contiguous-decode! dstate)
             (let [t (aget ^ints (gpu/download sess :tokbuf) 0)
