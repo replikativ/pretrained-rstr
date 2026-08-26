@@ -146,7 +146,7 @@
           {} maps))
 
 (defn- linked-paged-executable!
-  [decode-state pool pages-per-sequence prefix query-view positions-view
+  [decode-state pool batch-size pages-per-sequence prefix query-view positions-view
    key-view value-view output-view]
   (let [{:keys [sess model device-id]} decode-state
         staged (staged-executables! decode-state)
@@ -158,7 +158,7 @@
                  pool {:id [::append layer]
                        :key-prefix slot-prefix
                        :layer layer
-                       :batch-size 1
+                       :batch-size batch-size
                        :key-view key-view
                        :value-view value-view}))
               (range (:n-layers model)))
@@ -168,8 +168,8 @@
                  pool {:id [::attention layer]
                        :key-prefix route-prefix
                        :layer layer
-                       :batch-size 1
-                       :total-query-tokens 1
+                       :batch-size batch-size
+                       :total-query-tokens batch-size
                        :q-heads (:n-q model)
                        :kv-heads (:n-kv model)
                        :qk-head-dim (:head-dim model)
@@ -272,7 +272,7 @@
 
   Options:
   - `:page-size` defaults to 16 tokens.
-  - `:physical-pages` defaults to enough pages for one `:maxpos` continuation.
+  - `:physical-pages` defaults to enough pages for one full route per batch lane.
   - `:key-prefix` optionally supplies deterministic session buffer names.
 
   The decoder owns its linked graph but not the decode state, Raster session, or
@@ -287,8 +287,10 @@
         _ (staged-executables! decode-state)
         page-size (checked-positive :page-size page-size)
         pages-per-sequence (long (quot (+ (long maxpos) (dec page-size)) page-size))
-        physical-pages (checked-positive :physical-pages
-                                         (or physical-pages pages-per-sequence))
+        batch-size (long (:batch-size decode-state 1))
+        physical-pages (checked-positive
+                        :physical-pages
+                        (or physical-pages (* batch-size pages-per-sequence)))
         prefix (or key-prefix (str "paged-decoder-" (UUID/randomUUID)))
         pool (page-pool/open-pool!
               sess (attention-state/layout model)
@@ -296,29 +298,29 @@
                :physical-pages physical-pages
                :dtype :half
                :key-prefix (str prefix "-pool")})
-        q-elements (* (long (:n-q model)) (long (:head-dim model)))
-        kv-elements (* (long (:n-kv model)) (long (:head-dim model)))
+        q-elements (* batch-size (long (:n-q model)) (long (:head-dim model)))
+        kv-elements (* batch-size (long (:n-kv model)) (long (:head-dim model)))
         query-view (gpu/buffer-view sess :qr {:shape [q-elements]
                                               :id [prefix :query]})
-        positions-view (gpu/buffer-view sess :positions {:shape [1]
+        positions-view (gpu/buffer-view sess :positions {:shape [batch-size]
                                                          :id [prefix :positions]})
         key-view (gpu/buffer-view sess :kr {:shape [kv-elements]
                                             :id [prefix :key]})
         value-view (gpu/buffer-view sess :v {:shape [kv-elements]
                                              :id [prefix :value]})
         output-view (gpu/buffer-view sess :at {:shape [q-elements]
-                                               :id [prefix :output]})]
-    (let [{:keys [executable descriptor-keys owned-buffer-keys]}
-          (linked-paged-executable!
-           decode-state pool pages-per-sequence prefix
-           query-view positions-view key-view value-view output-view)]
-      (map->PagedDecoder
-       {:decode-state decode-state
-        :pool pool
-        :executable executable
-        :descriptor-keys descriptor-keys
-        :pages-per-sequence pages-per-sequence
-        :state (atom {:closed? false :owned-buffer-keys owned-buffer-keys})}))))
+                                               :id [prefix :output]})
+        {:keys [executable descriptor-keys owned-buffer-keys]}
+        (linked-paged-executable!
+         decode-state pool batch-size pages-per-sequence prefix
+         query-view positions-view key-view value-view output-view)]
+    (map->PagedDecoder
+     {:decode-state decode-state
+      :pool pool
+      :executable executable
+      :descriptor-keys descriptor-keys
+      :pages-per-sequence pages-per-sequence
+      :state (atom {:closed? false :owned-buffer-keys owned-buffer-keys})})))
 
 (defn allocate-continuation!
   "Allocate an empty resident route for `continuation-id` and return it.
@@ -335,35 +337,59 @@
   "Put `token` in the shared resident input row without advancing its route."
   [decoder token]
   (require-open! decoder)
+  (when-not (= 1 (long (:batch-size (:decode-state decoder) 1)))
+    (throw (ex-info "Use prime-tokens! with a batched paged decoder"
+                    {:batch-size (:batch-size (:decode-state decoder))})))
   (decoder-gpu/prime-resident-token! (:decode-state decoder) token)
   decoder)
 
-(defn step!
-  "Process the resident input token and append one K/V row atomically.
+(defn prime-tokens!
+  "Put one pending token in every fixed decode lane without advancing routes.
 
-  `position` must be the route's next absolute position. Every layer writes the
-  reserved physical slot and consumes the prospective route before the logical
-  token count is published. On failure the reservation is rolled back and its
-  partially written slot remains unreachable. Returns the next greedy token id."
-  [decoder continuation-id position]
+  `tokens` must have the batch size used by `decoder-gpu/bind-decode!`. Returns
+  `decoder`."
+  [decoder tokens]
   (require-open! decoder)
-  (let [{:keys [sess]} (:decode-state decoder)
-        route (or (page-pool/route (:pool decoder) continuation-id)
-                  (throw (ex-info "Continuation is not resident"
-                                  {:continuation-id continuation-id})))
-        expected-position (+ (long (:start-position route))
-                             (long (:token-count route)))]
-    (when-not (= expected-position (long position))
-      (throw (ex-info "Paged decode position does not extend the resident route"
-                      {:continuation-id continuation-id
-                       :expected expected-position :actual position})))
-    (when-not (< (long (:token-count route))
-                 (long (:maxpos (:decode-state decoder))))
-      (throw (ex-info "Paged decode reached its route capacity"
-                      {:continuation-id continuation-id
-                       :token-count (:token-count route)
-                       :capacity (:maxpos (:decode-state decoder))})))
-    (let [batch (paged-append/reserve-batch! (:pool decoder) [continuation-id])]
+  (decoder-gpu/prime-resident-tokens! (:decode-state decoder) tokens)
+  decoder)
+
+(defn step-batch!
+  "Process one resident token for every continuation in a fixed decode batch.
+
+  `continuation-ids` and `positions` must each have the decoder's bound batch
+  size and retain lane order. Every position must extend its route. The complete
+  batch reserves, executes, and publishes atomically with respect to logical
+  route lengths; on failure all still-pending reservations are aborted. Returns
+  the next greedy token id for each lane in the same order."
+  [decoder continuation-ids positions]
+  (require-open! decoder)
+  (let [{:keys [sess batch-size]} (:decode-state decoder)
+        batch-size (long (or batch-size 1))
+        continuation-ids (vec continuation-ids)
+        positions (mapv long positions)]
+    (when-not (and (= batch-size (count continuation-ids))
+                   (= batch-size (count positions)))
+      (throw (ex-info "Paged step does not match the bound decode batch"
+                      {:batch-size batch-size
+                       :continuation-count (count continuation-ids)
+                       :position-count (count positions)})))
+    (doseq [[continuation-id position] (map vector continuation-ids positions)]
+      (let [route (or (page-pool/route (:pool decoder) continuation-id)
+                      (throw (ex-info "Continuation is not resident"
+                                      {:continuation-id continuation-id})))
+            expected-position (+ (long (:start-position route))
+                                 (long (:token-count route)))]
+        (when-not (= expected-position position)
+          (throw (ex-info "Paged decode position does not extend the resident route"
+                          {:continuation-id continuation-id
+                           :expected expected-position :actual position})))
+        (when-not (< (long (:token-count route))
+                     (long (:maxpos (:decode-state decoder))))
+          (throw (ex-info "Paged decode reached its route capacity"
+                          {:continuation-id continuation-id
+                           :token-count (:token-count route)
+                           :capacity (:maxpos (:decode-state decoder))})))))
+    (let [batch (paged-append/reserve-batch! (:pool decoder) continuation-ids)]
       (try
         (let [entries (paged-append/reservation-entries batch)
               lease (page-pool/acquire-prospective-lease! (:pool decoder) entries)]
@@ -375,10 +401,11 @@
                   keys (:descriptor-keys decoder)]
               (gpu/upload-ranges!
                sess
-               [[:clenbuf (long-array [(inc (long position))]) {:elements 1}]
-                [(:slots keys) (paged-append/slot-values batch) {:elements 1}]
-                [(:row-offsets keys) (int-array [0 1]) {:elements 2}]
-                [(:positions keys) (int-array [(int position)]) {:elements 1}]
+               [[(:slots keys) (paged-append/slot-values batch)
+                 {:elements batch-size}]
+                [(:row-offsets keys) (int-array (range (inc batch-size)))
+                 {:elements (inc batch-size)}]
+                [(:positions keys) (int-array positions) {:elements batch-size}]
                 [(:page-table keys) (:page-table route-values)
                  {:elements (alength ^ints (:page-table route-values))}]
                 [(:lengths keys) (:lengths route-values)
@@ -389,17 +416,99 @@
             (finally
               (page-pool/release-lease! (:pool decoder) lease))))
         (paged-append/commit-batch! batch)
-        (long (aget ^ints (gpu/download sess :tokbuf) 0))
+        (mapv long (gpu/download sess :tokbuf))
         (catch Throwable error
           (when (= :reserved @(:state batch))
             (paged-append/abort-batch! batch))
           (throw error))))))
+
+(defn step!
+  "Process the resident input token and append one K/V row atomically.
+
+  `position` must be the route's next absolute position. Every layer writes the
+  reserved physical slot and consumes the prospective route before the logical
+  token count is published. On failure the reservation is rolled back and its
+  partially written slot remains unreachable. Returns the next greedy token id."
+  [decoder continuation-id position]
+  (let [batch-size (long (:batch-size (:decode-state decoder) 1))]
+    (when-not (= batch-size 1)
+      (throw (ex-info "Use step-batch! with a batched paged decoder"
+                      {:batch-size batch-size})))
+    (first (step-batch! decoder [continuation-id] [position]))))
 
 (defn decode-token!
   "Upload `token`'s embedding, process it at `position`, and return the next token."
   [decoder continuation-id token position]
   (prime-token! decoder token)
   (step! decoder continuation-id position))
+
+(defn decode-tokens!
+  "Upload one token per lane, process the fixed continuation batch, and return
+  the lane-ordered next tokens."
+  [decoder continuation-ids tokens positions]
+  (prime-tokens! decoder tokens)
+  (step-batch! decoder continuation-ids positions))
+
+(defn prime-prompts-batch!
+  "Compute an equal-length missing suffix for one prompt per decode lane.
+
+  Routes may already contain different exact prefix lengths, but every lane
+  must require the same number of decode steps so the fixed graph stays full.
+  The final prompt token in each lane is left resident and pending."
+  [decoder continuation-ids prompts]
+  (require-open! decoder)
+  (let [continuation-ids (vec continuation-ids)
+        prompts (mapv vec prompts)
+        batch-size (long (:batch-size (:decode-state decoder) 1))]
+    (when-not (and (= batch-size (count continuation-ids))
+                   (= batch-size (count prompts))
+                   (every? seq prompts))
+      (throw (ex-info "Prompt batch does not match the bound decoder"
+                      {:batch-size batch-size
+                       :continuation-count (count continuation-ids)
+                       :prompt-count (count prompts)})))
+    (let [routes (mapv #(or (page-pool/route (:pool decoder) %)
+                            (allocate-continuation! decoder %))
+                       continuation-ids)
+          cached-counts (mapv (comp long :token-count) routes)
+          processed-counts (mapv (comp dec count) prompts)
+          missing-counts (mapv - processed-counts cached-counts)]
+      (when-not (every? zero? (map (comp long :start-position) routes))
+        (throw (ex-info "Paged prompt priming requires zero absolute starts"
+                        {:start-positions (mapv :start-position routes)})))
+      (when (some neg? missing-counts)
+        (throw (ex-info "A resident prefix is longer than its prompt"
+                        {:cached-counts cached-counts
+                         :processed-counts processed-counts})))
+      (when-not (apply = missing-counts)
+        (throw (ex-info "Fixed decode lanes require equal missing suffix lengths"
+                        {:missing-counts missing-counts})))
+      (dotimes [offset (long (first missing-counts))]
+        (let [positions (mapv #(+ % offset) cached-counts)
+              tokens (mapv #(nth %1 %2) prompts positions)]
+          (decode-tokens! decoder continuation-ids tokens positions)))
+      (prime-tokens! decoder (mapv peek prompts)))))
+
+(defn generate-batch!
+  "Greedily generate exactly `max-new` tokens per fixed decode lane.
+
+  Prompts first pass through `prime-prompts-batch!`; consequently their missing
+  suffix lengths must match. Generation stops for the whole batch when any lane
+  reaches capacity. Per-lane EOS retirement requires a scheduler with lane
+  refill and is intentionally not simulated by advancing a finished route."
+  [decoder continuation-ids prompts max-new]
+  (let [continuation-ids (vec continuation-ids)
+        prompts (mapv vec prompts)]
+    (prime-prompts-batch! decoder continuation-ids prompts)
+    (loop [positions (mapv (comp dec count) prompts)
+           output (vec (repeat (count prompts) []))]
+      (if (and (< (count (first output)) (long max-new))
+               (every? #(< (long (:token-count (page-pool/route (:pool decoder) %)))
+                            (long (:maxpos (:decode-state decoder))))
+                       continuation-ids))
+        (let [tokens (step-batch! decoder continuation-ids positions)]
+          (recur (mapv inc positions) (mapv conj output tokens)))
+        output))))
 
 (defn prime-prompt!
   "Compute only the uncached suffix of `prompt` and leave its final token pending.

@@ -309,11 +309,30 @@ copy-on-write resume parity. Partial pages copy directly between resident
 Raster views (Level Zero unified allocation copy or OpenCL device-buffer copy),
 without JVM tensor staging.
 
-The routed attention leaf is still a portable correctness reference and this
-first model executor has one decode lane. The scheduler and attention/append
-adapters already describe multi-lane batches, but widening generated projection
-and post-attention stages for continuous model batching remains performance
-work. Durable chunks restore through `restore-paged-prefix!`. Newly generated
+The generated projections, per-row RoPE, routed attention, post-attention
+layers, head, deterministic argmax, and embedding gather now share one fixed
+decode batch dimension. Independent routes can therefore execute together
+without copying K/V or activations through the host:
+
+```clojure
+(def batched-state
+  (decoder/bind-decode! model :maxpos 64 :cache-mode :paged :batch-size 2))
+(def batched-engine
+  (paged/open! batched-state :page-size 16 :physical-pages 128))
+
+(paged/generate-batch!
+ batched-engine [:request-a :request-b]
+ [(vec ((:encode tokenizer) (:tok tokenizer) "Paris is the capital of"))
+  (vec ((:encode tokenizer) (:tok tokenizer) "Berlin is the capital of"))]
+ 4)
+;; => [[token-a0 token-a1 token-a2 token-a3]
+;;     [token-b0 token-b1 token-b2 token-b3]]
+```
+
+The graph capacity is fixed when it is compiled. The current batch convenience
+API requires equal missing prompt-suffix lengths and keeps every lane active;
+refilling retired/EOS lanes from the scheduler is the next continuous-batching
+step. Durable chunks restore through `restore-paged-prefix!`. Newly generated
 paged routes enter the same Hasch-chain/Konserve/Datahike pipeline through
 `checkpoint-paged-chunks-async!`: capture leases an immutable route snapshot,
 gathers arbitrary physical page spans on the bounded worker, and publishes only

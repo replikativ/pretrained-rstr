@@ -144,7 +144,7 @@
                     ::composite)]
       (let [result
             (#'paged-decoder/linked-paged-executable!
-             decode-state pool 2 "fixture"
+             decode-state pool 1 2 "fixture"
              (view :qr) (view :positions) (view :kr) (view :v) (view :at))]
         (is (= ::composite (:executable result)))
         (is (= 5 (count (:instances @captured))))
@@ -169,9 +169,50 @@
                                  (int-array [42]))]
       (is (= 42 (paged-decoder/step! decoder :request 0)))
       (is (= 1 (:token-count (page-pool/route pool :request))))
-      (is (= [[:upload [:clenbuf :slots :row-offsets :positions
+      (is (= [[:upload [:slots :row-offsets :positions
                         :page-table :lengths :start-positions]]
               [:run :paged-executable] [:download :tokbuf]]
+             @calls)))))
+
+(deftest fixed-batch-publishes-independent-routes-in-lane-order
+  (let [{:keys [pool decoder]} (fixture)
+        decoder (assoc-in decoder [:decode-state :batch-size] 2)
+        uploads (atom nil)]
+    (doseq [continuation-id [:left :right]]
+      (paged-decoder/allocate-continuation! decoder continuation-id))
+    (with-redefs [gpu/upload-ranges! (fn [_ entries] (reset! uploads entries))
+                  gpu-link/run! (fn [_] nil)
+                  gpu/download (fn [_ _] (int-array [41 42]))]
+      (is (= [41 42]
+             (paged-decoder/step-batch! decoder [:left :right] [0 0])))
+      (is (= [1 1]
+             (mapv #(get (page-pool/route pool %) :token-count)
+                   [:left :right])))
+      (is (= [0 1 2]
+             (vec ^ints (second (second @uploads)))))
+      (is (= [0 0]
+             (vec ^ints (second (nth @uploads 2))))))))
+
+(deftest fixed-batch-primes-equal-work-suffixes-at-independent-positions
+  (let [{:keys [pool decoder]} (fixture)
+        decoder (assoc-in decoder [:decode-state :batch-size] 2)
+        calls (atom [])]
+    (page-pool/allocate-route! pool :left 1)
+    (page-pool/allocate-route! pool :right 0)
+    (with-redefs [paged-decoder/decode-tokens!
+                  (fn [_ ids tokens positions]
+                    (swap! calls conj [:decode ids tokens positions]))
+                  paged-decoder/prime-tokens!
+                  (fn [engine tokens]
+                    (swap! calls conj [:prime tokens])
+                    engine)]
+      (is (identical?
+           decoder
+           (paged-decoder/prime-prompts-batch!
+            decoder [:left :right] [[10 11 12 13] [20 21 22]])))
+      (is (= [[:decode [:left :right] [11 20] [1 0]]
+              [:decode [:left :right] [12 21] [2 1]]
+              [:prime [13 22]]]
              @calls)))))
 
 (deftest failed-layer-leaves-partial-page-writes-unreachable
