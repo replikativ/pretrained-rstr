@@ -6,11 +6,11 @@
  ;; compilable blocks + quant kernels stay in raster.
  ;;
  ;; raster is released on Clojars (Maven-resolvable; its POM declares TypedClojure).
- ;; 0.2.377 adds fused dense-row padding during Q8_K packing plus deterministic
- ;; indexed row reduction and resident row gather on top of uniform multi-row
- ;; Q4_K projection, buffered RoPE, and validated LinkPlan composition.
+ ;; 0.2.379 formalizes inactive paged-append lanes and first-class SegOp program
+ ;; boundaries on top of fused dense-row padding, deterministic indexed row
+ ;; reduction, resident row gather, and validated LinkPlan composition.
  ;; The :dev alias overrides raster with the sibling checkout for local work.
- :deps {org.replikativ/raster {:mvn/version "0.2.377"}
+ :deps {org.replikativ/raster {:mvn/version "0.2.379"}
         org.replikativ/boring {:mvn/version "0.1.27"}
         org.replikativ/hasch {:mvn/version "0.4.102"}
         org.replikativ/konserve {:mvn/version "0.9.379"}
