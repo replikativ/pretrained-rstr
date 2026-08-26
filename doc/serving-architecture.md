@@ -137,11 +137,15 @@ The pretrained adapter can already bind FP16 query and output
 and output graphs can share allocations without tensor uploads or downloads.
 The current single-lane decoder declares the cache writes and attention output
 as a Raster `ProgramStage`; Raster selects the unique effect-defined interval
-and projects ordinary before/selected/after descriptors. Pretrained instantiates
-the before/after descriptors and the head/tail as validated `LinkPlan`
-executables over imported resident buffers. This keeps page management and
-transactional publication outside the compiler without introducing an
-attention-specific linker or decoding compiler ABI names in the runtime.
+and projects ordinary before/selected/after descriptors. Pretrained wraps each
+routed append and attention `KernelGraph` as an ordinary descriptor instance,
+then interleaves those instances with every layer's before/after descriptors and
+the head/tail in one validated `LinkPlan`. Each token therefore needs one linked
+replay, not four submissions per layer plus a head submission. Page reservation,
+prospective leases, and transactional publication remain outside the graph, so
+a failed replay cannot publish a partially written page. This keeps cache
+management outside the compiler without introducing an attention-specific
+linker or decoding compiler ABI names in the runtime.
 
 Raster 0.2.355 provides the routed append operation with this explicit ordered
 ABI:
@@ -179,11 +183,13 @@ Restore is planned before bytes move:
    request runnable only after GPU transfer events complete.
 6. Prefill the uncached suffix and leave the final token pending.
 
-Checkpointing takes immutable completed page ranges. GPU-to-host copies run on a
-transfer stream into a bounded pinned-memory pool. A low-priority worker writes
-the local mmap filestore; Konserve write-behind copies to S3; Datahike publication
-waits for backend receipts. If any queue is full, the optional checkpoint is
-skipped. Inference never waits for remote durability.
+`checkpoint-paged-chunks-async!` checkpoints immutable completed page ranges.
+The bounded capture worker leases a route snapshot, gathers arbitrary physical
+page spans, and writes the local mmap filestore; Konserve write-behind copies to
+S3 and Datahike publication waits for backend receipts. If either queue is full,
+the optional checkpoint is skipped. The remaining performance step is moving
+device-to-host capture onto a dedicated low-priority transfer stream backed by a
+bounded pinned-memory pool, so copies do not contend with inference kernels.
 
 ## Policy
 

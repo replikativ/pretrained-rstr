@@ -46,6 +46,7 @@
 (deftest resident-views-compose-attention-with-adjacent-device-graphs
   (let [page-pool (pool)
         query-view (Object.)
+        positions-view (Object.)
         output-view (Object.)]
     (with-redefs [gpu/resident-buffer-view? (constantly true)]
       (let [plan (paged-attention/reference-plan
@@ -63,12 +64,17 @@
                    :query-dtype :float
                    :output-dtype :float
                    :query-view query-view
+                   :query-positions-view positions-view
                    :output-view output-view})]
         (testing "caller-owned tensor views replace only private tensor allocations"
           (is (identical? query-view
                           (get (:bindings plan) (get-in plan [:ids :query]))))
           (is (identical? output-view
                           (get (:bindings plan) (get-in plan [:ids :output]))))
+          (is (identical? positions-view
+                          (get (:bindings plan) (get-in plan [:ids :query-positions]))))
+          (is (not (contains? (:allocations plan)
+                              (get-in plan [:buffer-keys :query-positions]))))
           (is (= :float (get-in plan [:problem :q-dtype])))
           (is (= :float (get-in plan [:problem :output-dtype])))
           (is (= #{:int} (set (map first (vals (:allocations plan))))))

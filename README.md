@@ -115,6 +115,11 @@ continuation boundary as uninterrupted inference.
 ;; dstate is a bound pretrained.decoder-gpu state; prompt-ids is a token vector.
 (bench/benchmark-gpu-prefix! manager dstate fingerprint prompt-ids
                              {:warmups 1 :iterations 5})
+
+;; For a paged decoder, includes mmap/scatter and exact suffix completion:
+(bench/benchmark-paged-prefix! manager engine fingerprint prompt-ids
+                               {:warmups 1 :iterations 5
+                                :probe-prompt-ids partially-matching-ids})
 ```
 
 The benchmark separates prefill, checkpoint submission/drain, first measured
@@ -169,12 +174,13 @@ promotes the chunks to a second worker, mmaps them, and restarts that worker:
 (distributed/run-minio-smoke!)
 ```
 
-`open-authority!`, `open-worker!`, `checkpoint-gpu-prefix!`, and
-`restore-gpu-prefix!` expose the same stages for a bound model. The source phase
-returns a small serializable manifest for the destination phase. Concurrent
-workers should run in separate JVMs; the smoke turns them over sequentially
-because distributed-scope intentionally keeps one in-process route per remote
-peer.
+`open-authority!` and `open-worker!` expose the topology. Contiguous model state
+uses `checkpoint-gpu-prefix!` / `restore-gpu-prefix!`; the paged executor uses
+`checkpoint-paged-prefix!` / `restore-paged-prefix!`. Both source phases return
+the same small serializable manifest and both destination phases report
+token-exact resumed output. Concurrent workers should run in separate JVMs; the
+smoke turns them over sequentially because distributed-scope intentionally keeps
+one in-process route per remote peer.
 
 ```clojure
 (require '[konserve.tiered :as tiered]
@@ -255,14 +261,16 @@ For model execution, `:query-view` and `:output-view` may be FP16 or FP32 Raster
 then uploads only small route descriptors and returns the resident output view
 after completion; query and attention tensors never cross the host.
 
-`pretrained.continuation.paged-decoder` executes a generated decoder layer in
-resident pre-attention and post-attention stages, replacing the contiguous K/V
-assignment and attention interval. The adapter declares K/V as stage state and
-the attention result as its output; Raster's operation-neutral `ProgramStage`
-derives and validates the interval from executable effects. Each projection is
-then an ordinary `LinkPlan` instance over stable resident nodes. Pretrained owns
-page allocation, reservations, and transactional publication, but neither scans
-kernel ABI names nor assembles raw compiler phase keys. Bind with
+`pretrained.continuation.paged-decoder` replaces the contiguous K/V assignment
+and attention interval between generated pre-attention and post-attention
+stages. The adapter declares K/V as stage state and the attention result as its
+output; Raster's operation-neutral `ProgramStage` derives and validates the
+interval from executable effects. One `LinkPlan` then interleaves every layer's
+generated pre-stage, routed append graph, paged-attention graph, and generated
+post-stage before linking the token head/tail. A decode step uploads one shared
+set of route descriptors and replays this composite executable once. Pretrained
+owns page allocation, reservations, leases, and transactional publication, but
+neither scans kernel ABI names nor assembles raw compiler phase keys. Bind with
 `:cache-mode :paged` to omit the displaced per-layer K/V and score buffers:
 
 ```clojure
@@ -291,7 +299,9 @@ kernel ABI names nor assembles raw compiler phase keys. Bind with
 
 The contiguous decoder is likewise one validated LinkPlan containing every
 layer plus the head and greedy tail. Both modes import the same pretrained-owned
-resident allocations without copying them or transferring ownership.
+resident allocations without copying them or transferring ownership. Routed
+graph temporaries stay private to their descriptor steps; query, K/V, attention
+output, page slabs, and route descriptors are stable linked nodes.
 
 The Gemma anchor verifies token-exact parity with the contiguous decoder, the
 absence of `kc*`, `vc*`, and `sc` allocations, shared-page fork semantics, and
@@ -299,13 +309,35 @@ copy-on-write resume parity. Partial pages copy directly between resident
 Raster views (Level Zero unified allocation copy or OpenCL device-buffer copy),
 without JVM tensor staging.
 
-The routed attention leaf is still a portable correctness reference and this
-first model executor has one decode lane. The scheduler and attention/append
-adapters already describe multi-lane batches, but widening generated projection
-and post-attention stages for continuous model batching remains performance
-work. Durable chunks can already restore into this page pool through
-`restore-paged-prefix!`; exporting newly generated paged routes directly into
-the asynchronous durable checkpoint queue is not yet automatic.
+The generated projections, per-row RoPE, routed attention, post-attention
+layers, head, deterministic argmax, and embedding gather now share one fixed
+decode batch dimension. Independent routes can therefore execute together
+without copying K/V or activations through the host:
+
+```clojure
+(def batched-state
+  (decoder/bind-decode! model :maxpos 64 :cache-mode :paged :batch-size 2))
+(def batched-engine
+  (paged/open! batched-state :page-size 16 :physical-pages 128))
+
+(paged/generate-batch!
+ batched-engine [:request-a :request-b]
+ [(vec ((:encode tokenizer) (:tok tokenizer) "Paris is the capital of"))
+  (vec ((:encode tokenizer) (:tok tokenizer) "Berlin is the capital of"))]
+ 4)
+;; => [[token-a0 token-a1 token-a2 token-a3]
+;;     [token-b0 token-b1 token-b2 token-b3]]
+```
+
+The graph capacity is fixed when it is compiled. The current batch convenience
+API requires equal missing prompt-suffix lengths and keeps every lane active;
+refilling retired/EOS lanes from the scheduler is the next continuous-batching
+step. Durable chunks restore through `restore-paged-prefix!`. Newly generated
+paged routes enter the same Hasch-chain/Konserve/Datahike pipeline through
+`checkpoint-paged-chunks-async!`: capture leases an immutable route snapshot,
+gathers arbitrary physical page spans on the bounded worker, and publishes only
+after tiered-store durability. Scheduling when to request that optional capture
+remains a serving-policy decision.
 
 ## Validation methodology
 

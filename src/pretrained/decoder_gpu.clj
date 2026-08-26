@@ -3,7 +3,8 @@
 
   Same descriptor + model map; instead of the CPU spin-pool, the whole decoder layer is
   compiled ONCE into a Level-Zero command graph (compile-gpu-program) over resident buffers
-  (weights :constant, KV :state) and replayed per token. Device-side position (posbuf/clenbuf)
+  (weights :constant, KV :state) and replayed per token. Device-side position
+  (`positions` for RoPE, legacy posbuf/clenbuf for contiguous append/attention)
   so the graph binds once and the host only writes the token + replays.
 
   The decoder layer + head deftms are GENERATED from the model's descriptor flags
@@ -18,6 +19,7 @@
             [raster.arrays :as arr]
             [raster.quant.kernels-k :as qk]
             [raster.quant.pack :as qpack]
+            [raster.dl.array-ops :as aops]
             [raster.dl.nn :as nn]
             [raster.dl.attention :as attn]
             [raster.gpu.core :as gpu]
@@ -60,23 +62,19 @@
 ;; ---------------------------------------------------------------------------
 ;; On-device decode tail: argmax(logits) → tokbuf, embedding gather → next r0.
 ;; Appended to the resident graph so a replay produces the NEXT token's residual input on-device —
-;; the host uploads only the 16-byte position and downloads the 4-byte token id (no 1MB logits
+;; the host uploads only position metadata and downloads the 4-byte token id (no 1MB logits
 ;; download, no embedding upload). The embedding table is bound PRE-SCALED by sqrt(d) (double-math
-;; host-side, bit-identical to embed-row) so the gather is a pure copy. Argmax ties are resolved
-;; by whichever work-item writes last (CPU argmax picks the first index) — irrelevant for logits.
+;; host-side, bit-identical to embed-row) so the gather is a pure copy. Raster's indexed row
+;; reduction makes token selection deterministic: ties choose the lowest token id and NaNs win
+;; over finite logits so numerical corruption remains visible.
 ;; ---------------------------------------------------------------------------
 
 (raster.core/deftm decode-tail!
   [logits :- (Array float) emb :- (Array float) tokbuf :- (Array int) r0 :- (Array float)
-   vocab :- Long d :- Long] :- Void
-  (let [mx (raster.par/reduce acc -1.0e30 i vocab
-             (raster.numeric/max acc (raster.arrays/aget logits i)))]
-    (raster.par/map-void! j vocab
-      (when (raster.numeric/== (raster.arrays/aget logits j) mx)
-        (raster.arrays/aset tokbuf 0 j)))
-    (raster.par/map-void! j d
-      (raster.arrays/aset r0 j
-        (raster.arrays/aget emb (+ (* (raster.arrays/aget tokbuf 0) d) j))))))
+   nrows :- Long vocab :- Long d :- Long] :- Void
+  (do
+    (aops/argmax-rows! logits tokbuf nrows vocab)
+    (aops/gather-rows! emb tokbuf r0 nrows d)))
 
 (defn- embed-scale ^double [m]
   (if (= :sqrt-d (get-in m [:desc :flags :embed-scale]))
@@ -124,17 +122,18 @@
   "The GPU layer deftm form for model m: flags decide qk-norm / sandwich / gelu|silu
   forms (and their params); dims are baked as literals. rms-style :fn = Stage-A
   parallel-reduce rms (fast); :map-void = serial rms (the oracle anchor)."
-  [m nm rms-style steer?]
-  (let [{:keys [d dp dff dffp qd qdp kvrow nq nkv hd group nsb-d nsb-qd nsb-dff]} (dims-of m)
+  [m nm rms-style steer? nrows]
+  (let [{:keys [d dp dff dffp qd qdp kvrow nq nkv hd group]} (dims-of m)
+        nrows (long nrows)
         flags (get-in m [:desc :flags])
         qk? (boolean (:qk-norm flags))
         sand? (boolean (:sandwich-norms flags))
         act-mul (if (= :geglu (:ffn flags)) 'nn/gelu-mul! 'nn/silu-mul!)
         go (double (get-in flags [:norm :gain-offset] 0.0))
         rms1 (fn [x w out]
-               (if (= rms-style :fn)
+               (if (and (= rms-style :fn) (= nrows 1))
                  (list 'nn/rms-norm-1row! x w out d 'eps go)
-                 (list 'nn/rms-norm! x w out 1 d 'eps go)))
+                 (list 'nn/rms-norm! x w out nrows d 'eps go)))
         params (vec (concat
                      ['r-in :- (af :f) 'inln :- (af :f)]
                      (when qk? ['qln :- (af :f) 'kln :- (af :f)])
@@ -161,45 +160,47 @@
                      ;; resid-post (activation addition). Injected ONLY when steer? — empty →
                      ;; identical program (compile-time switch, fast path untouched).
                      (when steer? ['steer :- (af :f)])
-                     ['posbuf :- (af :l) 'clenbuf :- (af :l) 'submax :- (af :f)
+                     ['posbuf :- (af :l) 'positions :- (af :i)
+                      'clenbuf :- (af :l) 'submax :- (af :f)
                       'maxpos :- 'Long 'eps :- 'Double 'theta :- 'Double 'scale :- 'Double]))
         body (remove nil?
               [(rms1 'r-in 'inln 'h)
-               (list 'qk/quant-act-q8k-gpu! 'h 'qinp 'qins 'qinb 'submax nsb-d)
-               (list 'qk/qmatmul-q4k-dp4a! 'qinp 'qins 'qinb 'wqp 'wqda 'wqdb 'wqaq 'wqbq 'q dp qd)
-               (list 'qk/qmatmul-q4k-dp4a! 'qinp 'qins 'qinb 'wkp 'wkda 'wkdb 'wkaq 'wkbq 'k dp kvrow)
-               (list 'qk/qmatmul-q4k-dp4a! 'qinp 'qins 'qinb 'wvp 'wvda 'wvdb 'wvaq 'wvbq 'v dp kvrow)
-               (when qk? (list 'nn/rms-norm! 'q 'qln 'qn nq hd 'eps go))
-               (when qk? (if (and (= rms-style :fn) (= nkv 1))
+               (list 'qk/quant-act-q8k-padded-rows-gpu! 'h 'qinp 'qins 'qinb 'submax d dp nrows)
+               (list 'qk/qmatmul-q4k-dp4a-rows! 'qinp 'qins 'qinb 'wqp 'wqda 'wqdb 'wqaq 'wqbq 'q dp qd nrows)
+               (list 'qk/qmatmul-q4k-dp4a-rows! 'qinp 'qins 'qinb 'wkp 'wkda 'wkdb 'wkaq 'wkbq 'k dp kvrow nrows)
+               (list 'qk/qmatmul-q4k-dp4a-rows! 'qinp 'qins 'qinb 'wvp 'wvda 'wvdb 'wvaq 'wvbq 'v dp kvrow nrows)
+               (when qk? (list 'nn/rms-norm! 'q 'qln 'qn (* nrows nq) hd 'eps go))
+               (when qk? (if (and (= rms-style :fn) (= nrows 1) (= nkv 1))
                            (list 'nn/rms-norm-1row! 'k 'kln 'kn hd 'eps go)
-                           (list 'nn/rms-norm! 'k 'kln 'kn nkv hd 'eps go)))
-               (list 'attn/rope-pos-buf! (if qk? 'qn 'q) 'qr nq hd 'theta 'posbuf)
-               (list 'attn/rope-pos-buf! (if qk? 'kn 'k) 'kr nkv hd 'theta 'posbuf)
+                           (list 'nn/rms-norm! 'k 'kln 'kn (* nrows nkv) hd 'eps go)))
+               (list 'attn/rope-pos-rows-buf! (if qk? 'qn 'q) 'qr nrows nq hd 'theta 'positions)
+               (list 'attn/rope-pos-rows-buf! (if qk? 'kn 'k) 'kr nrows nkv hd 'theta 'positions)
                (list 'attn/kv-append-buf! 'kr 'kc kvrow 'posbuf)
                (list 'attn/kv-append-buf! 'v 'vc kvrow 'posbuf)
                ;; concrete-float layer → cast the Double `scale` to float at the call
                ;; boundary (gqa's scale is :- T; float×double would not lower to GPU C).
                (list 'attn/gqa-decode-attention-buf! 'qr 'kc 'vc 'at 'sc 'clenbuf nq group nkv hd 'maxpos (list 'float 'scale))
-               (list 'qk/quant-act-q8k-gpu! 'at 'qap 'qas 'qab 'submax nsb-qd)
-               (list 'qk/qmatmul-q4k-dp4a! 'qap 'qas 'qab 'wop 'woda 'wodb 'woaq 'wobq 'o qdp d)
+               (list 'qk/quant-act-q8k-padded-rows-gpu! 'at 'qap 'qas 'qab 'submax qd qdp nrows)
+               (list 'qk/qmatmul-q4k-dp4a-rows! 'qap 'qas 'qab 'wop 'woda 'wodb 'woaq 'wobq 'o qdp d nrows)
                (when sand? (rms1 'o 'paln 'o2))
-               (list 'nn/residual-add! 'r-in (if sand? 'o2 'o) 'xmid d)
+               (list 'nn/residual-add! 'r-in (if sand? 'o2 'o) 'xmid (* nrows d))
                (rms1 'xmid 'pfln 'f)
-               (list 'qk/quant-act-q8k-gpu! 'f 'qfp 'qfs 'qfb 'submax nsb-d)
-               (list 'qk/qmatmul-q4k-dp4a! 'qfp 'qfs 'qfb 'wgp 'wgda 'wgdb 'wgaq 'wgbq 'gate dp dff)
-               (list 'qk/qmatmul-q4k-dp4a! 'qfp 'qfs 'qfb 'wup 'wuda 'wudb 'wuaq 'wubq 'up dp dff)
-               (list act-mul 'gate 'up 'hh dff)
-               (list 'qk/quant-act-q8k-gpu! 'hh 'qhp 'qhs 'qhb 'submax nsb-dff)
-               (list 'qk/qmatmul-q4k-dp4a! 'qhp 'qhs 'qhb 'wdp 'wdda 'wddb 'wdaq 'wdbq 'down dffp d)
+               (list 'qk/quant-act-q8k-padded-rows-gpu! 'f 'qfp 'qfs 'qfb 'submax d dp nrows)
+               (list 'qk/qmatmul-q4k-dp4a-rows! 'qfp 'qfs 'qfb 'wgp 'wgda 'wgdb 'wgaq 'wgbq 'gate dp dff nrows)
+               (list 'qk/qmatmul-q4k-dp4a-rows! 'qfp 'qfs 'qfb 'wup 'wuda 'wudb 'wuaq 'wubq 'up dp dff nrows)
+               (list act-mul 'gate 'up 'hh (* nrows dff))
+               (list 'qk/quant-act-q8k-padded-rows-gpu! 'hh 'qhp 'qhs 'qhb 'submax dff dffp nrows)
+               (list 'qk/qmatmul-q4k-dp4a-rows! 'qhp 'qhs 'qhb 'wdp 'wdda 'wddb 'wdaq 'wdbq 'down dffp d nrows)
                (when sand? (rms1 'down 'pffln 'down2))
-               (list 'nn/residual-add! 'xmid (if sand? 'down2 'down) 'r-out d)
+               (list 'nn/residual-add! 'xmid (if sand? 'down2 'down) 'r-out (* nrows d))
                ;; inject the steering add at :resid-post (reuses residual-add!, a known-good
                ;; resident kernel — the tap is "inject a deftm, compile transparently").
                (when steer? (list 'nn/residual-add! 'r-out 'steer 'r-out d))])]
     (list 'raster.core/deftm nm params :- 'Void (cons 'do body))))
 
-(defn- head-form [m nm]
-  (let [{:keys [d dp nsb-d]} (dims-of m)
+(defn- head-form [m nm nrows]
+  (let [{:keys [d dp]} (dims-of m)
+        nrows (long nrows)
         go (double (get-in m [:desc :flags :norm :gain-offset] 0.0))
         vocab (long (:vocab m))]
     (list 'raster.core/deftm nm
@@ -210,9 +211,12 @@
                         'logits :- (af :f) 'submax :- (af :f) 'eps :- 'Double]))
           :- 'Void
           (list 'do
-                (list 'nn/rms-norm! 'r-fin 'finalln 'fh 1 d 'eps go)
-                (list 'qk/quant-act-q8k-gpu! 'fh 'hqp 'hqs 'hqb 'submax nsb-d)
-                (list 'qk/qmatmul-q4k-dp4a! 'hqp 'hqs 'hqb 'lmp 'lmda 'lmdb 'lmaq 'lmbq 'logits dp vocab)))))
+                (list 'nn/rms-norm! 'r-fin 'finalln 'fh nrows d 'eps go)
+                (list 'qk/quant-act-q8k-padded-rows-gpu!
+                      'fh 'hqp 'hqs 'hqb 'submax d dp nrows)
+                (list 'qk/qmatmul-q4k-dp4a-rows!
+                      'hqp 'hqs 'hqb 'lmp 'lmda 'lmdb 'lmaq 'lmbq
+                      'logits dp vocab nrows)))))
 
 (defn eval-gen! [nm form]
   (or (get @gen-cache nm)
@@ -223,18 +227,25 @@
 
 (defn gen-layer!
   "Get-or-create the descriptor-generated GPU layer deftm var for model m."
-  [m & {:keys [rms-style steer?] :or {rms-style :fn}}]
+  [m & {:keys [rms-style steer? nrows] :or {rms-style :fn nrows 1}}]
   (let [{:keys [d dff]} (dims-of m)
+        nrows (long nrows)
         nm (symbol (str "glayer-" (name (get-in m [:desc :arch])) "-" d "x" dff
-                        "-" (name rms-style) (when steer? "-steer") "!"))]
-    (eval-gen! nm (layer-form m nm rms-style (boolean steer?)))))
+                        "-" (name rms-style) "-b" nrows
+                        (when steer? "-steer") "!"))]
+    (eval-gen! nm (layer-form m nm rms-style (boolean steer?) nrows))))
 
 (defn gen-head!
-  "Get-or-create the descriptor-generated GPU head deftm var for model m."
-  [m]
+  "Get or create the descriptor-generated GPU head deftm for `m`.
+
+  `:nrows` is the compile-time number of dense residual rows projected through
+  the shared final norm and language-model head; it defaults to one."
+  [m & {:keys [nrows] :or {nrows 1}}]
   (let [{:keys [d]} (dims-of m)
-        nm (symbol (str "ghead-" (name (get-in m [:desc :arch])) "-" d "!"))]
-    (eval-gen! nm (head-form m nm))))
+        nrows (long nrows)
+        nm (symbol (str "ghead-" (name (get-in m [:desc :arch])) "-" d
+                        "-b" nrows "!"))]
+    (eval-gen! nm (head-form m nm nrows))))
 
 ;; ---------------------------------------------------------------------------
 ;; Resident multi-layer binding + decode loop
@@ -246,19 +257,27 @@
 (defn- scratch-dims
   "key -> [size dtype], derived from the model dims (was a static gemma-3-270m map;
   verified identical for 270m). :sc is sized in buffer-specs (needs maxpos)."
-  [m]
+  [m nrows]
   (let [{:keys [d dp dff dffp qd qdp kvrow nsb-d nsb-qd nsb-dff]} (dims-of m)
+        nrows (long nrows)
+        rows #(* nrows (long %))
         mx-nsb (max nsb-d nsb-qd nsb-dff)]
-    {:h [dp :float] :q [qd :float] :k [kvrow :float] :v [kvrow :float]
-     :qn [qd :float] :kn [kvrow :float] :qr [qd :float] :kr [kvrow :float]
-     :at [qdp :float] :o [d :float] :o2 [d :float] :xmid [d :float]
-     :f [dp :float] :gate [dff :float] :up [dff :float] :hh [dffp :float]
-     :down [d :float] :down2 [d :float] :fh [dp :float]
-     :qinp [(quot dp 4) :int] :qins [nsb-d :float] :qinb [(quot dp 32) :int]
-     :qap [(quot qdp 4) :int] :qas [nsb-qd :float] :qab [(quot qdp 32) :int]
-     :qfp [(quot dp 4) :int] :qfs [nsb-d :float] :qfb [(quot dp 32) :int]
-     :qhp [(quot dffp 4) :int] :qhs [nsb-dff :float] :qhb [(quot dffp 32) :int]
-     :submax [(* 8 mx-nsb) :float]}))
+    {:h [(rows d) :float] :q [(rows qd) :float] :k [(rows kvrow) :float]
+     :v [(rows kvrow) :float] :qn [(rows qd) :float] :kn [(rows kvrow) :float]
+     :qr [(rows qd) :float] :kr [(rows kvrow) :float] :at [(rows qd) :float]
+     :o [(rows d) :float] :o2 [(rows d) :float] :xmid [(rows d) :float]
+     :f [(rows d) :float] :gate [(rows dff) :float] :up [(rows dff) :float]
+     :hh [(rows dff) :float] :down [(rows d) :float] :down2 [(rows d) :float]
+     :fh [(rows d) :float]
+     :qinp [(rows (quot dp 4)) :int] :qins [(rows nsb-d) :float]
+     :qinb [(rows (quot dp 32)) :int]
+     :qap [(rows (quot qdp 4)) :int] :qas [(rows nsb-qd) :float]
+     :qab [(rows (quot qdp 32)) :int]
+     :qfp [(rows (quot dp 4)) :int] :qfs [(rows nsb-d) :float]
+     :qfb [(rows (quot dp 32)) :int]
+     :qhp [(rows (quot dffp 4)) :int] :qhs [(rows nsb-dff) :float]
+     :qhb [(rows (quot dffp 32)) :int]
+     :submax [(rows (* 8 mx-nsb)) :float]}))
 
 (def ^:private proj->role {"q" :attn-q "k" :attn-k "v" :attn-v "o" :attn-o
                            "g" :ffn-gate "u" :ffn-up "d" :ffn-down})
@@ -366,8 +385,9 @@
               allocation-ids)]
     (gpu-link/instantiate! plan {:session sess :external-buffers external-buffers})))
 
-(defn- scratch-specs [m]
-  (into {} (map (fn [[k [sz ty]]] [k [ty sz nil :scratch]]) (scratch-dims m))))
+(defn- scratch-specs [m nrows]
+  (into {} (map (fn [[k [sz ty]]] [k [ty sz nil :scratch]])
+                (scratch-dims m nrows))))
 
 (defn- weight-specs [m qw l]
   (into {} (mapcat (fn [[pl role]]
@@ -390,8 +410,9 @@
     {(keyword (str "kc" l)) [:float (* (long maxpos) kvrow) nil :state]
      (keyword (str "vc" l)) [:float (* (long maxpos) kvrow) nil :state]}))
 
-(defn- head-specs [m qw]
+(defn- head-specs [m qw nrows]
   (let [{:keys [wp da db aq bq]} (get qw (dec/role-name (:desc m) :embed nil))
+        nrows (long nrows)
         ^floats fln (:data (get (:weights m) (dec/role-name (:desc m) :final-norm nil)))]
     {:lmp  [:int   (alength ^ints wp)   wp :constant]
      :lmda [:float (alength ^floats da) da :constant]
@@ -399,20 +420,23 @@
      :lmaq [:byte  (alength ^bytes aq)  aq :constant]
      :lmbq [:byte  (alength ^bytes bq)  bq :constant]
      :finalln [:float (alength fln) fln :constant]
-     :logits  [:float (long (:vocab m)) nil :output]}))
+     :logits  [:float (* nrows (long (:vocab m))) nil :output]}))
 
-(defn- io-specs [m maxpos]
-  (merge {:r0 [:float (long (:d-model m)) nil :state]
-          :posbuf [:long 1 nil :input] :clenbuf [:long 1 nil :input]}
+(defn- io-specs [m nrows]
+  (let [nrows (long nrows)]
+    (merge {:r0 [:float (* nrows (long (:d-model m))) nil :state]
+          :posbuf [:long 1 nil :input] :positions [:int nrows nil :input]
+          :clenbuf [:long 1 nil :input]}
          (into {} (for [l (range 1 (inc (:n-layers m)))]
-                    [(keyword (str "r" l)) [:float (long (:d-model m)) nil :scratch]]))))
+                    [(keyword (str "r" l))
+                     [:float (* nrows (long (:d-model m))) nil :scratch]])))))
 
-(defn- buffer-specs [m qw maxpos cache-mode]
-  (apply merge (scratch-specs m)
+(defn- buffer-specs [m qw maxpos cache-mode nrows]
+  (apply merge (scratch-specs m nrows)
          (when (= :contiguous cache-mode)
            ;; attention score/prob scratch: n-q rows strided by maxpos
            {:sc [:float (* (long (:n-q m)) (long maxpos)) nil :scratch]})
-         (io-specs m maxpos) (head-specs m qw)
+         (io-specs m nrows) (head-specs m qw nrows)
          (concat (for [l (range (:n-layers m))] (weight-specs m qw l))
                  (for [l (range (:n-layers m))] (norm-specs m l))
                  (when (= :contiguous cache-mode)
@@ -613,7 +637,8 @@
                                   #(head-node-id (:n-layers m) %)
                                   {"eps" (:eps m)})
         tail (descriptor-instance :decode-tail tail-prog keyword
-                                  {"vocab" (long (:vocab m))
+                                  {"nrows" 1
+                                   "vocab" (long (:vocab m))
                                    "d" (long (:d-model m))})
         plan (external-plan :resident-decode device-id specs
                             (into layers [head tail])
@@ -622,7 +647,7 @@
     (instantiate-external-plan! sess plan)))
 
 (defn- paged-decode-executables!
-  [sess device-id specs m maxpos norm-names layer-partition head-prog tail-prog]
+  [sess device-id specs m maxpos nrows norm-names layer-partition head-prog tail-prog]
   (let [opened (atom [])
         open! (fn [plan]
                 (let [executable (instantiate-external-plan! sess plan)]
@@ -655,7 +680,8 @@
                                       #(head-node-id (:n-layers m) %)
                                       {"eps" (:eps m)})
             tail (descriptor-instance :decode-tail tail-prog keyword
-                                      {"vocab" (long (:vocab m))
+                                      {"nrows" (long nrows)
+                                       "vocab" (long (:vocab m))
                                        "d" (long (:d-model m))})
             final-residual (keyword (str "r" (:n-layers m)))
             head-tail-plan (external-plan :resident-decode-head-tail
@@ -668,10 +694,102 @@
           (try (gpu-link/close! executable) (catch Throwable _)))
         (throw error)))))
 
+(defn- layer-stack-executable!
+  [sess plan-id device-id specs layer-count descriptor node-id scalar-values outputs
+   role-overrides]
+  (let [instances
+        (mapv (fn [layer]
+                (descriptor-instance
+                 [plan-id layer]
+                 descriptor
+                 #(node-id layer %)
+                 (scalar-values layer)))
+              (range layer-count))
+        plan (external-plan plan-id device-id specs instances outputs role-overrides)]
+    (instantiate-external-plan! sess plan)))
+
+(defn- prefill-node-id
+  [norm-names layer parameter]
+  (let [parameter (name parameter)]
+    (cond
+      (= parameter "r-in") (keyword (str "pr" layer))
+      (= parameter "r-out") (keyword (str "pr" (inc layer)))
+      (= parameter "kr") (keyword (str "kc" layer))
+      (= parameter "v") (keyword (str "vc" layer))
+      (= parameter "k") :p_k
+      (norm-names parameter) (keyword (str "L" layer parameter))
+      (= \w (first parameter)) (keyword (str "PL" layer parameter))
+      (re-find #"__rbuf" parameter) (keyword (str "PL" layer "_" parameter))
+      :else (keyword (str "p_" parameter)))))
+
+(defn- decode-prefill-executable!
+  [sess device-id existing-specs m maxpos prefill-T norm-names]
+  (let [tokens (long prefill-T)
+        _ (when-not (<= tokens (long maxpos))
+            (throw (ex-info "prefill-T must fit in maxpos"
+                            {:prefill-T tokens :maxpos maxpos})))
+        {:keys [d kvrow]} (dims-of m)
+        descriptor (compile-resident-or-throw
+                    (gen-embed-layer! m tokens) device-id
+                    (str "decode prefill layer (T=" tokens ")"))
+        q8 (quantize-q8s m)
+        scratch-specs
+        (into {}
+              (map (fn [[key spec]]
+                     [(keyword (str "p_" (name key))) spec]))
+              (dissoc (embed-scratch-specs m tokens) :k :v))
+        residual-specs
+        (into {}
+              (for [layer (range (inc (:n-layers m)))]
+                [(keyword (str "pr" layer))
+                 [:float (* tokens (long d)) nil :scratch]]))
+        weight-specs
+        (into {}
+              (mapcat
+               (fn [layer]
+                 (mapcat
+                  (fn [[prefix role]]
+                    (let [{:keys [wp ws]}
+                          (get q8 (dec/role-name (:desc m) role layer))]
+                      [[(keyword (str "PL" layer "w" prefix "p"))
+                        [:int (alength ^ints wp) wp :constant]]
+                       [(keyword (str "PL" layer "w" prefix "s"))
+                        [:float (alength ^floats ws) ws :constant]]]))
+                  proj->role))
+               (range (:n-layers m))))
+        allocation-args
+        (scalar-args descriptor
+                     {"eps" (:eps m) "theta" (:rope-local m)
+                      "scale" (:attn-scale m)})
+        compiler-specs
+        (into {}
+              (for [layer (range (:n-layers m))
+                    {:keys [sym dtype size-fn]} (:allocs descriptor)]
+                [(keyword (str "PL" layer "_" (name sym)))
+                 [dtype (long (size-fn allocation-args)) nil :scratch]]))
+        new-specs (merge scratch-specs residual-specs weight-specs compiler-specs
+                         {:p_k [:float (* tokens (long kvrow)) nil :scratch]})
+        plan-specs (merge existing-specs new-specs)]
+    (gpu/alloc! sess
+                (into {}
+                      (map (fn [[key spec]] [key (vec (take 3 spec))]))
+                      new-specs))
+    (layer-stack-executable!
+     sess :resident-prefill device-id plan-specs (:n-layers m) descriptor
+     (fn [layer parameter]
+       (prefill-node-id norm-names layer parameter))
+     (fn [layer]
+       {"eps" (:eps m)
+        "theta" (layer-theta m layer)
+        "scale" (:attn-scale m)})
+     [(keyword (str "pr" (:n-layers m)))]
+     {:pr0 :input})))
+
 (defn bind-embed!
   "Compile + bind the PREFILL embed program: n-layers x generated embed layer over
   T-sized resident buffers. `:device-id` defaults to `:ze:0`; use an OpenCL
-  device such as `:ocl:0` for NVIDIA or AMD. Returns {:sess :model :T}."
+  device such as `:ocl:0` for NVIDIA or AMD. Returns a state containing the
+  session, model, T, and the linked resident executable."
   [m & {:keys [T qw device-id] :or {T 128 device-id :ze:0}}]
   (let [_ (gpu/backend-type device-id)
         eps (:eps m) scale (:attn-scale m)
@@ -703,26 +821,34 @@
                      (concat (for [l (range (:n-layers m))] (embed-weight-specs m qw l))
                              (for [l (range (:n-layers m))] (norm-specs m l))))
         alloc-specs (into {} (map (fn [[k v]] [k (vec (take 3 v))]) specs))
-        roles (into {} (map (fn [[k v]] [k (nth v 3 :scratch)]) specs))
         layer-args (scalar-args layer-prog {"eps" eps "theta" (:rope-global m) "scale" scale})
         prog-alloc-specs (into {}
                            (for [l (range (:n-layers m))
-                                 {:keys [sym size-fn]} (:allocs layer-prog)]
+                                 {:keys [sym dtype size-fn]} (:allocs layer-prog)]
                              [(keyword (str "L" l "_" (name sym)))
-                              [:float (long (size-fn layer-args)) nil]]))
-        sess (gpu/make-session device-id)
-        phases (atom [])]
-    (gpu/alloc! sess (merge alloc-specs prog-alloc-specs))
-    (swap! sess assoc :chain-roles roles)
-    (doseq [l (range (:n-layers m))]
-      (let [args (scalar-args layer-prog {"eps" eps "theta" (layer-theta m l) "scale" scale})]
-        (doseq [step (:steps layer-prog)]
-          (let [ph (keyword (str "L" l "_" (name (:phase step))))]
-            (gpu/bind-step! sess (assoc step :phase ph) args
-                            (fn [a] (layer-node-id norm-names l (name a))))
-            (swap! phases conj ph)))))
-    (gpu/record-graph! sess @phases :embed)
-    {:sess sess :model m :T T :device-id device-id}))
+                              [dtype (long (size-fn layer-args)) nil :scratch]]))
+        all-specs (merge specs prog-alloc-specs)
+        roles (into {} (map (fn [[k v]] [k (nth v 3 :scratch)]) all-specs))
+        sess (gpu/make-session device-id)]
+    (try
+      (gpu/alloc! sess (merge alloc-specs prog-alloc-specs))
+      (swap! sess assoc :chain-roles roles)
+      {:sess sess
+       :model m
+       :T T
+       :device-id device-id
+       :embed-executable
+       (layer-stack-executable!
+        sess :resident-embed device-id all-specs (:n-layers m) layer-prog
+        (fn [layer parameter]
+          (layer-node-id norm-names layer parameter))
+        (fn [layer]
+          {"eps" eps "theta" (layer-theta m layer) "scale" scale})
+        [(keyword (str "r" (:n-layers m)))]
+        {:r0 :input})}
+      (catch Throwable error
+        (try (gpu/close-session! sess) (catch Throwable _))
+        (throw error)))))
 
 (declare embed-pool-last embed-pool-mean)
 
@@ -731,7 +857,7 @@
   embeddings, replay, download the final residual, host-side final-norm + last-token
   pool + L2 normalize. Returns float[d-model]."
   ^floats [estate ids]
-  (let [{:keys [sess model T]} estate
+  (let [{:keys [sess model T embed-executable]} estate
         d (long (:d-model model))
         T (long T)
         ids (vec (take T ids))
@@ -740,7 +866,9 @@
     (dotimes [i n]
       (System/arraycopy ^floats (embed-row model (nth ids i)) 0 r0 (* i d) d))
     (gpu/upload! sess :r0 r0)
-    (gpu/replay! sess :embed)
+    (if embed-executable
+      (gpu-link/run! embed-executable)
+      (throw (ex-info "Embed state has no resident LinkPlan executable" {})))
     (if (= :mean (get-in model [:desc :flags :pooling]))
       (embed-pool-mean model (gpu/download sess (keyword (str "r" (:n-layers model)))) n)
       (embed-pool-last model (gpu/download sess (keyword (str "r" (:n-layers model)))) n))))
@@ -800,11 +928,20 @@
   prepares only the stages around attention and omits contiguous K/V and score
   buffers; attach it with `pretrained.continuation.paged-decoder/open!`.
   Returns a decode state."
-  [m & {:keys [maxpos layer-var head-var qw rms-style prefill-T steer device-id cache-mode]
-        :or {maxpos 64 rms-style :map-void device-id :ze:0 cache-mode :contiguous}}]
+  [m & {:keys [maxpos layer-var head-var qw rms-style prefill-T steer device-id cache-mode
+               batch-size]
+        :or {maxpos 64 rms-style :map-void device-id :ze:0 cache-mode :contiguous
+             batch-size 1}}]
   (let [_ (gpu/backend-type device-id)
+        batch-size (long batch-size)
+        _ (when-not (pos? batch-size)
+            (throw (ex-info "Decode batch size must be positive"
+                            {:batch-size batch-size})))
         _ (when-not (contains? #{:contiguous :paged} cache-mode)
             (throw (ex-info "Unknown decoder cache mode" {:cache-mode cache-mode})))
+        _ (when (and (= :contiguous cache-mode) (not= batch-size 1))
+            (throw (ex-info "Contiguous decode supports only one sequence"
+                            {:cache-mode cache-mode :batch-size batch-size})))
         _ (when (and (= :paged cache-mode) prefill-T)
             (throw (ex-info "Paged decode does not yet support the contiguous prefill graph"
                             {:cache-mode cache-mode :prefill-T prefill-T})))
@@ -814,9 +951,13 @@
         ;; layer (an injected residual-add!) and allocate a per-layer L{l}steer :constant buffer,
         ;; zero except at target layers. Absent → identical program (no injected kernel).
         steer? (boolean (seq steer))
+        _ (when (and steer? (not= batch-size 1))
+            (throw (ex-info "Batched steering requires an explicit broadcast policy"
+                            {:batch-size batch-size})))
         d (long (:d-model m))
-        layer-var (or layer-var (gen-layer! m :rms-style rms-style :steer? steer?))
-        head-var  (or head-var (gen-head! m))
+        layer-var (or layer-var (gen-layer! m :rms-style rms-style :steer? steer?
+                                           :nrows batch-size))
+        head-var  (or head-var (gen-head! m :nrows batch-size))
         norm-names (set (keys (norm-roles m)))
         fn-hint (when (= rms-style :fn) "(rms-style :fn is incomplete; use :map-void)")
         layer-prog (compile-resident-or-throw layer-var device-id
@@ -824,36 +965,38 @@
         head-prog  (compile-resident-or-throw head-var device-id "head")
         tail-prog  (compile-resident-or-throw #'decode-tail! device-id "decode-tail!")
         layer-partition (layer-step-partition layer-prog)
-        tail-args  (scalar-args tail-prog {"vocab" (long (:vocab m)) "d" (long (:d-model m))})
+        tail-args  (scalar-args tail-prog {"nrows" batch-size
+                                           "vocab" (long (:vocab m))
+                                           "d" (long (:d-model m))})
         qw (or qw (gpu-quantize m))
         steer-specs (when steer?
                       (into {} (for [l (range (:n-layers m))]
                                  [(keyword (str "L" l "steer"))
                                   [:float d (or (get steer l) (float-array d)) :constant]])))
-        specs (merge (buffer-specs m qw maxpos cache-mode)
+        specs (merge (buffer-specs m qw maxpos cache-mode batch-size)
                      steer-specs
                      {:emb    [:float (* (long (:vocab m)) (long (:d-model m)))
                                (prescaled-embed m) :constant]
-                      :tokbuf [:int 1 nil :output]})
-        ;; A program's :allocs are compiler-introduced scratch — Stage A's reduce-result ss__rbuf
-        ;; 1-elem buffers. These must be PER-LAYER (matching layer-node-id's L{l}_… identity for
-        ;; __rbuf), not shared, to avoid cross-layer write-after-read hazards. Size-fns are
-        ;; constant, so any layer's scalar arguments suffice.
+                      :tokbuf [:int batch-size nil :output]})
+        ;; A program's :allocs are typed compiler-introduced scratch. They must be PER-LAYER
+        ;; (matching layer-node-id's L{l}_… identity), not shared, to avoid cross-layer
+        ;; write-after-read hazards. Size-fns are constant, so any layer's scalar arguments
+        ;; suffice. Argmax adds both float values and int indices here.
         layer-alloc-args (scalar-args layer-prog {"eps" eps "theta" (:rope-local m) "scale" scale
                                                   "maxpos" (long maxpos)})
         prog-alloc-specs (into {}
                            (concat
                             (for [l (range (:n-layers m))
-                                  {:keys [sym size-fn]} (:allocs layer-prog)]
+                                  {:keys [sym dtype size-fn]} (:allocs layer-prog)]
                               [(keyword (str "L" l "_" (name sym)))
-                               [:float (long (size-fn layer-alloc-args)) nil :scratch]])
-                            (for [{:keys [sym size-fn]} (:allocs head-prog)]
+                               [dtype (long (size-fn layer-alloc-args)) nil :scratch]])
+                            (for [{:keys [sym dtype size-fn]} (:allocs head-prog)]
                               [(keyword (name sym))
-                               [:float (long (size-fn (scalar-args head-prog {"eps" eps})))
+                               [dtype (long (size-fn (scalar-args head-prog {"eps" eps})))
                                 nil :scratch]])
-                            (for [{:keys [sym size-fn]} (:allocs tail-prog)]
+                            (for [{:keys [sym dtype size-fn]} (:allocs tail-prog)]
                               [(keyword (name sym))
-                               [:float (long (size-fn tail-args)) nil :scratch]])))
+                               [dtype (long (size-fn tail-args)) nil :scratch]])))
         all-specs (merge specs prog-alloc-specs)
         alloc-specs (into {} (map (fn [[k v]] [k (vec (take 3 v))]) all-specs))
         roles (into {} (map (fn [[k v]] [k (nth v 3 :scratch)]) all-specs))
@@ -867,70 +1010,17 @@
                (contiguous-decode-executable! sess device-id all-specs m maxpos norm-names
                                               layer-prog head-prog tail-prog)}
               {:stage-executables
-               (paged-decode-executables! sess device-id all-specs m maxpos norm-names
-                                          layer-partition head-prog tail-prog)})]
-    ;; ---- optional batched PREFILL graph (phase 2a) ----
-    ;; The embed-layer program at block size prefill-T, bound into the SAME
-    ;; session with its roped-keys/values args pointing DIRECTLY at the decode
-    ;; KV caches: kr/v are [T,kvrow] row-major = exactly the first T rows of
-    ;; kc{l}/vc{l} — the prefill GEMM+rope write the cache in place, zero-copy.
-    ;; Causal attention within the block (the qwen3 embed program is causal),
-    ;; positions 0..T-1 = absolute prompt positions. Pad rows beyond the real
-    ;; prompt are harmless: causal masking keeps real rows clean, and the
-    ;; rollout overwrites pad KV rows position by position as it generates.
-    ;; Q8 weights (the prefill kernels are i8-gemm), norms shared with decode.
-    (when prefill-T
-      (let [Tp (long prefill-T)
-            _ (assert (<= Tp (long maxpos)) "prefill-T must fit in maxpos")
-            {:keys [d dff qd kvrow]} (dims-of m)
-            pvar (gen-embed-layer! m Tp)
-            pprog (pipeline/compile-gpu-program pvar device-id :dtype :float)
-            q8 (quantize-q8s m)
-            pscratch (into {} (map (fn [[k v]] [(keyword (str "p_" (name k))) v])
-                                   (dissoc (embed-scratch-specs m Tp) :k :v)))
-            ;; k (pre-rope) stays scratch; kr + v go to the caches
-            presid (into {} (for [l (range (inc (:n-layers m)))]
-                              [(keyword (str "pr" l)) [:float (* Tp (long d)) nil]]))
-            pweights (into {}
-                       (mapcat (fn [l]
-                                 (mapcat (fn [[pl role]]
-                                           (let [{:keys [wp ws]} (get q8 (dec/role-name (:desc m) role l))]
-                                             [[(keyword (str "PL" l "w" pl "p")) [:int (alength ^ints wp) wp]]
-                                              [(keyword (str "PL" l "w" pl "s")) [:float (alength ^floats ws) ws]]]))
-                                         proj->role))
-                               (range (:n-layers m))))
-            pargs (scalar-args pprog {"eps" (:eps m) "theta" (:rope-local m)
-                                      "scale" (:attn-scale m)})
-            pallocs (into {}
-                      (for [l (range (:n-layers m))
-                            {:keys [sym size-fn]} (:allocs pprog)]
-                        [(keyword (str "PL" l "_" (name sym))) [:float (long (size-fn pargs)) nil]]))
-            ppbk (fn [l]
-                   (fn [a]
-                     (let [pn (name a)]
-                       (cond (= pn "r-in")  (keyword (str "pr" l))
-                             (= pn "r-out") (keyword (str "pr" (inc l)))
-                             (= pn "kr")    (keyword (str "kc" l))   ; ← the cache
-                             (= pn "v")     (keyword (str "vc" l))   ; ← the cache
-                             (= pn "k")     :p_k                     ; pre-rope scratch
-                             (norm-names pn) (keyword (str "L" l pn)) ; SHARED with decode
-                             (= \w (first pn)) (keyword (str "PL" l pn))
-                             (re-find #"__rbuf" pn) (keyword (str "PL" l "_" pn))
-                             :else (keyword (str "p_" pn))))))
-            pphases (atom [])]
-        (gpu/alloc! sess (merge pscratch presid pweights pallocs
-                                {:p_k [:float (* Tp (long kvrow)) nil]}))
-        (doseq [l (range (:n-layers m))]
-          (let [args (scalar-args pprog {"eps" (:eps m) "theta" (layer-theta m l)
-                                         "scale" (:attn-scale m)})]
-            (doseq [step (:steps pprog)]
-              (let [ph (keyword (str "PL" l "_" (name (:phase step))))]
-                (gpu/bind-step! sess (assoc step :phase ph) args (ppbk l))
-                (swap! pphases conj ph)))))
-        (gpu/record-graph! sess @pphases :prefill)))
-      (merge {:sess sess :model m :maxpos maxpos :prefill-T prefill-T
-              :cache-mode cache-mode :device-id device-id}
-             execution))
+               (paged-decode-executables! sess device-id all-specs m maxpos batch-size norm-names
+                                          layer-partition head-prog tail-prog)})
+            prefill-execution
+            (when prefill-T
+              {:prefill-executable
+               (decode-prefill-executable! sess device-id all-specs m maxpos prefill-T
+                                            norm-names)})]
+        (merge {:sess sess :model m :maxpos maxpos :prefill-T prefill-T
+                :batch-size batch-size
+                :cache-mode cache-mode :device-id device-id}
+               execution prefill-execution))
       (catch Throwable error
         (try (gpu/close-session! sess) (catch Throwable _))
         (throw error)))))
@@ -938,15 +1028,17 @@
 (defn prefill-rows!
   "Batched prompt prefill: upload the [T,d] input rows (token embeddings with
   any multimodal rows already spliced; zero-pad past the real prompt) and
-  replay the :prefill graph — one pass over all layers fills the decode KV
+  run the linked prefill program. One pass over all layers fills the decode KV
   caches for positions 0..T-1. Requires bind-decode! with :prefill-T."
   [dstate ^floats rows]
-  (let [{:keys [sess prefill-T model]} dstate]
+  (let [{:keys [sess prefill-T model prefill-executable]} dstate]
     (when-not prefill-T
       (throw (ex-info "dstate was bound without :prefill-T" {})))
     (assert (= (alength rows) (* (long prefill-T) (long (:d-model model)))))
     (gpu/upload! sess :pr0 rows)
-    (gpu/replay! sess :prefill)))
+    (if prefill-executable
+      (gpu-link/run! prefill-executable)
+      (throw (ex-info "Decode state has no resident prefill LinkPlan executable" {})))))
 
 (defn- run-contiguous-decode!
   [dstate]
@@ -963,6 +1055,7 @@
   ^floats [dstate ^floats row pos]
   (let [{:keys [sess]} dstate]
     (gpu/upload! sess :posbuf (long-array [pos]))
+    (gpu/upload! sess :positions (int-array [(int pos)]))
     (gpu/upload! sess :clenbuf (long-array [(inc pos)]))
     (gpu/upload! sess :r0 row)
     (run-contiguous-decode! dstate)
@@ -1024,6 +1117,26 @@
   (gpu/upload! (:sess dstate) :r0 (embed-row (:model dstate) token))
   dstate)
 
+(defn prime-resident-tokens!
+  "Put one token embedding per decode lane into the resident input rows.
+
+  The number of tokens must equal the decode state's fixed `:batch-size`.
+  This establishes the input boundary for paged batch execution without
+  changing any continuation route. Returns `dstate`."
+  [dstate tokens]
+  (let [tokens (vec tokens)
+        batch-size (long (:batch-size dstate 1))
+        d (long (get-in dstate [:model :d-model]))]
+    (when-not (= batch-size (count tokens))
+      (throw (ex-info "Resident token batch does not match the bound decoder"
+                      {:expected batch-size :actual (count tokens)})))
+    (let [rows (float-array (* batch-size d))]
+      (doseq [[lane token] (map-indexed vector tokens)]
+        (System/arraycopy ^floats (embed-row (:model dstate) token) 0
+                          rows (* (long lane) d) d))
+      (gpu/upload! (:sess dstate) :r0 rows))
+    dstate))
+
 (defn resident-step!
   "Process the token currently resident in `r0` at absolute `pos`.
 
@@ -1035,13 +1148,14 @@
       (throw (ex-info "Resident decode reached its maximum position"
                       {:position pos :max-position maxpos})))
     (gpu/upload! sess :posbuf (long-array [pos]))
+    (gpu/upload! sess :positions (int-array [(int pos)]))
     (gpu/upload! sess :clenbuf (long-array [(inc (long pos))]))
     (run-contiguous-decode! dstate)
     (long (aget ^ints (gpu/download sess :tokbuf) 0))))
 
 (defn generate-resident
   "Greedy autoregressive rollout fully on-device: after priming the prompt, each step uploads
-  only the 16-byte position, replays the graph (layers + head + argmax/embed-gather tail), and
+  only position metadata, replays the graph (layers + head + argmax/embed-gather tail), and
   downloads the 4-byte token id — the tail writes the next r0 on-device, so no logits download
   and no embedding upload. Rolls out up to `max-new` tokens, stopping early when the generated
   id is in `eos-ids` (the stop token is included in the result) or when the KV cache (maxpos)
@@ -1054,6 +1168,7 @@
     (loop [p p0 out []]
       (if (and (< (count out) max-new) (< p (long maxpos)))
         (do (gpu/upload! sess :posbuf (long-array [p]))
+            (gpu/upload! sess :positions (int-array [(int p)]))
             (gpu/upload! sess :clenbuf (long-array [(inc p)]))
             (run-contiguous-decode! dstate)
             (let [t (aget ^ints (gpu/download sess :tokbuf) 0)

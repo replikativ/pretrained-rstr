@@ -381,6 +381,51 @@
         (d/delete-database config)
         (delete-directory! directory)))))
 
+(deftest async-paged-checkpoint-uses-the-same-durable-prefix-chain
+  (let [directory (Files/createTempDirectory "pretrained-kv-async-pages-"
+                                              (make-array java.nio.file.attribute.FileAttribute 0))
+        config {:store {:backend :memory :id (random-uuid)}
+                :schema-flexibility :write :keep-history? false :value-caps :default}
+        model {:n-layers 1 :n-kv 1 :head-dim 2}
+        pool (page-pool/->DevicePagePool
+              ::session (attention-state/layout model) 2 4 :half
+              {[:key 0] :k0, [:value 0] :v0}
+              (atom {:free (sorted-set 2 3)
+                     :refcounts {0 1, 1 1}
+                     :leases {}
+                     :routes {:request {:continuation-id :request
+                                        :pages [0 1]
+                                        :token-count 4
+                                        :start-position 0}}}))
+        captured (atom [])
+        cache (manager/open-manager config directory {:chunk-size 2})]
+    (try
+      (with-redefs [page-pool/export-chunk
+                    (fn [_ continuation-id model-fingerprint descriptor]
+                      (swap! captured conj [continuation-id descriptor])
+                      (merge descriptor
+                             {:chunk/version 2
+                              :chunk/model-fingerprint model-fingerprint
+                              :chunk/layout (continuation/model-layout model)
+                              :chunk/elements-per-slab 4
+                              :chunk/payload (float-array 8)}))]
+        (let [ticket (manager/checkpoint-paged-chunks-async!
+                      cache pool :request "fixture-paged-v1" [1 2 3 4 5])
+              stored (.get ^java.util.concurrent.CompletableFuture (:captured ticket)
+                           5 TimeUnit/SECONDS)
+              published (.get ^java.util.concurrent.CompletableFuture (:published ticket)
+                              5 TimeUnit/SECONDS)
+              lookup (manager/lookup-chunk-prefix
+                      cache "fixture-paged-v1" [1 2 3 4 5])]
+          (is (:accepted? ticket))
+          (is (= 2 (count stored) (count published) (count @captured)))
+          (is (= [0 2] (mapv (comp :chunk/start second) @captured)))
+          (is (= 4 (:cached-token-count lookup)))))
+      (finally
+        (.close cache)
+        (d/delete-database config)
+        (delete-directory! directory)))))
+
 (deftest write-behind-chunks-publish-only-after-backend-durability
   (let [directory (Files/createTempDirectory "pretrained-kv-write-behind-"
                                              (make-array java.nio.file.attribute.FileAttribute 0))

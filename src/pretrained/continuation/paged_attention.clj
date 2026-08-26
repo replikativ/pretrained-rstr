@@ -76,14 +76,16 @@
   `:q-heads`, `:kv-heads`, `:qk-head-dim`, `:value-head-dim`, and
   `:pages-per-sequence`. `:scale` defaults to `1/sqrt(qk-head-dim)`.
   `:query-dtype` and `:output-dtype` accept `:half` (the default) or `:float`.
-  Optional `:query-view` and `:output-view` bind caller-owned Raster resident
-  views of those dtypes instead of allocating private tensor buffers.
+  Optional `:query-view`, `:query-positions-view`, and `:output-view` bind
+  caller-owned Raster resident views instead of allocating private buffers.
+  Sharing the positions view lets buffered RoPE and routed attention consume
+  one uploaded absolute-position vector.
 
   Returns the semantic problem, verified graph, logical buffer identities and
   concrete allocation specs used by `open-runner!`."
   [pool {:keys [id layer batch-size total-query-tokens q-heads kv-heads
                 qk-head-dim value-head-dim pages-per-sequence scale key-prefix
-                query-view output-view query-dtype output-dtype]
+                query-view query-positions-view output-view query-dtype output-dtype]
          :as opts}]
   (when-not (page-pool/page-pool? pool)
     (throw (ex-info "Paged attention requires a DevicePagePool" {:pool pool})))
@@ -108,10 +110,15 @@
                   [:query :query-row-offsets :query-positions
                    :key-pages :value-pages :page-table :lengths
                    :start-positions :output])
-        keys (into {}
-                   (map (fn [role] [role (scoped-key prefix role)]))
-                   [:query :query-row-offsets :query-positions
-                    :page-table :lengths :start-positions :output])
+        private-keys (into {}
+                           (map (fn [role] [role (scoped-key prefix role)]))
+                           [:query :query-row-offsets :query-positions
+                            :page-table :lengths :start-positions :output])
+        keys (cond-> private-keys
+               query-positions-view
+               (assoc :query-positions
+                      (or (:key query-positions-view)
+                          (:query-positions private-keys))))
         query (attention/packed-query-batch
                {:values (:query ids)
                 :row-offsets (:query-row-offsets ids)
@@ -148,13 +155,12 @@
         routed (attention-route/route! problem)
         specs (attention/buffer-specs problem)
         _ (checked-resident-view :query query-view)
+        _ (checked-resident-view :query-positions query-positions-view)
         _ (checked-resident-view :output output-view)
         allocations
         (cond->
          {(:query-row-offsets keys)
           [:int (get-in specs [(:query-row-offsets ids) :elements]) nil :input]
-          (:query-positions keys)
-          [:int (get-in specs [(:query-positions ids) :elements]) nil :input]
           (:page-table keys) [:int (get-in specs [(:page-table ids) :elements]) nil :input]
           (:lengths keys) [:int (get-in specs [(:lengths ids) :elements]) nil :input]
           (:start-positions keys)
@@ -162,12 +168,16 @@
           (nil? query-view)
           (assoc (:query keys)
                  [query-dtype (get-in specs [(:query ids) :elements]) nil :input])
+          (nil? query-positions-view)
+          (assoc (:query-positions keys)
+                 [:int (get-in specs [(:query-positions ids) :elements]) nil :input])
           (nil? output-view)
           (assoc (:output keys)
                  [output-dtype (get-in specs [(:output ids) :elements]) nil :output]))
         bindings {(:query ids) (or query-view (:query keys))
                   (:query-row-offsets ids) (:query-row-offsets keys)
-                  (:query-positions ids) (:query-positions keys)
+                  (:query-positions ids) (or query-positions-view
+                                             (:query-positions keys))
                   (:key-pages ids) (get (page-pool/buffer-keys pool) [:key layer])
                   (:value-pages ids) (get (page-pool/buffer-keys pool) [:value layer])
                   (:page-table ids) (:page-table keys)

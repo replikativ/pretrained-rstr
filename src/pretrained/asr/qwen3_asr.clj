@@ -577,7 +577,7 @@
   replay — token positions feed embedding rows, <|audio_pad|> positions feed the
   AuT projector rows (the multimodal seam is just decode-row!) — then the
   autoregressive rollout runs fully on-device (argmax + next-embed in the graph
-  tail; per-token host traffic = 16-byte position up, 4-byte token id down).
+  tail; per-token host traffic is position metadata up and a 4-byte token id down).
   opts: :language, :context (as transcribe), :dstate (reuse a bind-gpu result),
   :max-new (default 512)."
   ([m wav] (transcribe-gpu m wav {}))
@@ -630,13 +630,10 @@
                  []
                  (loop [p P out [t0]]
                    (if (and (< (count out) (long max-new)) (< p maxpos))
-                     (do (gpu/upload! sess :posbuf (long-array [p]))
-                         (gpu/upload! sess :clenbuf (long-array [(inc p)]))
-                         (gpu/replay! sess :decode)
-                         (let [t (aget ^ints (gpu/download sess :tokbuf) 0)]
-                           (if (or (= t IM-END) (= t EOT))
-                             out
-                             (recur (inc p) (conj out t)))))
+                     (let [t (dgpu/resident-step! dstate p)]
+                       (if (or (= t IM-END) (= t EOT))
+                         out
+                         (recur (inc p) (conj out t))))
                      out)))
            {:keys [tok decode]} (:tokenizer m)]
        (strip-asr-text (decode tok out))))))

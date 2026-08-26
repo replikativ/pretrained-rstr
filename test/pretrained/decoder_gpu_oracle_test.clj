@@ -50,32 +50,33 @@
    gate :- (Array float) up :- (Array float) hh :- (Array float)
    qhp :- (Array int) qhs :- (Array float) qhb :- (Array int)
    down :- (Array float) down2 :- (Array float) r-out :- (Array float)
-   posbuf :- (Array long) clenbuf :- (Array long) submax :- (Array float)
+   posbuf :- (Array long) positions :- (Array int)
+   clenbuf :- (Array long) submax :- (Array float)
    maxpos :- Long eps :- Double theta :- Double scale :- Double] :- Void
   (do
     (nn/rms-norm! r-in inln h 1 640 eps 1.0)
-    (qk/quant-act-q8k-gpu! h qinp qins qinb submax 3)
-    (qk/qmatmul-q4k-dp4a! qinp qins qinb wqp wqda wqdb wqaq wqbq q 768 1024)
-    (qk/qmatmul-q4k-dp4a! qinp qins qinb wkp wkda wkdb wkaq wkbq k 768 256)
-    (qk/qmatmul-q4k-dp4a! qinp qins qinb wvp wvda wvdb wvaq wvbq v 768 256)
+    (qk/quant-act-q8k-padded-rows-gpu! h qinp qins qinb submax 640 768 1)
+    (qk/qmatmul-q4k-dp4a-rows! qinp qins qinb wqp wqda wqdb wqaq wqbq q 768 1024 1)
+    (qk/qmatmul-q4k-dp4a-rows! qinp qins qinb wkp wkda wkdb wkaq wkbq k 768 256 1)
+    (qk/qmatmul-q4k-dp4a-rows! qinp qins qinb wvp wvda wvdb wvaq wvbq v 768 256 1)
     (nn/rms-norm! q qln qn 4 256 eps 1.0)
     (nn/rms-norm! k kln kn 1 256 eps 1.0)
-    (attn/rope-pos-buf! qn qr 4 256 theta posbuf)
-    (attn/rope-pos-buf! kn kr 1 256 theta posbuf)
+    (attn/rope-pos-rows-buf! qn qr 1 4 256 theta positions)
+    (attn/rope-pos-rows-buf! kn kr 1 1 256 theta positions)
     (attn/kv-append-buf! kr kc 256 posbuf)
     (attn/kv-append-buf! v vc 256 posbuf)
     (attn/gqa-decode-attention-buf! qr kc vc at sc clenbuf 4 4 1 256 maxpos (float scale))
-    (qk/quant-act-q8k-gpu! at qap qas qab submax 4)
-    (qk/qmatmul-q4k-dp4a! qap qas qab wop woda wodb woaq wobq o 1024 640)
+    (qk/quant-act-q8k-padded-rows-gpu! at qap qas qab submax 1024 1024 1)
+    (qk/qmatmul-q4k-dp4a-rows! qap qas qab wop woda wodb woaq wobq o 1024 640 1)
     (nn/rms-norm! o paln o2 1 640 eps 1.0)
     (nn/residual-add! r-in o2 xmid 640)
     (nn/rms-norm! xmid pfln f 1 640 eps 1.0)
-    (qk/quant-act-q8k-gpu! f qfp qfs qfb submax 3)
-    (qk/qmatmul-q4k-dp4a! qfp qfs qfb wgp wgda wgdb wgaq wgbq gate 768 2048)
-    (qk/qmatmul-q4k-dp4a! qfp qfs qfb wup wuda wudb wuaq wubq up 768 2048)
+    (qk/quant-act-q8k-padded-rows-gpu! f qfp qfs qfb submax 640 768 1)
+    (qk/qmatmul-q4k-dp4a-rows! qfp qfs qfb wgp wgda wgdb wgaq wgbq gate 768 2048 1)
+    (qk/qmatmul-q4k-dp4a-rows! qfp qfs qfb wup wuda wudb wuaq wubq up 768 2048 1)
     (nn/gelu-mul! gate up hh 2048)
-    (qk/quant-act-q8k-gpu! hh qhp qhs qhb submax 8)
-    (qk/qmatmul-q4k-dp4a! qhp qhs qhb wdp wdda wddb wdaq wdbq down 2048 640)
+    (qk/quant-act-q8k-padded-rows-gpu! hh qhp qhs qhb submax 2048 2048 1)
+    (qk/qmatmul-q4k-dp4a-rows! qhp qhs qhb wdp wdda wddb wdaq wdbq down 2048 640 1)
     (nn/rms-norm! down pffln down2 1 640 eps 1.0)
     (nn/residual-add! xmid down2 r-out 640)))
 
@@ -101,32 +102,33 @@
    gate :- (Array float) up :- (Array float) hh :- (Array float)
    qhp :- (Array int) qhs :- (Array float) qhb :- (Array int)
    down :- (Array float) down2 :- (Array float) r-out :- (Array float)
-   posbuf :- (Array long) clenbuf :- (Array long) submax :- (Array float)
+   posbuf :- (Array long) positions :- (Array int)
+   clenbuf :- (Array long) submax :- (Array float)
    maxpos :- Long eps :- Double theta :- Double scale :- Double] :- Void
   (do
     (nn/rms-norm-1row! r-in inln h 640 eps 1.0)
-    (qk/quant-act-q8k-gpu! h qinp qins qinb submax 3)
-    (qk/qmatmul-q4k-dp4a! qinp qins qinb wqp wqda wqdb wqaq wqbq q 768 1024)
-    (qk/qmatmul-q4k-dp4a! qinp qins qinb wkp wkda wkdb wkaq wkbq k 768 256)
-    (qk/qmatmul-q4k-dp4a! qinp qins qinb wvp wvda wvdb wvaq wvbq v 768 256)
+    (qk/quant-act-q8k-padded-rows-gpu! h qinp qins qinb submax 640 768 1)
+    (qk/qmatmul-q4k-dp4a-rows! qinp qins qinb wqp wqda wqdb wqaq wqbq q 768 1024 1)
+    (qk/qmatmul-q4k-dp4a-rows! qinp qins qinb wkp wkda wkdb wkaq wkbq k 768 256 1)
+    (qk/qmatmul-q4k-dp4a-rows! qinp qins qinb wvp wvda wvdb wvaq wvbq v 768 256 1)
     (nn/rms-norm! q qln qn 4 256 eps 1.0)
     (nn/rms-norm-1row! k kln kn 256 eps 1.0)
-    (attn/rope-pos-buf! qn qr 4 256 theta posbuf)
-    (attn/rope-pos-buf! kn kr 1 256 theta posbuf)
+    (attn/rope-pos-rows-buf! qn qr 1 4 256 theta positions)
+    (attn/rope-pos-rows-buf! kn kr 1 1 256 theta positions)
     (attn/kv-append-buf! kr kc 256 posbuf)
     (attn/kv-append-buf! v vc 256 posbuf)
     (attn/gqa-decode-attention-buf! qr kc vc at sc clenbuf 4 4 1 256 maxpos (float scale))
-    (qk/quant-act-q8k-gpu! at qap qas qab submax 4)
-    (qk/qmatmul-q4k-dp4a! qap qas qab wop woda wodb woaq wobq o 1024 640)
+    (qk/quant-act-q8k-padded-rows-gpu! at qap qas qab submax 1024 1024 1)
+    (qk/qmatmul-q4k-dp4a-rows! qap qas qab wop woda wodb woaq wobq o 1024 640 1)
     (nn/rms-norm-1row! o paln o2 640 eps 1.0)
     (nn/residual-add! r-in o2 xmid 640)
     (nn/rms-norm-1row! xmid pfln f 640 eps 1.0)
-    (qk/quant-act-q8k-gpu! f qfp qfs qfb submax 3)
-    (qk/qmatmul-q4k-dp4a! qfp qfs qfb wgp wgda wgdb wgaq wgbq gate 768 2048)
-    (qk/qmatmul-q4k-dp4a! qfp qfs qfb wup wuda wudb wuaq wubq up 768 2048)
+    (qk/quant-act-q8k-padded-rows-gpu! f qfp qfs qfb submax 640 768 1)
+    (qk/qmatmul-q4k-dp4a-rows! qfp qfs qfb wgp wgda wgdb wgaq wgbq gate 768 2048 1)
+    (qk/qmatmul-q4k-dp4a-rows! qfp qfs qfb wup wuda wudb wuaq wubq up 768 2048 1)
     (nn/gelu-mul! gate up hh 2048)
-    (qk/quant-act-q8k-gpu! hh qhp qhs qhb submax 8)
-    (qk/qmatmul-q4k-dp4a! qhp qhs qhb wdp wdda wddb wdaq wdbq down 2048 640)
+    (qk/quant-act-q8k-padded-rows-gpu! hh qhp qhs qhb submax 2048 2048 1)
+    (qk/qmatmul-q4k-dp4a-rows! qhp qhs qhb wdp wdda wddb wdaq wdbq down 2048 640 1)
     (nn/rms-norm-1row! down pffln down2 640 eps 1.0)
     (nn/residual-add! xmid down2 r-out 640)))
 
@@ -137,8 +139,8 @@
    logits :- (Array float) eps :- Double] :- Void
   (do
     (nn/rms-norm! r-fin finalln fh 1 640 eps 1.0)
-    (qk/quant-act-q8k-gpu! fh hqp hqs hqb submax 3)
-    (qk/qmatmul-q4k-dp4a! hqp hqs hqb lmp lmda lmdb lmaq lmbq logits 768 262144)))
+    (qk/quant-act-q8k-padded-rows-gpu! fh hqp hqs hqb submax 640 768 1)
+    (qk/qmatmul-q4k-dp4a-rows! hqp hqs hqb lmp lmda lmdb lmaq lmbq logits 768 262144 1)))
 
 ;; ---------------------------------------------------------------------------
 ;; Seeded buffer construction (per-name deterministic; two builds are identical)
@@ -164,6 +166,7 @@
     ;; scratch: zeroed (overwritten by the programs)
     :zf  (float-array n)
     :zi  (int-array n)
+    :iv  (int-array [(int n)])
     :lv  (long-array [(long n)])
     :s   n))
 
@@ -185,16 +188,17 @@
     ["paln" [:nw 640]] ["pfln" [:nw 640]] ["pffln" [:nw 640]]]
    (mapcat wspec ["q" "k" "v" "o" "g" "u" "d"])
    [["kc" [:act 2048]] ["vc" [:act 2048]]           ;; maxpos=8 x kvrow=256
-    ["h" [:zf 768]] ["qinp" [:zi 192]] ["qins" [:zf 3]] ["qinb" [:zi 24]]
+    ["h" [:zf 640]] ["qinp" [:zi 192]] ["qins" [:zf 3]] ["qinb" [:zi 24]]
     ["q" [:zf 1024]] ["k" [:zf 256]] ["v" [:zf 256]] ["qn" [:zf 1024]] ["kn" [:zf 256]]
     ["qr" [:zf 1024]] ["kr" [:zf 256]] ["sc" [:zf 32]] ["at" [:zf 1024]]
     ["qap" [:zi 256]] ["qas" [:zf 4]] ["qab" [:zi 32]]
     ["o" [:zf 640]] ["o2" [:zf 640]] ["xmid" [:zf 640]]
-    ["f" [:zf 768]] ["qfp" [:zi 192]] ["qfs" [:zf 3]] ["qfb" [:zi 24]]
+    ["f" [:zf 640]] ["qfp" [:zi 192]] ["qfs" [:zf 3]] ["qfb" [:zi 24]]
     ["gate" [:zf 2048]] ["up" [:zf 2048]] ["hh" [:zf 2048]]
     ["qhp" [:zi 512]] ["qhs" [:zf 8]] ["qhb" [:zi 64]]
     ["down" [:zf 640]] ["down2" [:zf 640]] ["r-out" [:zf 640]]
-    ["posbuf" [:lv 3]] ["clenbuf" [:lv 4]] ["submax" [:zf 64]]
+    ["posbuf" [:lv 3]] ["positions" [:iv 3]]
+    ["clenbuf" [:lv 4]] ["submax" [:zf 64]]
     ["maxpos" [:s 8]] ["eps" [:s 1.0e-6]] ["theta" [:s 10000.0]] ["scale" [:s 0.0625]]]))
 
 ;; the fixture AND the generated layer share this exact param order (verified
@@ -202,7 +206,7 @@
 (def ^:private layer-args (mapv first layer-spec))
 
 (def ^:private head-spec
-  [["r-fin" [:act 640]] ["finalln" [:nw 640]] ["fh" [:zf 768]]
+   [["r-fin" [:act 640]] ["finalln" [:nw 640]] ["fh" [:zf 640]]
    ["hqp" [:zi 192]] ["hqs" [:zf 3]] ["hqb" [:zi 24]] ["submax" [:zf 64]]
    ["lmp" [:ri (* 262144 96)]] ["lmda" [:qs (* 262144 3)]] ["lmdb" [:qs (* 262144 3)]]
    ["lmaq" [:rb (* 262144 24)]] ["lmbq" [:rb (* 262144 24)]]
@@ -256,3 +260,42 @@
         _ (apply (deref v) (map b2 head-gen-args))]
     (is (finite-nonzero? (b1 "logits")) "oracle logits non-degenerate")
     (is (feq? (b1 "logits") (b2 "logits")) "logits bit-exact")))
+
+(deftest generated-head-batches-independent-dense-rows
+  (let [nrows 3 d 640 dp 768 vocab 257
+        model (assoc fake-270m :vocab vocab)
+        residual (mk "batched-r-fin" [:act (* nrows d)])
+        shared {"finalln" (mk "batched-finalln" [:nw d])
+                "lmp" (mk "batched-lmp" [:ri (* vocab (quot dp 8))])
+                "lmda" (mk "batched-lmda" [:qs (* vocab (quot dp 256))])
+                "lmdb" (mk "batched-lmdb" [:qs (* vocab (quot dp 256))])
+                "lmaq" (mk "batched-lmaq" [:rb (* vocab (quot dp 32))])
+                "lmbq" (mk "batched-lmbq" [:rb (* vocab (quot dp 32))])
+                "eps" 1.0e-6}
+        batched (merge shared
+                       {"r-fin" residual
+                        "fh" (float-array (* nrows d))
+                        "hqp" (int-array (* nrows (quot dp 4)))
+                        "hqs" (float-array (* nrows (quot dp 256)))
+                        "hqb" (int-array (* nrows (quot dp 32)))
+                        "logits" (float-array (* nrows vocab))
+                        "submax" (float-array (* nrows (quot dp 32)))})
+        expected (float-array (* nrows vocab))
+        single-head (deref (dgpu/gen-head! model))]
+    (dotimes [row nrows]
+      (let [single-residual (float-array d)
+            _ (System/arraycopy residual (* row d) single-residual 0 d)
+            single (merge shared
+                          {"r-fin" single-residual
+                           "fh" (float-array d)
+                           "hqp" (int-array (quot dp 4))
+                           "hqs" (float-array (quot dp 256))
+                           "hqb" (int-array (quot dp 32))
+                           "logits" (float-array vocab)
+                           "submax" (float-array (quot dp 32))})]
+        (apply single-head (map single head-gen-args))
+        (System/arraycopy ^floats (single "logits") 0 expected (* row vocab) vocab)))
+    (apply (deref (dgpu/gen-head! model :nrows nrows))
+           (map batched head-gen-args))
+    (is (feq? expected (batched "logits"))
+        "one shared head projection preserves independent dense row results")))

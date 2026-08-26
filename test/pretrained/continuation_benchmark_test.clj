@@ -2,7 +2,9 @@
   (:require [clojure.test :refer [deftest is]]
             [pretrained.continuation.benchmark :as benchmark]
             [pretrained.continuation.gpu :as continuation-gpu]
-            [pretrained.continuation.manager :as manager])
+            [pretrained.continuation.manager :as manager]
+            [pretrained.continuation.page-pool :as page-pool]
+            [pretrained.continuation.paged-decoder :as paged-decoder])
   (:import [java.util.concurrent CompletableFuture]))
 
 (deftest measure-runs-explicit-warmups-and-samples
@@ -43,3 +45,40 @@
         (is (= 3 (get-in result [:probe :cached-token-count])))
         (is (= {:logical-token-count 4 :processed-token-count 3}
                (:prompt result)))))))
+
+(deftest paged-benchmark-measures-restore-through-suffix-readiness
+  (let [resident (atom #{})
+        primes (atom 0)
+        completed (fn [value] (CompletableFuture/completedFuture value))]
+    (with-redefs [paged-decoder/prime-prompt!
+                  (fn [_ continuation-id _]
+                    (swap! resident conj continuation-id)
+                    (swap! primes inc))
+                  page-pool/route
+                  (fn [_ continuation-id]
+                    (when (contains? @resident continuation-id)
+                      {:continuation-id continuation-id}))
+                  page-pool/release-route!
+                  (fn [_ continuation-id]
+                    (swap! resident disj continuation-id)
+                    true)
+                  manager/checkpoint-paged-chunks-async!
+                  (fn [& _]
+                    {:accepted? true
+                     :captured (completed [{:bytes 48}])
+                     :published (completed ::published)})
+                  manager/restore-paged-prefix!
+                  (fn [_ _ continuation-id _ tokens]
+                    (swap! resident conj continuation-id)
+                    {:cached-token-count (if (= [1 2 3 4] (vec tokens)) 3 2)})
+                  manager/stats (fn [_] {:full-hits 4 :partial-hits 1})]
+      (let [result (benchmark/benchmark-paged-prefix!
+                    ::cache {:pool ::pool} "fixture-v1" [1 2 3 4]
+                    {:iterations 2 :warmups 1
+                     :probe-prompt-ids [1 2 9 4]})]
+        (is (= 48 (get-in result [:checkpoint :stored-bytes])))
+        (is (= 2 (get-in result [:probe :cached-token-count])))
+        (is (= {:full-hits 4 :partial-hits 1} (:cache-stats result)))
+        (is (pos? @primes))
+        (is (empty? @resident)
+            "every benchmark sample releases its worker-local pages")))))
