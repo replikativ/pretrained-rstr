@@ -668,10 +668,102 @@
           (try (gpu-link/close! executable) (catch Throwable _)))
         (throw error)))))
 
+(defn- layer-stack-executable!
+  [sess plan-id device-id specs layer-count descriptor node-id scalar-values outputs
+   role-overrides]
+  (let [instances
+        (mapv (fn [layer]
+                (descriptor-instance
+                 [plan-id layer]
+                 descriptor
+                 #(node-id layer %)
+                 (scalar-values layer)))
+              (range layer-count))
+        plan (external-plan plan-id device-id specs instances outputs role-overrides)]
+    (instantiate-external-plan! sess plan)))
+
+(defn- prefill-node-id
+  [norm-names layer parameter]
+  (let [parameter (name parameter)]
+    (cond
+      (= parameter "r-in") (keyword (str "pr" layer))
+      (= parameter "r-out") (keyword (str "pr" (inc layer)))
+      (= parameter "kr") (keyword (str "kc" layer))
+      (= parameter "v") (keyword (str "vc" layer))
+      (= parameter "k") :p_k
+      (norm-names parameter) (keyword (str "L" layer parameter))
+      (= \w (first parameter)) (keyword (str "PL" layer parameter))
+      (re-find #"__rbuf" parameter) (keyword (str "PL" layer "_" parameter))
+      :else (keyword (str "p_" parameter)))))
+
+(defn- decode-prefill-executable!
+  [sess device-id existing-specs m maxpos prefill-T norm-names]
+  (let [tokens (long prefill-T)
+        _ (when-not (<= tokens (long maxpos))
+            (throw (ex-info "prefill-T must fit in maxpos"
+                            {:prefill-T tokens :maxpos maxpos})))
+        {:keys [d kvrow]} (dims-of m)
+        descriptor (compile-resident-or-throw
+                    (gen-embed-layer! m tokens) device-id
+                    (str "decode prefill layer (T=" tokens ")"))
+        q8 (quantize-q8s m)
+        scratch-specs
+        (into {}
+              (map (fn [[key spec]]
+                     [(keyword (str "p_" (name key))) spec]))
+              (dissoc (embed-scratch-specs m tokens) :k :v))
+        residual-specs
+        (into {}
+              (for [layer (range (inc (:n-layers m)))]
+                [(keyword (str "pr" layer))
+                 [:float (* tokens (long d)) nil :scratch]]))
+        weight-specs
+        (into {}
+              (mapcat
+               (fn [layer]
+                 (mapcat
+                  (fn [[prefix role]]
+                    (let [{:keys [wp ws]}
+                          (get q8 (dec/role-name (:desc m) role layer))]
+                      [[(keyword (str "PL" layer "w" prefix "p"))
+                        [:int (alength ^ints wp) wp :constant]]
+                       [(keyword (str "PL" layer "w" prefix "s"))
+                        [:float (alength ^floats ws) ws :constant]]]))
+                  proj->role))
+               (range (:n-layers m))))
+        allocation-args
+        (scalar-args descriptor
+                     {"eps" (:eps m) "theta" (:rope-local m)
+                      "scale" (:attn-scale m)})
+        compiler-specs
+        (into {}
+              (for [layer (range (:n-layers m))
+                    {:keys [sym dtype size-fn]} (:allocs descriptor)]
+                [(keyword (str "PL" layer "_" (name sym)))
+                 [dtype (long (size-fn allocation-args)) nil :scratch]]))
+        new-specs (merge scratch-specs residual-specs weight-specs compiler-specs
+                         {:p_k [:float (* tokens (long kvrow)) nil :scratch]})
+        plan-specs (merge existing-specs new-specs)]
+    (gpu/alloc! sess
+                (into {}
+                      (map (fn [[key spec]] [key (vec (take 3 spec))]))
+                      new-specs))
+    (layer-stack-executable!
+     sess :resident-prefill device-id plan-specs (:n-layers m) descriptor
+     (fn [layer parameter]
+       (prefill-node-id norm-names layer parameter))
+     (fn [layer]
+       {"eps" (:eps m)
+        "theta" (layer-theta m layer)
+        "scale" (:attn-scale m)})
+     [(keyword (str "pr" (:n-layers m)))]
+     {:pr0 :input})))
+
 (defn bind-embed!
   "Compile + bind the PREFILL embed program: n-layers x generated embed layer over
   T-sized resident buffers. `:device-id` defaults to `:ze:0`; use an OpenCL
-  device such as `:ocl:0` for NVIDIA or AMD. Returns {:sess :model :T}."
+  device such as `:ocl:0` for NVIDIA or AMD. Returns a state containing the
+  session, model, T, and the linked resident executable."
   [m & {:keys [T qw device-id] :or {T 128 device-id :ze:0}}]
   (let [_ (gpu/backend-type device-id)
         eps (:eps m) scale (:attn-scale m)
@@ -703,26 +795,34 @@
                      (concat (for [l (range (:n-layers m))] (embed-weight-specs m qw l))
                              (for [l (range (:n-layers m))] (norm-specs m l))))
         alloc-specs (into {} (map (fn [[k v]] [k (vec (take 3 v))]) specs))
-        roles (into {} (map (fn [[k v]] [k (nth v 3 :scratch)]) specs))
         layer-args (scalar-args layer-prog {"eps" eps "theta" (:rope-global m) "scale" scale})
         prog-alloc-specs (into {}
                            (for [l (range (:n-layers m))
                                  {:keys [sym size-fn]} (:allocs layer-prog)]
                              [(keyword (str "L" l "_" (name sym)))
-                              [:float (long (size-fn layer-args)) nil]]))
-        sess (gpu/make-session device-id)
-        phases (atom [])]
-    (gpu/alloc! sess (merge alloc-specs prog-alloc-specs))
-    (swap! sess assoc :chain-roles roles)
-    (doseq [l (range (:n-layers m))]
-      (let [args (scalar-args layer-prog {"eps" eps "theta" (layer-theta m l) "scale" scale})]
-        (doseq [step (:steps layer-prog)]
-          (let [ph (keyword (str "L" l "_" (name (:phase step))))]
-            (gpu/bind-step! sess (assoc step :phase ph) args
-                            (fn [a] (layer-node-id norm-names l (name a))))
-            (swap! phases conj ph)))))
-    (gpu/record-graph! sess @phases :embed)
-    {:sess sess :model m :T T :device-id device-id}))
+                              [:float (long (size-fn layer-args)) nil :scratch]]))
+        all-specs (merge specs prog-alloc-specs)
+        roles (into {} (map (fn [[k v]] [k (nth v 3 :scratch)]) all-specs))
+        sess (gpu/make-session device-id)]
+    (try
+      (gpu/alloc! sess (merge alloc-specs prog-alloc-specs))
+      (swap! sess assoc :chain-roles roles)
+      {:sess sess
+       :model m
+       :T T
+       :device-id device-id
+       :embed-executable
+       (layer-stack-executable!
+        sess :resident-embed device-id all-specs (:n-layers m) layer-prog
+        (fn [layer parameter]
+          (layer-node-id norm-names layer parameter))
+        (fn [layer]
+          {"eps" eps "theta" (layer-theta m layer) "scale" scale})
+        [(keyword (str "r" (:n-layers m)))]
+        {:r0 :input})}
+      (catch Throwable error
+        (try (gpu/close-session! sess) (catch Throwable _))
+        (throw error)))))
 
 (declare embed-pool-last embed-pool-mean)
 
@@ -731,7 +831,7 @@
   embeddings, replay, download the final residual, host-side final-norm + last-token
   pool + L2 normalize. Returns float[d-model]."
   ^floats [estate ids]
-  (let [{:keys [sess model T]} estate
+  (let [{:keys [sess model T embed-executable]} estate
         d (long (:d-model model))
         T (long T)
         ids (vec (take T ids))
@@ -740,7 +840,9 @@
     (dotimes [i n]
       (System/arraycopy ^floats (embed-row model (nth ids i)) 0 r0 (* i d) d))
     (gpu/upload! sess :r0 r0)
-    (gpu/replay! sess :embed)
+    (if embed-executable
+      (gpu-link/run! embed-executable)
+      (throw (ex-info "Embed state has no resident LinkPlan executable" {})))
     (if (= :mean (get-in model [:desc :flags :pooling]))
       (embed-pool-mean model (gpu/download sess (keyword (str "r" (:n-layers model)))) n)
       (embed-pool-last model (gpu/download sess (keyword (str "r" (:n-layers model)))) n))))
@@ -868,69 +970,15 @@
                                               layer-prog head-prog tail-prog)}
               {:stage-executables
                (paged-decode-executables! sess device-id all-specs m maxpos norm-names
-                                          layer-partition head-prog tail-prog)})]
-    ;; ---- optional batched PREFILL graph (phase 2a) ----
-    ;; The embed-layer program at block size prefill-T, bound into the SAME
-    ;; session with its roped-keys/values args pointing DIRECTLY at the decode
-    ;; KV caches: kr/v are [T,kvrow] row-major = exactly the first T rows of
-    ;; kc{l}/vc{l} — the prefill GEMM+rope write the cache in place, zero-copy.
-    ;; Causal attention within the block (the qwen3 embed program is causal),
-    ;; positions 0..T-1 = absolute prompt positions. Pad rows beyond the real
-    ;; prompt are harmless: causal masking keeps real rows clean, and the
-    ;; rollout overwrites pad KV rows position by position as it generates.
-    ;; Q8 weights (the prefill kernels are i8-gemm), norms shared with decode.
-    (when prefill-T
-      (let [Tp (long prefill-T)
-            _ (assert (<= Tp (long maxpos)) "prefill-T must fit in maxpos")
-            {:keys [d dff qd kvrow]} (dims-of m)
-            pvar (gen-embed-layer! m Tp)
-            pprog (pipeline/compile-gpu-program pvar device-id :dtype :float)
-            q8 (quantize-q8s m)
-            pscratch (into {} (map (fn [[k v]] [(keyword (str "p_" (name k))) v])
-                                   (dissoc (embed-scratch-specs m Tp) :k :v)))
-            ;; k (pre-rope) stays scratch; kr + v go to the caches
-            presid (into {} (for [l (range (inc (:n-layers m)))]
-                              [(keyword (str "pr" l)) [:float (* Tp (long d)) nil]]))
-            pweights (into {}
-                       (mapcat (fn [l]
-                                 (mapcat (fn [[pl role]]
-                                           (let [{:keys [wp ws]} (get q8 (dec/role-name (:desc m) role l))]
-                                             [[(keyword (str "PL" l "w" pl "p")) [:int (alength ^ints wp) wp]]
-                                              [(keyword (str "PL" l "w" pl "s")) [:float (alength ^floats ws) ws]]]))
-                                         proj->role))
-                               (range (:n-layers m))))
-            pargs (scalar-args pprog {"eps" (:eps m) "theta" (:rope-local m)
-                                      "scale" (:attn-scale m)})
-            pallocs (into {}
-                      (for [l (range (:n-layers m))
-                            {:keys [sym size-fn]} (:allocs pprog)]
-                        [(keyword (str "PL" l "_" (name sym))) [:float (long (size-fn pargs)) nil]]))
-            ppbk (fn [l]
-                   (fn [a]
-                     (let [pn (name a)]
-                       (cond (= pn "r-in")  (keyword (str "pr" l))
-                             (= pn "r-out") (keyword (str "pr" (inc l)))
-                             (= pn "kr")    (keyword (str "kc" l))   ; ← the cache
-                             (= pn "v")     (keyword (str "vc" l))   ; ← the cache
-                             (= pn "k")     :p_k                     ; pre-rope scratch
-                             (norm-names pn) (keyword (str "L" l pn)) ; SHARED with decode
-                             (= \w (first pn)) (keyword (str "PL" l pn))
-                             (re-find #"__rbuf" pn) (keyword (str "PL" l "_" pn))
-                             :else (keyword (str "p_" pn))))))
-            pphases (atom [])]
-        (gpu/alloc! sess (merge pscratch presid pweights pallocs
-                                {:p_k [:float (* Tp (long kvrow)) nil]}))
-        (doseq [l (range (:n-layers m))]
-          (let [args (scalar-args pprog {"eps" (:eps m) "theta" (layer-theta m l)
-                                         "scale" (:attn-scale m)})]
-            (doseq [step (:steps pprog)]
-              (let [ph (keyword (str "PL" l "_" (name (:phase step))))]
-                (gpu/bind-step! sess (assoc step :phase ph) args (ppbk l))
-                (swap! pphases conj ph)))))
-        (gpu/record-graph! sess @pphases :prefill)))
-      (merge {:sess sess :model m :maxpos maxpos :prefill-T prefill-T
-              :cache-mode cache-mode :device-id device-id}
-             execution))
+                                          layer-partition head-prog tail-prog)})
+            prefill-execution
+            (when prefill-T
+              {:prefill-executable
+               (decode-prefill-executable! sess device-id all-specs m maxpos prefill-T
+                                            norm-names)})]
+        (merge {:sess sess :model m :maxpos maxpos :prefill-T prefill-T
+                :cache-mode cache-mode :device-id device-id}
+               execution prefill-execution))
       (catch Throwable error
         (try (gpu/close-session! sess) (catch Throwable _))
         (throw error)))))
@@ -938,15 +986,17 @@
 (defn prefill-rows!
   "Batched prompt prefill: upload the [T,d] input rows (token embeddings with
   any multimodal rows already spliced; zero-pad past the real prompt) and
-  replay the :prefill graph — one pass over all layers fills the decode KV
+  run the linked prefill program. One pass over all layers fills the decode KV
   caches for positions 0..T-1. Requires bind-decode! with :prefill-T."
   [dstate ^floats rows]
-  (let [{:keys [sess prefill-T model]} dstate]
+  (let [{:keys [sess prefill-T model prefill-executable]} dstate]
     (when-not prefill-T
       (throw (ex-info "dstate was bound without :prefill-T" {})))
     (assert (= (alength rows) (* (long prefill-T) (long (:d-model model)))))
     (gpu/upload! sess :pr0 rows)
-    (gpu/replay! sess :prefill)))
+    (if prefill-executable
+      (gpu-link/run! prefill-executable)
+      (throw (ex-info "Decode state has no resident prefill LinkPlan executable" {})))))
 
 (defn- run-contiguous-decode!
   [dstate]

@@ -630,13 +630,10 @@
                  []
                  (loop [p P out [t0]]
                    (if (and (< (count out) (long max-new)) (< p maxpos))
-                     (do (gpu/upload! sess :posbuf (long-array [p]))
-                         (gpu/upload! sess :clenbuf (long-array [(inc p)]))
-                         (gpu/replay! sess :decode)
-                         (let [t (aget ^ints (gpu/download sess :tokbuf) 0)]
-                           (if (or (= t IM-END) (= t EOT))
-                             out
-                             (recur (inc p) (conj out t)))))
+                     (let [t (dgpu/resident-step! dstate p)]
+                       (if (or (= t IM-END) (= t EOT))
+                         out
+                         (recur (inc p) (conj out t))))
                      out)))
            {:keys [tok decode]} (:tokenizer m)]
        (strip-asr-text (decode tok out))))))
