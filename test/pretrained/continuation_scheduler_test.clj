@@ -106,5 +106,6 @@
     (is (= 8 (get-in result [:lanes 0 :request/position])))
     (is (= 20 (get-in result [:lanes 0 :request/pending-token])))
     (is (= 2 (get-in result [:lanes 0 :request/remaining-tokens])))
+    (is (= [:keep] (mapv :request/id (:runnable result))))
     (is (= [:stop] (mapv :request/id (:completed result))))
     (is (= 99 (get-in result [:completed 0 :iteration/token])))))

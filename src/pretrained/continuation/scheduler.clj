@@ -244,8 +244,7 @@
            next-lanes (mapv #(when-not (complete? %) (dissoc % :iteration/token))
                             updated)]
        {:lanes next-lanes
-        :runnable (into [] (comp (filter some?) (map #(dissoc % :iteration/token)))
-                        updated)
+        :runnable (filterv some? next-lanes)
         :completed completed}))))
 
 (defn choose-cache-source
