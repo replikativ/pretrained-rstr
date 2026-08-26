@@ -255,14 +255,16 @@ For model execution, `:query-view` and `:output-view` may be FP16 or FP32 Raster
 then uploads only small route descriptors and returns the resident output view
 after completion; query and attention tensors never cross the host.
 
-`pretrained.continuation.paged-decoder` executes a generated decoder layer in
-resident pre-attention and post-attention stages, replacing the contiguous K/V
-assignment and attention interval. The adapter declares K/V as stage state and
-the attention result as its output; Raster's operation-neutral `ProgramStage`
-derives and validates the interval from executable effects. Each projection is
-then an ordinary `LinkPlan` instance over stable resident nodes. Pretrained owns
-page allocation, reservations, and transactional publication, but neither scans
-kernel ABI names nor assembles raw compiler phase keys. Bind with
+`pretrained.continuation.paged-decoder` replaces the contiguous K/V assignment
+and attention interval between generated pre-attention and post-attention
+stages. The adapter declares K/V as stage state and the attention result as its
+output; Raster's operation-neutral `ProgramStage` derives and validates the
+interval from executable effects. One `LinkPlan` then interleaves every layer's
+generated pre-stage, routed append graph, paged-attention graph, and generated
+post-stage before linking the token head/tail. A decode step uploads one shared
+set of route descriptors and replays this composite executable once. Pretrained
+owns page allocation, reservations, leases, and transactional publication, but
+neither scans kernel ABI names nor assembles raw compiler phase keys. Bind with
 `:cache-mode :paged` to omit the displaced per-layer K/V and score buffers:
 
 ```clojure
@@ -291,7 +293,9 @@ kernel ABI names nor assembles raw compiler phase keys. Bind with
 
 The contiguous decoder is likewise one validated LinkPlan containing every
 layer plus the head and greedy tail. Both modes import the same pretrained-owned
-resident allocations without copying them or transferring ownership.
+resident allocations without copying them or transferring ownership. Routed
+graph temporaries stay private to their descriptor steps; query, K/V, attention
+output, page slabs, and route descriptors are stable linked nodes.
 
 The Gemma anchor verifies token-exact parity with the contiguous decoder, the
 absence of `kc*`, `vc*`, and `sc` allocations, shared-page fork semantics, and

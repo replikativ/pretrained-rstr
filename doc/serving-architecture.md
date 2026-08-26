@@ -137,11 +137,15 @@ The pretrained adapter can already bind FP16 query and output
 and output graphs can share allocations without tensor uploads or downloads.
 The current single-lane decoder declares the cache writes and attention output
 as a Raster `ProgramStage`; Raster selects the unique effect-defined interval
-and projects ordinary before/selected/after descriptors. Pretrained instantiates
-the before/after descriptors and the head/tail as validated `LinkPlan`
-executables over imported resident buffers. This keeps page management and
-transactional publication outside the compiler without introducing an
-attention-specific linker or decoding compiler ABI names in the runtime.
+and projects ordinary before/selected/after descriptors. Pretrained wraps each
+routed append and attention `KernelGraph` as an ordinary descriptor instance,
+then interleaves those instances with every layer's before/after descriptors and
+the head/tail in one validated `LinkPlan`. Each token therefore needs one linked
+replay, not four submissions per layer plus a head submission. Page reservation,
+prospective leases, and transactional publication remain outside the graph, so
+a failed replay cannot publish a partially written page. This keeps cache
+management outside the compiler without introducing an attention-specific
+linker or decoding compiler ABI names in the runtime.
 
 Raster 0.2.355 provides the routed append operation with this explicit ordered
 ABI:

@@ -1,15 +1,18 @@
 (ns pretrained.continuation.paged-decoder
   "Paged autoregressive execution over an already-bound resident decoder.
 
-  The generated layer is replayed in two resident stages around Raster's paged
-  K/V append and attention graphs. Q, K, V, and attention output stay in device
-  buffers; the host moves only token/position metadata and the selected token."
+  Raster links the generated layer stages, paged K/V append, routed attention,
+  and token head into one resident executable. Q, K, V, and attention output
+  stay in device buffers; the host moves only routing metadata and the selected
+  token."
   (:refer-clojure :exclude [run!])
   (:require [pretrained.attention-state :as attention-state]
             [pretrained.continuation.page-pool :as page-pool]
             [pretrained.continuation.paged-append :as paged-append]
             [pretrained.continuation.paged-attention :as paged-attention]
             [pretrained.decoder-gpu :as decoder-gpu]
+            [raster.compiler.ir.kernel-executable :as kernel-executable]
+            [raster.compiler.ir.link-plan :as link]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as gpu-link])
   (:import [java.io Closeable]
@@ -18,7 +21,7 @@
 (declare close!)
 
 (defrecord PagedDecoder
-           [decode-state pool append-runners attention-runners executables state]
+           [decode-state pool executable descriptor-keys pages-per-sequence state]
   Closeable
   (close [decoder]
     (close! decoder)))
@@ -53,6 +56,214 @@
                       {:stage-executables execution})))
     execution))
 
+(defn- graph-instance
+  [id graph graph-bindings]
+  (let [abi (:abi (kernel-executable/validate! graph))
+        arguments (kernel-executable/arguments graph)
+        entries
+        (mapv (fn [index slot argument]
+                (let [parameter (symbol (str "argument-" index))]
+                  {:parameter parameter
+                   :slot slot
+                   :argument argument
+                   :node-id (when-not (= :scalar (:kind slot))
+                              (let [binding (get graph-bindings argument)]
+                                (if (gpu/resident-buffer-view? binding)
+                                  (:key binding)
+                                  binding)))}))
+              (range) abi arguments)
+        pointer-entries (filterv #(not= :scalar (get-in % [:slot :kind])) entries)
+        scalar-entries (filterv #(= :scalar (get-in % [:slot :kind])) entries)
+        descriptor
+        {:dtype nil
+         :all-params (mapv :parameter entries)
+         :array-params (mapv :parameter pointer-entries)
+         :scalar-params (mapv :parameter scalar-entries)
+         :array-roles
+         (into {}
+               (map (fn [{:keys [parameter slot]}]
+                      [parameter (if (= :input (:kind slot)) :input :output)]))
+               pointer-entries)
+         :allocs []
+         :steps
+         [{:phase id
+           :kernel-name (str (name (if (keyword? id) id :linked-graph)))
+           :convention :map
+           :artifact graph
+           :argument-specs
+           (mapv (fn [index {:keys [parameter slot]}]
+                   (if (= :scalar (:kind slot))
+                     {:kind :scalar
+                      :sym parameter
+                      :type (:kernel-dtype slot)
+                      :value-fn #(nth % index)}
+                     {:kind (:kind slot) :sym parameter}))
+                 (range) entries)}]
+         :result-sym (some-> pointer-entries last :parameter)}]
+    {:instance
+     (link/instance
+      {:id id
+       :descriptor descriptor
+       :bindings (into {} (map (juxt :parameter :node-id)) pointer-entries)
+       :scalars
+       (into {}
+             (map (fn [{:keys [parameter argument]}]
+                    [parameter
+                     (or (get graph-bindings argument)
+                         (throw (ex-info "Linked graph scalar has no bound value"
+                                         {:instance id :argument argument})))]))
+             scalar-entries)})
+     :buffers
+     (into {}
+           (map (juxt :id identity))
+           (concat (:inputs graph) (:outputs graph)))
+     :node-ids
+     (into {} (map (juxt :argument :node-id)) pointer-entries)}))
+
+(defn- graph-nodes
+  [device-id graph-component roles]
+  (into {}
+        (map (fn [[argument node-id]]
+               (let [buffer (get-in graph-component [:buffers argument])
+                     elements (:elements buffer)]
+                 (when-not (integer? elements)
+                   (throw (ex-info "Paged graph has an unresolved external extent"
+                                   {:argument argument :elements elements})))
+                 [node-id
+                  (link/node {:id node-id
+                              :dtype (:dtype buffer)
+                              :shape [(long elements)]
+                              :device device-id
+                              :role (get roles node-id :internal)
+                              :ownership :external
+                              :allocation-id node-id})])))
+        (:node-ids graph-component)))
+
+(defn- merge-first
+  [maps]
+  (reduce (fn [result values]
+            (reduce-kv #(if (contains? %1 %2) %1 (assoc %1 %2 %3)) result values))
+          {} maps))
+
+(defn- linked-paged-executable!
+  [decode-state pool pages-per-sequence prefix query-view key-view value-view output-view]
+  (let [{:keys [sess model device-id]} decode-state
+        staged (staged-executables! decode-state)
+        slot-prefix (str prefix "-append")
+        route-prefix (str prefix "-attention")
+        append-plans
+        (mapv (fn [layer]
+                (paged-append/reference-plan
+                 pool {:id [::append layer]
+                       :key-prefix slot-prefix
+                       :layer layer
+                       :batch-size 1
+                       :key-view key-view
+                       :value-view value-view}))
+              (range (:n-layers model)))
+        attention-plans
+        (mapv (fn [layer]
+                (paged-attention/reference-plan
+                 pool {:id [::attention layer]
+                       :key-prefix route-prefix
+                       :layer layer
+                       :batch-size 1
+                       :total-query-tokens 1
+                       :q-heads (:n-q model)
+                       :kv-heads (:n-kv model)
+                       :qk-head-dim (:head-dim model)
+                       :value-head-dim (:head-dim model)
+                       :pages-per-sequence pages-per-sequence
+                       :scale (:attn-scale model)
+                       :query-dtype :float
+                       :output-dtype :float
+                       :query-view query-view
+                       :output-view output-view}))
+              (range (:n-layers model)))
+        descriptor-specs
+        (merge (into {} (map :allocation) append-plans)
+               (apply merge (map :allocations attention-plans)))
+        descriptor-keys (set (keys descriptor-specs))
+        page-keys (set (vals (page-pool/buffer-keys pool)))]
+    (gpu/alloc! sess (into {} (map (fn [[key spec]] [key (vec (take 3 spec))]))
+                            descriptor-specs))
+    (try
+      (let [append-components
+            (mapv (fn [layer plan]
+                    (graph-instance [::append layer] (:graph plan) (:bindings plan)))
+                  (range) append-plans)
+            attention-components
+            (mapv (fn [layer plan]
+                    (graph-instance [::attention layer] (:graph plan) (:bindings plan)))
+                  (range) attention-plans)
+            stage-plans
+            (vec
+             (concat
+              (mapcat (fn [{:keys [pre post]}] [(:plan pre) (:plan post)])
+                      (:layers staged))
+              [(:plan (:head-tail staged))]))
+            stage-nodes (merge-first (map :nodes stage-plans))
+            graph-roles (merge (zipmap descriptor-keys (repeat :input))
+                               (zipmap page-keys (repeat :state))
+                               (zipmap [(:key query-view) (:key key-view)
+                                        (:key value-view) (:key output-view)]
+                                       (repeat :internal)))
+            append-nodes (map #(graph-nodes device-id % graph-roles) append-components)
+            attention-nodes (map #(graph-nodes device-id % graph-roles) attention-components)
+            nodes (reduce-kv (fn [result node-id role]
+                               (if-let [node (get result node-id)]
+                                 (assoc result node-id (assoc node :role role))
+                                 result))
+                             (merge-first
+                              (concat [stage-nodes] append-nodes attention-nodes))
+                             graph-roles)
+            instances
+            (vec
+             (concat
+              (mapcat
+               (fn [layer]
+                 (concat
+                  (:instances (:plan (get-in staged [:layers layer :pre])))
+                  [(get-in append-components [layer :instance])
+                   (get-in attention-components [layer :instance])]
+                  (:instances (:plan (get-in staged [:layers layer :post])))))
+               (range (:n-layers model)))
+              (:instances (:plan (:head-tail staged)))))
+            aliases (into #{} (mapcat :aliases) stage-plans)
+            plan (link/make
+                  {:id [::decoder prefix]
+                   :target device-id
+                   :nodes nodes
+                   :instances instances
+                   :outputs [:tokbuf]
+                   :aliases aliases
+                   :attributes {:owner ::paged-decoder}})
+            allocation-ids
+            (into #{} (map #(get-in % [:view :allocation :id])) (vals (:nodes plan)))
+            external-buffers
+            (into {}
+                  (map (fn [allocation-id]
+                         [allocation-id
+                          (or (gpu/buffer sess allocation-id)
+                              (throw (ex-info "Paged LinkPlan allocation is not resident"
+                                              {:allocation allocation-id})))]))
+                  allocation-ids)]
+        {:executable (gpu-link/instantiate!
+                      plan {:session sess :external-buffers external-buffers})
+         :descriptor-keys
+         {:slots (:slot-key (first append-plans))
+          :row-offsets (get-in (first attention-plans) [:buffer-keys :query-row-offsets])
+          :positions (get-in (first attention-plans) [:buffer-keys :query-positions])
+          :page-table (get-in (first attention-plans) [:buffer-keys :page-table])
+          :lengths (get-in (first attention-plans) [:buffer-keys :lengths])
+          :start-positions (get-in (first attention-plans) [:buffer-keys :start-positions])}
+         :owned-buffer-keys descriptor-keys})
+      (catch Throwable error
+        (doseq [key descriptor-keys]
+          (when (gpu/buffer sess key)
+            (gpu/free-buffer! sess key)))
+        (throw error)))))
+
 (defn open!
   "Attach paged K/V execution to a resident state returned by `bind-decode!`.
 
@@ -61,8 +272,8 @@
   - `:physical-pages` defaults to enough pages for one `:maxpos` continuation.
   - `:key-prefix` optionally supplies deterministic session buffer names.
 
-  The decoder owns its runners but not the decode state, Raster session, or page
-  pool allocations. Closing it releases runner graphs and descriptor buffers;
+  The decoder owns its linked graph but not the decode state, Raster session, or
+  page-pool allocations. Closing it releases the graph and descriptor buffers;
   close the decode state's session to release all resident tensors."
   [decode-state & {:keys [page-size physical-pages key-prefix]
                    :or {page-size 16}}]
@@ -70,7 +281,7 @@
     (throw (ex-info "Paged decoder requires bind-decode! with :cache-mode :paged"
                     {:cache-mode (:cache-mode decode-state)})))
   (let [{:keys [sess model maxpos]} decode-state
-        executables (staged-executables! decode-state)
+        _ (staged-executables! decode-state)
         page-size (checked-positive :page-size page-size)
         pages-per-sequence (long (quot (+ (long maxpos) (dec page-size)) page-size))
         physical-pages (checked-positive :physical-pages
@@ -91,47 +302,18 @@
         value-view (gpu/buffer-view sess :v {:shape [kv-elements]
                                              :id [prefix :value]})
         output-view (gpu/buffer-view sess :at {:shape [q-elements]
-                                               :id [prefix :output]})
-        append-runners (atom [])
-        attention-runners (atom [])]
-    (try
-      (doseq [layer (range (:n-layers model))]
-        (swap! append-runners conj
-               (paged-append/open-runner!
-                pool {:id [::append prefix layer]
-                      :key-prefix (str prefix "-append-" layer)
-                      :layer layer
-                      :batch-size 1
-                      :key-view key-view
-                      :value-view value-view}))
-        (swap! attention-runners conj
-               (paged-attention/open-runner!
-                pool {:id [::attention prefix layer]
-                      :key-prefix (str prefix "-attention-" layer)
-                      :layer layer
-                      :batch-size 1
-                      :total-query-tokens 1
-                      :q-heads (:n-q model)
-                      :kv-heads (:n-kv model)
-                      :qk-head-dim (:head-dim model)
-                      :value-head-dim (:head-dim model)
-                      :pages-per-sequence pages-per-sequence
-                      :scale (:attn-scale model)
-                      :query-dtype :float
-                      :output-dtype :float
-                      :query-view query-view
-                      :output-view output-view})))
+                                               :id [prefix :output]})]
+    (let [{:keys [executable descriptor-keys owned-buffer-keys]}
+          (linked-paged-executable!
+           decode-state pool pages-per-sequence prefix
+           query-view key-view value-view output-view)]
       (map->PagedDecoder
        {:decode-state decode-state
         :pool pool
-        :append-runners @append-runners
-        :attention-runners @attention-runners
-        :executables executables
-        :state (atom {:closed? false})})
-      (catch Throwable error
-        (doseq [runner (concat @attention-runners @append-runners)]
-          (.close ^Closeable runner))
-        (throw error)))))
+        :executable executable
+        :descriptor-keys descriptor-keys
+        :pages-per-sequence pages-per-sequence
+        :state (atom {:closed? false :owned-buffer-keys owned-buffer-keys})}))))
 
 (defn allocate-continuation!
   "Allocate an empty resident route for `continuation-id` and return it.
@@ -176,24 +358,33 @@
                       {:continuation-id continuation-id
                        :token-count (:token-count route)
                        :capacity (:maxpos (:decode-state decoder))})))
-    (gpu/upload! sess :posbuf (long-array [position]))
-    (gpu/upload! sess :clenbuf (long-array [(inc (long position))]))
     (let [batch (paged-append/reserve-batch! (:pool decoder) [continuation-id])]
       (try
-        (doseq [[layer-execution append-runner attention-runner]
-                (map vector (get-in decoder [:executables :layers])
-                     (:append-runners decoder) (:attention-runners decoder))]
-          (gpu-link/run! (:pre layer-execution))
-          (paged-append/run! append-runner batch)
-          (paged-attention/run!
-           attention-runner
-           {:continuation-ids [continuation-id]
-            :append-reservations (paged-append/reservation-entries batch)
-            :row-offsets [0 1]
-            :positions [position]})
-          (gpu-link/run! (:post layer-execution)))
+        (let [entries (paged-append/reservation-entries batch)
+              lease (page-pool/acquire-prospective-lease! (:pool decoder) entries)]
+          (try
+            (let [route-values
+                  (page-pool/leased-dense-route-values
+                   (:pool decoder) lease
+                   {:pages-per-sequence (:pages-per-sequence decoder)})
+                  keys (:descriptor-keys decoder)]
+              (gpu/upload-ranges!
+               sess
+               [[:posbuf (long-array [position]) {:elements 1}]
+                [:clenbuf (long-array [(inc (long position))]) {:elements 1}]
+                [(:slots keys) (paged-append/slot-values batch) {:elements 1}]
+                [(:row-offsets keys) (int-array [0 1]) {:elements 2}]
+                [(:positions keys) (int-array [(int position)]) {:elements 1}]
+                [(:page-table keys) (:page-table route-values)
+                 {:elements (alength ^ints (:page-table route-values))}]
+                [(:lengths keys) (:lengths route-values)
+                 {:elements (alength ^ints (:lengths route-values))}]
+                [(:start-positions keys) (:start-positions route-values)
+                 {:elements (alength ^ints (:start-positions route-values))}]])
+              (gpu-link/run! (:executable decoder)))
+            (finally
+              (page-pool/release-lease! (:pool decoder) lease))))
         (paged-append/commit-batch! batch)
-        (gpu-link/run! (get-in decoder [:executables :head-tail]))
         (long (aget ^ints (gpu/download sess :tokbuf) 0))
         (catch Throwable error
           (when (= :reserved @(:state batch))
@@ -241,13 +432,14 @@
           output)))))
 
 (defn close!
-  "Release routed-attention runners. Idempotent; does not close the decode
-  state's LinkPlan executables or session."
+  "Release the composite paged executable and its route descriptors. Idempotent;
+  does not close the decode state's staged LinkPlans, page pool, or session."
   [decoder]
   (locking decoder
     (when-not (:closed? @(:state decoder))
-      (doseq [runner (concat (:attention-runners decoder)
-                             (:append-runners decoder))]
-        (.close ^Closeable runner))
+      (gpu-link/close! (:executable decoder))
+      (doseq [key (:owned-buffer-keys @(:state decoder))]
+        (when (gpu/buffer (get-in decoder [:decode-state :sess]) key)
+          (gpu/free-buffer! (get-in decoder [:decode-state :sess]) key)))
       (swap! (:state decoder) assoc :closed? true)))
   nil)
