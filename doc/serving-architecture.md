@@ -135,6 +135,14 @@ different descriptor on the next replay.
 The pretrained adapter can already bind FP16 query and output
 `ResidentBufferView`s directly into routed attention, so projection, attention,
 and output graphs can share allocations without tensor uploads or downloads.
+The current single-lane decoder declares the cache writes and attention output
+as a Raster `ProgramStage`; Raster selects the unique effect-defined interval
+and projects ordinary before/selected/after descriptors. Pretrained instantiates
+the before/after descriptors and the head/tail as validated `LinkPlan`
+executables over imported resident buffers. This keeps page management and
+transactional publication outside the compiler without introducing an
+attention-specific linker or decoding compiler ABI names in the runtime.
+
 Raster 0.2.355 provides the routed append operation with this explicit ordered
 ABI:
 

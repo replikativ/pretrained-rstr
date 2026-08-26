@@ -21,6 +21,9 @@
             [raster.dl.nn :as nn]
             [raster.dl.attention :as attn]
             [raster.gpu.core :as gpu]
+            [raster.gpu.link :as gpu-link]
+            [raster.compiler.ir.link-plan :as link]
+            [raster.compiler.ir.program-stage :as program-stage]
             [raster.compiler.pipeline :as pipeline]))
 
 ;; ---------------------------------------------------------------------------
@@ -235,9 +238,9 @@
 
 ;; ---------------------------------------------------------------------------
 ;; Resident multi-layer binding + decode loop
-;; One layer program bound once PER LAYER (different weights/KV/residual via pbk) + the head,
-;; all into ONE command graph. Scratch buffers are SHARED across layers; weights/norms/KV and the
-;; residual stream r{l} are per-layer. PHASE 1 buffer sizes are gemma-3-270m specific.
+;; One layer descriptor is instantiated once per layer through stable LinkNode identities and
+;; composed with the head/tail as a LinkPlan. Scratch buffers are shared where declared;
+;; weights/norms/KV and the residual stream r{l} retain explicit per-layer identities.
 ;; ---------------------------------------------------------------------------
 
 (defn- scratch-dims
@@ -268,9 +271,10 @@
       (:qk-norm flags)        (assoc "qln" :attn-q-norm "kln" :attn-k-norm)
       (:sandwich-norms flags) (assoc "paln" :attn-post-norm "pffln" :ffn-post-norm))))
 
-(defn- pbk
-  "Layer-l buffer key for a layer-program arg name: residual r{l}/r{l+1}, KV kc{l}/vc{l}, weights
-  + norms L{l}…, everything else (scratch, posbuf/clenbuf) SHARED by its bare name."
+(defn- layer-node-id
+  "Stable node identity for one compiler symbol in layer `l`. Residuals, K/V,
+  weights, norms, steering state, and compiler scratch receive explicit
+  instance identities; reusable scratch and scalar buffers retain shared ids."
   [norm-names l pn]
   (cond (= pn "r-in")  (keyword (str "r" l))
         (= pn "r-out") (keyword (str "r" (inc l)))
@@ -285,14 +289,82 @@
         (re-find #"__rbuf" pn) (keyword (str "L" l "_" pn))
         :else (keyword pn)))
 
-(defn- head-pbk
-  "Head-program arg name -> buffer key. Head reuses the layer's qinp/qins/qinb quant scratch and
-  reads the final residual r{n-layers}."
+(defn- head-node-id
+  "Stable node identity for one head compiler symbol. The head deliberately
+  reuses activation-quantization scratch and reads the final residual node."
   [n-layers pn]
   (case pn
     "r-fin" (keyword (str "r" n-layers))
     "fh" :fh "hqp" :qinp "hqs" :qins "hqb" :qinb
     (keyword pn)))
+
+(defn- descriptor-pointer-symbols
+  [descriptor]
+  (into (sorted-set-by #(compare (pr-str %1) (pr-str %2)))
+        (mapcat keys)
+        (program-stage/descriptor-accesses descriptor)))
+
+(defn- descriptor-bindings
+  [descriptor node-id]
+  (into {}
+        (map (fn [symbol]
+               [symbol (node-id (name symbol))]))
+        (descriptor-pointer-symbols descriptor)))
+
+(defn- scalar-bindings
+  [descriptor values]
+  (into {}
+        (map (fn [symbol] [symbol (get values (name symbol))]))
+        (:scalar-params descriptor)))
+
+(defn- descriptor-instance
+  [id descriptor node-id scalar-values]
+  (link/instance
+   {:id id
+    :descriptor descriptor
+    :bindings (descriptor-bindings descriptor node-id)
+    :scalars (scalar-bindings descriptor scalar-values)}))
+
+(defn- external-plan
+  [id device-id specs instances outputs role-overrides]
+  (let [node-ids (into #{} (mapcat (comp vals :bindings)) instances)
+        missing (remove #(contains? specs %) node-ids)]
+    (when (seq missing)
+      (throw (ex-info "Decoder LinkPlan refers to unspecified resident nodes"
+                      {:plan id :missing (set missing)})))
+    (link/make
+     {:id id
+      :target device-id
+      :nodes
+      (mapv (fn [node-id]
+              (let [[dtype elements _ role] (get specs node-id)]
+                (link/node {:id node-id
+                            :dtype dtype
+                            :shape [(long elements)]
+                            :device device-id
+                            :role (get role-overrides node-id role)
+                            :ownership :external
+                            :allocation-id node-id})))
+            (sort-by pr-str node-ids))
+      :instances instances
+      :outputs outputs
+      :attributes {:owner :pretrained.decoder-gpu}})))
+
+(defn- instantiate-external-plan!
+  [sess plan]
+  (let [allocation-ids (into #{}
+                             (map #(get-in % [:view :allocation :id]))
+                             (vals (:nodes plan)))
+        external-buffers
+        (into {}
+              (map (fn [allocation-id]
+                     (let [buffer (gpu/buffer sess allocation-id)]
+                       (when-not buffer
+                         (throw (ex-info "Decoder LinkPlan allocation is not resident"
+                                         {:plan (:id plan) :allocation allocation-id})))
+                       [allocation-id buffer])))
+              allocation-ids)]
+    (gpu-link/instantiate! plan {:session sess :external-buffers external-buffers})))
 
 (defn- scratch-specs [m]
   (into {} (map (fn [[k [sz ty]]] [k [ty sz nil :scratch]]) (scratch-dims m))))
@@ -330,7 +402,7 @@
      :logits  [:float (long (:vocab m)) nil :output]}))
 
 (defn- io-specs [m maxpos]
-  (merge {:r0 [:float (long (:d-model m)) nil :input]
+  (merge {:r0 [:float (long (:d-model m)) nil :state]
           :posbuf [:long 1 nil :input] :clenbuf [:long 1 nil :input]}
          (into {} (for [l (range 1 (inc (:n-layers m)))]
                     [(keyword (str "r" l)) [:float (long (:d-model m)) nil :scratch]]))))
@@ -362,40 +434,19 @@
 (defn- scalar-args [prog kvs]
   (mapv (fn [p] (get kvs (name p))) (:all-params prog)))
 
-(defn- output-names
-  [step]
-  (into #{}
-        (keep (fn [{:keys [name kind]}]
-                (when (contains? #{:output :inout} kind)
-                  (clojure.core/name name))))
-        (:abi step)))
-
 (defn- layer-step-partition
   [layer-prog]
-  (let [steps (:steps layer-prog)
-        outputs (mapv output-names steps)
-        cache-indices (keep-indexed
-                       (fn [index names]
-                         (when (some names ["kc" "vc"]) index))
-                       outputs)
-        attention-end (first (keep-indexed
-                              (fn [index names]
-                                (when (contains? names "at") index))
-                              outputs))]
-    (when-not (and (= #{"kc" "vc"}
-                      (set (filter #{"kc" "vc"} (mapcat identity outputs))))
-                   (seq cache-indices)
-                   attention-end
-                   (< (first cache-indices) attention-end))
-      (throw (ex-info "Generated decoder layer has no replaceable KV-attention interval"
-                      {:outputs outputs})))
-    {:pre (subvec steps 0 (first cache-indices))
-     :replaced (subvec steps (first cache-indices) (inc attention-end))
-     :post (subvec steps (inc attention-end))}))
-
-(defn- layer-phase-key
-  [layer step]
-  (keyword (str "L" layer "_" (name (:phase step)))))
+  (let [stage (program-stage/select
+               layer-prog
+               {:id :routed-kv-attention
+                :state #{'kc 'vc}
+                :outputs #{'at}
+                :attributes {:runtime-owner :pretrained.continuation/paged-decoder}})
+        {:keys [before selected after]} (program-stage/partition layer-prog stage)]
+    (when-not (and before selected after)
+      (throw (ex-info "Generated decoder layer has no complete routed-attention boundary"
+                      {:stage stage})))
+    {:stage stage :pre before :replaced selected :post after}))
 
 (defn embed-row ^floats [m token]
   (let [d (long (:d-model m))
@@ -541,6 +592,82 @@
                             " — not a resident-compilable program" (when hint (str " " hint)))
                        {:program what :device-id device-id})))))
 
+(defn- layer-scalar-values
+  [m layer maxpos]
+  {"eps" (:eps m)
+   "theta" (layer-theta m layer)
+   "scale" (:attn-scale m)
+   "maxpos" (long maxpos)})
+
+(defn- contiguous-decode-executable!
+  [sess device-id specs m maxpos norm-names layer-prog head-prog tail-prog]
+  (let [layers
+        (mapv (fn [layer]
+                (descriptor-instance
+                 [:decode-layer layer]
+                 layer-prog
+                 #(layer-node-id norm-names layer %)
+                 (layer-scalar-values m layer maxpos)))
+              (range (:n-layers m)))
+        head (descriptor-instance :decode-head head-prog
+                                  #(head-node-id (:n-layers m) %)
+                                  {"eps" (:eps m)})
+        tail (descriptor-instance :decode-tail tail-prog keyword
+                                  {"vocab" (long (:vocab m))
+                                   "d" (long (:d-model m))})
+        plan (external-plan :resident-decode device-id specs
+                            (into layers [head tail])
+                            [:logits :tokbuf]
+                            {})]
+    (instantiate-external-plan! sess plan)))
+
+(defn- paged-decode-executables!
+  [sess device-id specs m maxpos norm-names layer-partition head-prog tail-prog]
+  (let [opened (atom [])
+        open! (fn [plan]
+                (let [executable (instantiate-external-plan! sess plan)]
+                  (swap! opened conj executable)
+                  executable))]
+    (try
+      (let [layers
+            (mapv
+             (fn [layer]
+               (let [node-id #(layer-node-id norm-names layer %)
+                     scalars (layer-scalar-values m layer maxpos)
+                     input-id (node-id "r-in")
+                     output-id (node-id "r-out")
+                     pre-instance (descriptor-instance [:decode-layer layer :pre]
+                                                       (:pre layer-partition) node-id scalars)
+                     post-instance (descriptor-instance [:decode-layer layer :post]
+                                                        (:post layer-partition) node-id scalars)
+                     pre-plan (external-plan [:resident-decode layer :pre]
+                                             device-id specs [pre-instance]
+                                             [(node-id "qr") (node-id "kr") (node-id "v")]
+                                             {input-id :input})
+                     post-plan (external-plan [:resident-decode layer :post]
+                                              device-id specs [post-instance]
+                                              [output-id]
+                                              {input-id :input (node-id "at") :input})]
+                 {:pre (open! pre-plan)
+                  :post (open! post-plan)}))
+             (range (:n-layers m)))
+            head (descriptor-instance :decode-head head-prog
+                                      #(head-node-id (:n-layers m) %)
+                                      {"eps" (:eps m)})
+            tail (descriptor-instance :decode-tail tail-prog keyword
+                                      {"vocab" (long (:vocab m))
+                                       "d" (long (:d-model m))})
+            final-residual (keyword (str "r" (:n-layers m)))
+            head-tail-plan (external-plan :resident-decode-head-tail
+                                          device-id specs [head tail]
+                                          [:logits :tokbuf]
+                                          {final-residual :input})]
+        {:layers layers :head-tail (open! head-tail-plan)})
+      (catch Throwable error
+        (doseq [executable (reverse @opened)]
+          (try (gpu-link/close! executable) (catch Throwable _)))
+        (throw error)))))
+
 (defn bind-embed!
   "Compile + bind the PREFILL embed program: n-layers x generated embed layer over
   T-sized resident buffers. `:device-id` defaults to `:ze:0`; use an OpenCL
@@ -591,7 +718,8 @@
       (let [args (scalar-args layer-prog {"eps" eps "theta" (layer-theta m l) "scale" scale})]
         (doseq [step (:steps layer-prog)]
           (let [ph (keyword (str "L" l "_" (name (:phase step))))]
-            (gpu/bind-step! sess (assoc step :phase ph) args (fn [a] (pbk norm-names l (name a))))
+            (gpu/bind-step! sess (assoc step :phase ph) args
+                            (fn [a] (layer-node-id norm-names l (name a))))
             (swap! phases conj ph)))))
     (gpu/record-graph! sess @phases :embed)
     {:sess sess :model m :T T :device-id device-id}))
@@ -704,50 +832,43 @@
                                   [:float d (or (get steer l) (float-array d)) :constant]])))
         specs (merge (buffer-specs m qw maxpos cache-mode)
                      steer-specs
-                     {:emb    [:float (* (long (:vocab m)) (long (:d-model m))) (prescaled-embed m) :constant]
+                     {:emb    [:float (* (long (:vocab m)) (long (:d-model m)))
+                               (prescaled-embed m) :constant]
                       :tokbuf [:int 1 nil :output]})
-        alloc-specs (into {} (map (fn [[k v]] [k (vec (take 3 v))]) specs))
-        roles (into {} (map (fn [[k v]] [k (nth v 3 :scratch)]) specs))
         ;; A program's :allocs are compiler-introduced scratch — Stage A's reduce-result ss__rbuf
-        ;; 1-elem buffers. These must be PER-LAYER (key matches pbk's L{l}_… for __rbuf), NOT shared,
-        ;; to avoid the cross-layer write-after-read hazard. The head has no reduce allocs.
-        ;; Size-fns are constant, so any layer's scalar args suffice.
+        ;; 1-elem buffers. These must be PER-LAYER (matching layer-node-id's L{l}_… identity for
+        ;; __rbuf), not shared, to avoid cross-layer write-after-read hazards. Size-fns are
+        ;; constant, so any layer's scalar arguments suffice.
         layer-alloc-args (scalar-args layer-prog {"eps" eps "theta" (:rope-local m) "scale" scale
                                                   "maxpos" (long maxpos)})
         prog-alloc-specs (into {}
                            (concat
                             (for [l (range (:n-layers m))
                                   {:keys [sym size-fn]} (:allocs layer-prog)]
-                              [(keyword (str "L" l "_" (name sym))) [:float (long (size-fn layer-alloc-args)) nil]])
+                              [(keyword (str "L" l "_" (name sym)))
+                               [:float (long (size-fn layer-alloc-args)) nil :scratch]])
                             (for [{:keys [sym size-fn]} (:allocs head-prog)]
-                              [(keyword (name sym)) [:float (long (size-fn (scalar-args head-prog {"eps" eps}))) nil]])
+                              [(keyword (name sym))
+                               [:float (long (size-fn (scalar-args head-prog {"eps" eps})))
+                                nil :scratch]])
                             (for [{:keys [sym size-fn]} (:allocs tail-prog)]
-                              [(keyword (name sym)) [:float (long (size-fn tail-args)) nil]])))
-        sess (gpu/make-session device-id)
-        phases (atom [])]
-    (gpu/alloc! sess (merge alloc-specs prog-alloc-specs))
-    (swap! sess assoc :chain-roles roles)
-    (doseq [l (range (:n-layers m))]
-      (let [args (scalar-args layer-prog {"eps" eps "theta" (layer-theta m l) "scale" scale
-                                          "maxpos" (long maxpos)})]
-        (doseq [step (if (= :paged cache-mode)
-                       (into (:pre layer-partition) (:post layer-partition))
-                       (:steps layer-prog))]
-          (let [ph (keyword (str "L" l "_" (name (:phase step))))]
-            (gpu/bind-step! sess (assoc step :phase ph) args (fn [a] (pbk norm-names l (name a))))
-            (swap! phases conj ph)))))
-    (let [args (scalar-args head-prog {"eps" eps})]
-      (doseq [step (:steps head-prog)]
-        (let [ph (keyword (str "H_" (name (:phase step))))]
-          (gpu/bind-step! sess (assoc step :phase ph) args (fn [a] (head-pbk (:n-layers m) (name a))))
-          (swap! phases conj ph))))
-    ;; decode tail (argmax + embed-gather); params map to session buffers by their own names
-    (doseq [step (:steps tail-prog)]
-      (let [ph (keyword (str "T_" (name (:phase step))))]
-        (gpu/bind-step! sess (assoc step :phase ph) tail-args (fn [a] (keyword (name a))))
-        (swap! phases conj ph)))
-    (when (= :contiguous cache-mode)
-      (gpu/record-graph! sess @phases :decode))
+                              [(keyword (name sym))
+                               [:float (long (size-fn tail-args)) nil :scratch]])))
+        all-specs (merge specs prog-alloc-specs)
+        alloc-specs (into {} (map (fn [[k v]] [k (vec (take 3 v))]) all-specs))
+        roles (into {} (map (fn [[k v]] [k (nth v 3 :scratch)]) all-specs))
+        sess (gpu/make-session device-id)]
+    (try
+      (gpu/alloc! sess alloc-specs)
+      (swap! sess assoc :chain-roles roles)
+      (let [execution
+            (if (= :contiguous cache-mode)
+              {:decode-executable
+               (contiguous-decode-executable! sess device-id all-specs m maxpos norm-names
+                                              layer-prog head-prog tail-prog)}
+              {:stage-executables
+               (paged-decode-executables! sess device-id all-specs m maxpos norm-names
+                                          layer-partition head-prog tail-prog)})]
     ;; ---- optional batched PREFILL graph (phase 2a) ----
     ;; The embed-layer program at block size prefill-T, bound into the SAME
     ;; session with its roped-keys/values args pointing DIRECTLY at the decode
@@ -807,19 +928,12 @@
                 (gpu/bind-step! sess (assoc step :phase ph) args (ppbk l))
                 (swap! pphases conj ph)))))
         (gpu/record-graph! sess @pphases :prefill)))
-    {:sess sess :model m :maxpos maxpos :prefill-T prefill-T
-     :cache-mode cache-mode
-     :phase-layout
-     {:layers
-      (mapv (fn [layer]
-              (into {}
-                    (map (fn [[stage steps]]
-                           [stage (mapv #(layer-phase-key layer %) steps)]))
-                    layer-partition))
-            (range (:n-layers m)))
-      :head (mapv #(keyword (str "H_" (name (:phase %)))) (:steps head-prog))
-      :tail (mapv #(keyword (str "T_" (name (:phase %)))) (:steps tail-prog))}
-     :device-id device-id}))
+      (merge {:sess sess :model m :maxpos maxpos :prefill-T prefill-T
+              :cache-mode cache-mode :device-id device-id}
+             execution))
+      (catch Throwable error
+        (try (gpu/close-session! sess) (catch Throwable _))
+        (throw error)))))
 
 (defn prefill-rows!
   "Batched prompt prefill: upload the [T,d] input rows (token embeddings with
@@ -834,6 +948,13 @@
     (gpu/upload! sess :pr0 rows)
     (gpu/replay! sess :prefill)))
 
+(defn- run-contiguous-decode!
+  [dstate]
+  (if-let [executable (:decode-executable dstate)]
+    (gpu-link/run! executable)
+    (throw (ex-info "Contiguous decode requires a resident decode LinkPlan"
+                    {:cache-mode (:cache-mode dstate)}))))
+
 (defn decode-row!
   "One resident-decode step from an ARBITRARY input row (float[d-model]): write absolute
   `pos` + the row, replay the graph, return the logits (float[vocab]). This is the
@@ -844,7 +965,7 @@
     (gpu/upload! sess :posbuf (long-array [pos]))
     (gpu/upload! sess :clenbuf (long-array [(inc pos)]))
     (gpu/upload! sess :r0 row)
-    (gpu/replay! sess :decode)
+    (run-contiguous-decode! dstate)
     (gpu/download sess :logits)))
 
 (defn decode-token!
@@ -866,7 +987,7 @@
   "GPU analogue of decoder/hidden-states (Phase-2a read tap): per-layer resid-post +
   final hidden for the LAST token of `ids`, read straight from the resident residual
   buffers. The residual stream r1..r_n is already allocated as separate per-layer
-  resident buffers (pbk maps r-out -> r{l+1}), so after the last token's replay they
+  resident nodes (r-out binds to r{l+1}), so after the last token's replay they
   hold that token's per-layer resid-post — reading them is a plain download, NO
   de-fusion and NO extra kernels (the tap is free at :resid-post on GPU). Returns
   {:layers [float[d] × n-layers] :final float[d]} to match the CPU seam."
@@ -915,7 +1036,7 @@
                       {:position pos :max-position maxpos})))
     (gpu/upload! sess :posbuf (long-array [pos]))
     (gpu/upload! sess :clenbuf (long-array [(inc (long pos))]))
-    (gpu/replay! sess :decode)
+    (run-contiguous-decode! dstate)
     (long (aget ^ints (gpu/download sess :tokbuf) 0))))
 
 (defn generate-resident
@@ -934,7 +1055,7 @@
       (if (and (< (count out) max-new) (< p (long maxpos)))
         (do (gpu/upload! sess :posbuf (long-array [p]))
             (gpu/upload! sess :clenbuf (long-array [(inc p)]))
-            (gpu/replay! sess :decode)
+            (run-contiguous-decode! dstate)
             (let [t (aget ^ints (gpu/download sess :tokbuf) 0)
                   out (conj out t)]
               (if (contains? eos-ids t) out (recur (inc p) out))))
