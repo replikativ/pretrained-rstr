@@ -6,12 +6,11 @@
  ;; compilable blocks + quant kernels stay in raster.
  ;;
  ;; raster is released on Clojars (Maven-resolvable; its POM declares TypedClojure).
- ;; 0.2.374 adds uniform multi-row Q8_K/Q4_K projection and buffered per-row
- ;; RoPE on top of validated LinkPlan composition and semantic ProgramStage
- ;; selection. Pretrained owns cache allocation/publication while Raster owns
- ;; compiler-stage selection, node validation, and linked execution.
+ ;; 0.2.377 adds fused dense-row padding during Q8_K packing plus deterministic
+ ;; indexed row reduction and resident row gather on top of uniform multi-row
+ ;; Q4_K projection, buffered RoPE, and validated LinkPlan composition.
  ;; The :dev alias overrides raster with the sibling checkout for local work.
- :deps {org.replikativ/raster {:mvn/version "0.2.374"}
+ :deps {org.replikativ/raster {:mvn/version "0.2.377"}
         org.replikativ/boring {:mvn/version "0.1.27"}
         org.replikativ/hasch {:mvn/version "0.4.102"}
         org.replikativ/konserve {:mvn/version "0.9.379"}

@@ -19,6 +19,7 @@
             [raster.arrays :as arr]
             [raster.quant.kernels-k :as qk]
             [raster.quant.pack :as qpack]
+            [raster.dl.array-ops :as aops]
             [raster.dl.nn :as nn]
             [raster.dl.attention :as attn]
             [raster.gpu.core :as gpu]
@@ -63,21 +64,17 @@
 ;; Appended to the resident graph so a replay produces the NEXT token's residual input on-device —
 ;; the host uploads only position metadata and downloads the 4-byte token id (no 1MB logits
 ;; download, no embedding upload). The embedding table is bound PRE-SCALED by sqrt(d) (double-math
-;; host-side, bit-identical to embed-row) so the gather is a pure copy. Argmax ties are resolved
-;; by whichever work-item writes last (CPU argmax picks the first index) — irrelevant for logits.
+;; host-side, bit-identical to embed-row) so the gather is a pure copy. Raster's indexed row
+;; reduction makes token selection deterministic: ties choose the lowest token id and NaNs win
+;; over finite logits so numerical corruption remains visible.
 ;; ---------------------------------------------------------------------------
 
 (raster.core/deftm decode-tail!
   [logits :- (Array float) emb :- (Array float) tokbuf :- (Array int) r0 :- (Array float)
-   vocab :- Long d :- Long] :- Void
-  (let [mx (raster.par/reduce acc -1.0e30 i vocab
-             (raster.numeric/max acc (raster.arrays/aget logits i)))]
-    (raster.par/map-void! j vocab
-      (when (raster.numeric/== (raster.arrays/aget logits j) mx)
-        (raster.arrays/aset tokbuf 0 j)))
-    (raster.par/map-void! j d
-      (raster.arrays/aset r0 j
-        (raster.arrays/aget emb (+ (* (raster.arrays/aget tokbuf 0) d) j))))))
+   nrows :- Long vocab :- Long d :- Long] :- Void
+  (do
+    (aops/argmax-rows! logits tokbuf nrows vocab)
+    (aops/gather-rows! emb tokbuf r0 nrows d)))
 
 (defn- embed-scale ^double [m]
   (if (= :sqrt-d (get-in m [:desc :flags :embed-scale]))
@@ -167,7 +164,7 @@
                       'maxpos :- 'Long 'eps :- 'Double 'theta :- 'Double 'scale :- 'Double]))
         body (remove nil?
               [(rms1 'r-in 'inln 'h)
-               (list 'qk/quant-act-q8k-rows-gpu! 'h 'qinp 'qins 'qinb 'submax dp 1)
+               (list 'qk/quant-act-q8k-padded-rows-gpu! 'h 'qinp 'qins 'qinb 'submax d dp 1)
                (list 'qk/qmatmul-q4k-dp4a-rows! 'qinp 'qins 'qinb 'wqp 'wqda 'wqdb 'wqaq 'wqbq 'q dp qd 1)
                (list 'qk/qmatmul-q4k-dp4a-rows! 'qinp 'qins 'qinb 'wkp 'wkda 'wkdb 'wkaq 'wkbq 'k dp kvrow 1)
                (list 'qk/qmatmul-q4k-dp4a-rows! 'qinp 'qins 'qinb 'wvp 'wvda 'wvdb 'wvaq 'wvbq 'v dp kvrow 1)
@@ -182,16 +179,16 @@
                ;; concrete-float layer → cast the Double `scale` to float at the call
                ;; boundary (gqa's scale is :- T; float×double would not lower to GPU C).
                (list 'attn/gqa-decode-attention-buf! 'qr 'kc 'vc 'at 'sc 'clenbuf nq group nkv hd 'maxpos (list 'float 'scale))
-               (list 'qk/quant-act-q8k-rows-gpu! 'at 'qap 'qas 'qab 'submax qdp 1)
+               (list 'qk/quant-act-q8k-padded-rows-gpu! 'at 'qap 'qas 'qab 'submax qd qdp 1)
                (list 'qk/qmatmul-q4k-dp4a-rows! 'qap 'qas 'qab 'wop 'woda 'wodb 'woaq 'wobq 'o qdp d 1)
                (when sand? (rms1 'o 'paln 'o2))
                (list 'nn/residual-add! 'r-in (if sand? 'o2 'o) 'xmid d)
                (rms1 'xmid 'pfln 'f)
-               (list 'qk/quant-act-q8k-rows-gpu! 'f 'qfp 'qfs 'qfb 'submax dp 1)
+               (list 'qk/quant-act-q8k-padded-rows-gpu! 'f 'qfp 'qfs 'qfb 'submax d dp 1)
                (list 'qk/qmatmul-q4k-dp4a-rows! 'qfp 'qfs 'qfb 'wgp 'wgda 'wgdb 'wgaq 'wgbq 'gate dp dff 1)
                (list 'qk/qmatmul-q4k-dp4a-rows! 'qfp 'qfs 'qfb 'wup 'wuda 'wudb 'wuaq 'wubq 'up dp dff 1)
                (list act-mul 'gate 'up 'hh dff)
-               (list 'qk/quant-act-q8k-rows-gpu! 'hh 'qhp 'qhs 'qhb 'submax dffp 1)
+               (list 'qk/quant-act-q8k-padded-rows-gpu! 'hh 'qhp 'qhs 'qhb 'submax dff dffp 1)
                (list 'qk/qmatmul-q4k-dp4a-rows! 'qhp 'qhs 'qhb 'wdp 'wdda 'wddb 'wdaq 'wdbq 'down dffp d 1)
                (when sand? (rms1 'down 'pffln 'down2))
                (list 'nn/residual-add! 'xmid (if sand? 'down2 'down) 'r-out d)
@@ -200,8 +197,9 @@
                (when steer? (list 'nn/residual-add! 'r-out 'steer 'r-out d))])]
     (list 'raster.core/deftm nm params :- 'Void (cons 'do body))))
 
-(defn- head-form [m nm]
+(defn- head-form [m nm nrows]
   (let [{:keys [d dp]} (dims-of m)
+        nrows (long nrows)
         go (double (get-in m [:desc :flags :norm :gain-offset] 0.0))
         vocab (long (:vocab m))]
     (list 'raster.core/deftm nm
@@ -212,9 +210,12 @@
                         'logits :- (af :f) 'submax :- (af :f) 'eps :- 'Double]))
           :- 'Void
           (list 'do
-                (list 'nn/rms-norm! 'r-fin 'finalln 'fh 1 d 'eps go)
-                (list 'qk/quant-act-q8k-rows-gpu! 'fh 'hqp 'hqs 'hqb 'submax dp 1)
-                (list 'qk/qmatmul-q4k-dp4a-rows! 'hqp 'hqs 'hqb 'lmp 'lmda 'lmdb 'lmaq 'lmbq 'logits dp vocab 1)))))
+                (list 'nn/rms-norm! 'r-fin 'finalln 'fh nrows d 'eps go)
+                (list 'qk/quant-act-q8k-padded-rows-gpu!
+                      'fh 'hqp 'hqs 'hqb 'submax d dp nrows)
+                (list 'qk/qmatmul-q4k-dp4a-rows!
+                      'hqp 'hqs 'hqb 'lmp 'lmda 'lmdb 'lmaq 'lmbq
+                      'logits dp vocab nrows)))))
 
 (defn eval-gen! [nm form]
   (or (get @gen-cache nm)
@@ -232,11 +233,16 @@
     (eval-gen! nm (layer-form m nm rms-style (boolean steer?)))))
 
 (defn gen-head!
-  "Get-or-create the descriptor-generated GPU head deftm var for model m."
-  [m]
+  "Get or create the descriptor-generated GPU head deftm for `m`.
+
+  `:nrows` is the compile-time number of dense residual rows projected through
+  the shared final norm and language-model head; it defaults to one."
+  [m & {:keys [nrows] :or {nrows 1}}]
   (let [{:keys [d]} (dims-of m)
-        nm (symbol (str "ghead-" (name (get-in m [:desc :arch])) "-" d "!"))]
-    (eval-gen! nm (head-form m nm))))
+        nrows (long nrows)
+        nm (symbol (str "ghead-" (name (get-in m [:desc :arch])) "-" d
+                        "-b" nrows "!"))]
+    (eval-gen! nm (head-form m nm nrows))))
 
 ;; ---------------------------------------------------------------------------
 ;; Resident multi-layer binding + decode loop
@@ -251,11 +257,11 @@
   [m]
   (let [{:keys [d dp dff dffp qd qdp kvrow nsb-d nsb-qd nsb-dff]} (dims-of m)
         mx-nsb (max nsb-d nsb-qd nsb-dff)]
-    {:h [dp :float] :q [qd :float] :k [kvrow :float] :v [kvrow :float]
+    {:h [d :float] :q [qd :float] :k [kvrow :float] :v [kvrow :float]
      :qn [qd :float] :kn [kvrow :float] :qr [qd :float] :kr [kvrow :float]
-     :at [qdp :float] :o [d :float] :o2 [d :float] :xmid [d :float]
-     :f [dp :float] :gate [dff :float] :up [dff :float] :hh [dffp :float]
-     :down [d :float] :down2 [d :float] :fh [dp :float]
+     :at [qd :float] :o [d :float] :o2 [d :float] :xmid [d :float]
+     :f [d :float] :gate [dff :float] :up [dff :float] :hh [dff :float]
+     :down [d :float] :down2 [d :float] :fh [d :float]
      :qinp [(quot dp 4) :int] :qins [nsb-d :float] :qinb [(quot dp 32) :int]
      :qap [(quot qdp 4) :int] :qas [nsb-qd :float] :qab [(quot qdp 32) :int]
      :qfp [(quot dp 4) :int] :qfs [nsb-d :float] :qfb [(quot dp 32) :int]
@@ -616,7 +622,8 @@
                                   #(head-node-id (:n-layers m) %)
                                   {"eps" (:eps m)})
         tail (descriptor-instance :decode-tail tail-prog keyword
-                                  {"vocab" (long (:vocab m))
+                                  {"nrows" 1
+                                   "vocab" (long (:vocab m))
                                    "d" (long (:d-model m))})
         plan (external-plan :resident-decode device-id specs
                             (into layers [head tail])
@@ -658,7 +665,8 @@
                                       #(head-node-id (:n-layers m) %)
                                       {"eps" (:eps m)})
             tail (descriptor-instance :decode-tail tail-prog keyword
-                                      {"vocab" (long (:vocab m))
+                                      {"nrows" 1
+                                       "vocab" (long (:vocab m))
                                        "d" (long (:d-model m))})
             final-residual (keyword (str "r" (:n-layers m)))
             head-tail-plan (external-plan :resident-decode-head-tail
@@ -801,9 +809,9 @@
         layer-args (scalar-args layer-prog {"eps" eps "theta" (:rope-global m) "scale" scale})
         prog-alloc-specs (into {}
                            (for [l (range (:n-layers m))
-                                 {:keys [sym size-fn]} (:allocs layer-prog)]
+                                 {:keys [sym dtype size-fn]} (:allocs layer-prog)]
                              [(keyword (str "L" l "_" (name sym)))
-                              [:float (long (size-fn layer-args)) nil :scratch]]))
+                              [dtype (long (size-fn layer-args)) nil :scratch]]))
         all-specs (merge specs prog-alloc-specs)
         roles (into {} (map (fn [[k v]] [k (nth v 3 :scratch)]) all-specs))
         sess (gpu/make-session device-id)]
@@ -929,7 +937,9 @@
         head-prog  (compile-resident-or-throw head-var device-id "head")
         tail-prog  (compile-resident-or-throw #'decode-tail! device-id "decode-tail!")
         layer-partition (layer-step-partition layer-prog)
-        tail-args  (scalar-args tail-prog {"vocab" (long (:vocab m)) "d" (long (:d-model m))})
+        tail-args  (scalar-args tail-prog {"nrows" 1
+                                           "vocab" (long (:vocab m))
+                                           "d" (long (:d-model m))})
         qw (or qw (gpu-quantize m))
         steer-specs (when steer?
                       (into {} (for [l (range (:n-layers m))]
@@ -940,25 +950,25 @@
                      {:emb    [:float (* (long (:vocab m)) (long (:d-model m)))
                                (prescaled-embed m) :constant]
                       :tokbuf [:int 1 nil :output]})
-        ;; A program's :allocs are compiler-introduced scratch — Stage A's reduce-result ss__rbuf
-        ;; 1-elem buffers. These must be PER-LAYER (matching layer-node-id's L{l}_… identity for
-        ;; __rbuf), not shared, to avoid cross-layer write-after-read hazards. Size-fns are
-        ;; constant, so any layer's scalar arguments suffice.
+        ;; A program's :allocs are typed compiler-introduced scratch. They must be PER-LAYER
+        ;; (matching layer-node-id's L{l}_… identity), not shared, to avoid cross-layer
+        ;; write-after-read hazards. Size-fns are constant, so any layer's scalar arguments
+        ;; suffice. Argmax adds both float values and int indices here.
         layer-alloc-args (scalar-args layer-prog {"eps" eps "theta" (:rope-local m) "scale" scale
                                                   "maxpos" (long maxpos)})
         prog-alloc-specs (into {}
                            (concat
                             (for [l (range (:n-layers m))
-                                  {:keys [sym size-fn]} (:allocs layer-prog)]
+                                  {:keys [sym dtype size-fn]} (:allocs layer-prog)]
                               [(keyword (str "L" l "_" (name sym)))
-                               [:float (long (size-fn layer-alloc-args)) nil :scratch]])
-                            (for [{:keys [sym size-fn]} (:allocs head-prog)]
+                               [dtype (long (size-fn layer-alloc-args)) nil :scratch]])
+                            (for [{:keys [sym dtype size-fn]} (:allocs head-prog)]
                               [(keyword (name sym))
-                               [:float (long (size-fn (scalar-args head-prog {"eps" eps})))
+                               [dtype (long (size-fn (scalar-args head-prog {"eps" eps})))
                                 nil :scratch]])
-                            (for [{:keys [sym size-fn]} (:allocs tail-prog)]
+                            (for [{:keys [sym dtype size-fn]} (:allocs tail-prog)]
                               [(keyword (name sym))
-                               [:float (long (size-fn tail-args)) nil :scratch]])))
+                               [dtype (long (size-fn tail-args)) nil :scratch]])))
         all-specs (merge specs prog-alloc-specs)
         alloc-specs (into {} (map (fn [[k v]] [k (vec (take 3 v))]) all-specs))
         roles (into {} (map (fn [[k v]] [k (nth v 3 :scratch)]) all-specs))

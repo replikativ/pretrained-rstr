@@ -6,6 +6,19 @@
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-launch :as launch]))
 
+(deftest resident-tail-selects-and-gathers-each-row-deterministically
+  (let [nan Float/NaN
+        logits (float-array [1.0 5.0 5.0 2.0
+                             9.0 nan 8.0 nan])
+        embedding (float-array [0.0 10.0, 1.0 11.0, 2.0 12.0, 3.0 13.0])
+        tokens (int-array 2)
+        next-residual (float-array 4)]
+    (decoder-gpu/decode-tail! logits embedding tokens next-residual 2 4 2)
+    (is (= [1 1] (vec tokens))
+        "ties and multiple NaNs both select the lowest matching column")
+    (is (= [1.0 11.0 1.0 11.0] (vec next-residual))
+        "each selected token gathers one complete embedding row")))
+
 (defn- step
   [phase reads write & {:keys [inout?]}]
   (let [kernel-name (str/replace (name phase) "-" "_")
