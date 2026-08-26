@@ -169,12 +169,13 @@ promotes the chunks to a second worker, mmaps them, and restarts that worker:
 (distributed/run-minio-smoke!)
 ```
 
-`open-authority!`, `open-worker!`, `checkpoint-gpu-prefix!`, and
-`restore-gpu-prefix!` expose the same stages for a bound model. The source phase
-returns a small serializable manifest for the destination phase. Concurrent
-workers should run in separate JVMs; the smoke turns them over sequentially
-because distributed-scope intentionally keeps one in-process route per remote
-peer.
+`open-authority!` and `open-worker!` expose the topology. Contiguous model state
+uses `checkpoint-gpu-prefix!` / `restore-gpu-prefix!`; the paged executor uses
+`checkpoint-paged-prefix!` / `restore-paged-prefix!`. Both source phases return
+the same small serializable manifest and both destination phases report
+token-exact resumed output. Concurrent workers should run in separate JVMs; the
+smoke turns them over sequentially because distributed-scope intentionally keeps
+one in-process route per remote peer.
 
 ```clojure
 (require '[konserve.tiered :as tiered]

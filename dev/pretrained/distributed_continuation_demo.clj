@@ -22,6 +22,7 @@
             [pretrained.continuation.chunk-store :as chunk-store]
             [pretrained.continuation.gpu :as continuation-gpu]
             [pretrained.continuation.manager :as manager]
+            [pretrained.continuation.paged-decoder :as paged-decoder]
             [pretrained.continuation.placement :as placement]
             [pretrained.continuation.replica :as replica]
             [superv.async :refer [<?? S]])
@@ -422,3 +423,83 @@
                  :restore (milliseconds promotion-done restore-done)
                  :decode (milliseconds restore-done complete)}
      :cache-stats (manager/stats (:cache destination))}))
+
+(defn checkpoint-paged-prefix!
+  "Checkpoint a paged prompt and return a serializable destination manifest.
+
+  `decoder` is a worker-local paged decoder. `opts` requires
+  `:model-fingerprint` and accepts `:continuation-id` plus `:tail-tokens`
+  (default 1). Prompt priming computes K/V through the penultimate token, the
+  asynchronous capture publishes that exact prefix, and reference generation
+  then continues on the same resident route."
+  [^Worker source decoder prompt-ids
+   {:keys [model-fingerprint continuation-id tail-tokens]
+    :or {continuation-id :source-continuation tail-tokens 1}}]
+  (when-not (string? model-fingerprint)
+    (throw (ex-info "checkpoint-paged-prefix! requires a model fingerprint" {})))
+  (let [prompt-ids (vec prompt-ids)
+        started (System/nanoTime)
+        _ (paged-decoder/prime-prompt! decoder continuation-id prompt-ids)
+        ticket (manager/checkpoint-paged-chunks-async!
+                (:cache source) (:pool decoder) continuation-id
+                model-fingerprint prompt-ids)
+        _ (when-not (:accepted? ticket)
+            (throw (ex-info "Source paged checkpoint was rejected" {})))
+        submitted (System/nanoTime)
+        captured (.get ^CompletableFuture (:captured ticket) 120 TimeUnit/SECONDS)
+        capture-done (System/nanoTime)
+        published (.get ^CompletableFuture (:published ticket) 120 TimeUnit/SECONDS)
+        publish-done (System/nanoTime)
+        reference-tokens (paged-decoder/generate!
+                          decoder continuation-id prompt-ids tail-tokens)
+        complete (System/nanoTime)
+        milliseconds (fn [a b] (/ (- b a) 1.0e6))
+        manifest-keys [:chunk/index :chunk/start :chunk/token-count
+                       :chunk/parent-hash :chunk/prefix-hash :store-key :bytes]]
+    {:model-fingerprint model-fingerprint
+     :prompt-ids prompt-ids
+     :tail-tokens (long tail-tokens)
+     :reference-tokens reference-tokens
+     :manifest (mapv #(select-keys % manifest-keys) published)
+     :chunks (count captured)
+     :timing-ms {:source-prefill+submit (milliseconds started submitted)
+                 :capture (milliseconds submitted capture-done)
+                 :backend+catalog (milliseconds capture-done publish-done)
+                 :reference-decode (milliseconds publish-done complete)}
+     :cache-stats (manager/stats (:cache source))}))
+
+(defn restore-paged-prefix!
+  "Promote, restore, and resume a paged checkpoint on another worker.
+
+  The destination decoder owns a distinct worker-local GPU page pool. `opts`
+  accepts its `:continuation-id`; tensor chunks move through the shared object
+  store and local mmap frontend, while only the catalog and placement facts go
+  through Kabel/Datahike."
+  ([^Worker destination decoder checkpoint]
+   (restore-paged-prefix! destination decoder checkpoint
+                          {:continuation-id :destination-continuation}))
+  ([^Worker destination decoder checkpoint {:keys [continuation-id]
+                                             :or {continuation-id
+                                                  :destination-continuation}}]
+   (let [{:keys [model-fingerprint prompt-ids tail-tokens
+                 reference-tokens manifest]} checkpoint
+         started (System/nanoTime)
+         replicas (request-prefix! destination model-fingerprint manifest)
+         promotion-done (System/nanoTime)
+         restored (manager/restore-paged-prefix!
+                   (:cache destination) (:pool decoder) continuation-id
+                   model-fingerprint prompt-ids)
+         restore-done (System/nanoTime)
+         resumed-tokens (paged-decoder/generate!
+                         decoder continuation-id prompt-ids tail-tokens)
+         complete (System/nanoTime)
+         milliseconds (fn [a b] (/ (- b a) 1.0e6))]
+     {:token-exact? (= reference-tokens resumed-tokens)
+      :reference-tokens reference-tokens
+      :resumed-tokens resumed-tokens
+      :cached-token-count (:cached-token-count restored)
+      :replicas (count replicas)
+      :timing-ms {:promotion (milliseconds started promotion-done)
+                  :restore (milliseconds promotion-done restore-done)
+                  :decode (milliseconds restore-done complete)}
+      :cache-stats (manager/stats (:cache destination))})))
