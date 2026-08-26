@@ -278,6 +278,7 @@ neither scans kernel ABI names nor assembles raw compiler phase keys. Bind with
          '[pretrained.decoder-gpu :as decoder]
          '[pretrained.continuation.page-pool :as pages]
          '[pretrained.continuation.paged-decoder :as paged]
+         '[pretrained.continuation.worker :as worker]
          '[raster.gpu.core :as gpu])
 
 (def model (loader/from-pretrained "/models/gemma-3-270m-it"))
@@ -320,7 +321,7 @@ without copying K/V or activations through the host:
 (def batched-engine
   (paged/open! batched-state :page-size 16 :physical-pages 128))
 
-(paged/generate-batch!
+(worker/generate-continuously!
  batched-engine [:request-a :request-b]
  [(vec ((:encode tokenizer) (:tok tokenizer) "Paris is the capital of"))
   (vec ((:encode tokenizer) (:tok tokenizer) "Berlin is the capital of"))]
@@ -337,21 +338,16 @@ Inactive rows carry append slot `-1` and an empty attention route: they allocate
 no page, write no K/V, and their head result is ignored.
 
 ```clojure
-(require '[pretrained.continuation.scheduler :as scheduler])
-
-(def plan (scheduler/plan-decode-lanes 8 previous-lanes runnable-requests))
-(def submission (scheduler/decode-submission plan))
+(def iteration
+  (worker/run-decode-iteration!
+   engine previous-lanes runnable-requests :eos-ids eos-ids))
 
 ;; Protect these routes while restore/admission policy considers GPU victims.
-(:protected-continuation-ids submission)
-
-(paged/prime-lanes! engine (:prime-lanes submission))
-(def results (paged/step-lanes! engine (:lane-work submission)))
-(def iteration
-  (scheduler/complete-decode-iteration plan results {:eos-ids eos-ids}))
+(:protected-continuation-ids iteration)
 
 ;; Feed (:lanes iteration) back as previous-lanes and add queued requests.
 ;; (:completed iteration) is now eligible for async checkpoint/retention policy.
+(def next-ready (worker/next-ready-requests iteration new-arrivals))
 ```
 
 The fixed-batch prompt convenience API still requires equal missing suffix
