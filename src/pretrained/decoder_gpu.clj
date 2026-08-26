@@ -1137,6 +1137,31 @@
       (gpu/upload! (:sess dstate) :r0 rows))
     dstate))
 
+(defn prime-resident-lanes!
+  "Upload pending token embeddings only for selected fixed-batch lanes.
+
+  Each entry is `{:lane non-negative-int :token token-id}`. Lane identities
+  must be unique and less than the decode state's `:batch-size`; unspecified
+  rows remain resident, preserving the tail output for retained lanes. Returns
+  `dstate`."
+  [dstate lane-tokens]
+  (let [lane-tokens (vec lane-tokens)
+        batch-size (long (:batch-size dstate 1))
+        d (long (get-in dstate [:model :d-model]))
+        lanes (mapv :lane lane-tokens)]
+    (when-not (and (= (count lanes) (count (set lanes)))
+                   (every? #(and (integer? %) (<= 0 (long %) (dec batch-size))) lanes))
+      (throw (ex-info "Resident token lanes are invalid for the bound decoder"
+                      {:batch-size batch-size :lanes lanes})))
+    (when (seq lane-tokens)
+      (gpu/upload-ranges!
+       (:sess dstate)
+       (mapv (fn [{:keys [lane token]}]
+               [:r0 (embed-row (:model dstate) token)
+                {:dst-element (* (long lane) d) :elements d}])
+             lane-tokens)))
+    dstate))
+
 (defn resident-step!
   "Process the token currently resident in `r0` at absolute `pos`.
 

@@ -329,10 +329,34 @@ without copying K/V or activations through the host:
 ;;     [token-b0 token-b1 token-b2 token-b3]]
 ```
 
-The graph capacity is fixed when it is compiled. The current batch convenience
-API requires equal missing prompt-suffix lengths and keeps every lane active;
-refilling retired/EOS lanes from the scheduler is the next continuous-batching
-step. Durable chunks restore through `restore-paged-prefix!`. Newly generated
+The graph capacity is fixed when it is compiled, but occupancy is dynamic.
+`plan-decode-lanes` retains runnable requests in their existing rows so the
+next-token embedding produced by the device tail stays resident. It fills only
+vacancies, and `prime-lanes!` uploads embeddings only for those new occupants.
+Inactive rows carry append slot `-1` and an empty attention route: they allocate
+no page, write no K/V, and their head result is ignored.
+
+```clojure
+(require '[pretrained.continuation.scheduler :as scheduler])
+
+(def plan (scheduler/plan-decode-lanes 8 previous-lanes runnable-requests))
+(def submission (scheduler/decode-submission plan))
+
+;; Protect these routes while restore/admission policy considers GPU victims.
+(:protected-continuation-ids submission)
+
+(paged/prime-lanes! engine (:prime-lanes submission))
+(def results (paged/step-lanes! engine (:lane-work submission)))
+(def iteration
+  (scheduler/complete-decode-iteration plan results {:eos-ids eos-ids}))
+
+;; Feed (:lanes iteration) back as previous-lanes and add queued requests.
+;; (:completed iteration) is now eligible for async checkpoint/retention policy.
+```
+
+The fixed-batch prompt convenience API still requires equal missing suffix
+lengths; mixed prefill/decode packing remains separate scheduler work. Durable
+chunks restore through `restore-paged-prefix!`. Newly generated
 paged routes enter the same Hasch-chain/Konserve/Datahike pipeline through
 `checkpoint-paged-chunks-async!`: capture leases an immutable route snapshot,
 gathers arbitrary physical page spans on the bounded worker, and publishes only

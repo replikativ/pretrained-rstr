@@ -353,27 +353,71 @@
   (decoder-gpu/prime-resident-tokens! (:decode-state decoder) tokens)
   decoder)
 
-(defn step-batch!
-  "Process one resident token for every continuation in a fixed decode batch.
+(defn prime-lanes!
+  "Upload pending token embeddings only for newly occupied decode lanes.
 
-  `continuation-ids` and `positions` must each have the decoder's bound batch
-  size and retain lane order. Every position must extend its route. The complete
-  batch reserves, executes, and publishes atomically with respect to logical
-  route lengths; on failure all still-pending reservations are aborted. Returns
-  the next greedy token id for each lane in the same order."
-  [decoder continuation-ids positions]
+  Entries are `{:lane index :token token-id}`. Rows omitted from `lane-tokens`
+  remain untouched, so continuations retained across iterations keep the next
+  embedding produced by the resident decoder tail. Returns `decoder`."
+  [decoder lane-tokens]
+  (require-open! decoder)
+  (decoder-gpu/prime-resident-lanes! (:decode-state decoder) lane-tokens)
+  decoder)
+
+(defn- checked-active-lanes
+  [decoder lane-work]
+  (let [batch-size (long (:batch-size (:decode-state decoder) 1))
+        lane-work (->> lane-work
+                       (mapv #(update % :position long))
+                       (sort-by :lane)
+                       vec)
+        lanes (mapv :lane lane-work)
+        continuation-ids (mapv :continuation-id lane-work)]
+    (when-not (seq lane-work)
+      (throw (ex-info "Paged execution requires at least one active lane" {})))
+    (when-not (and (every? #(and (integer? %) (<= 0 (long %) (dec batch-size))) lanes)
+                   (= (count lanes) (count (set lanes))))
+      (throw (ex-info "Active decode lanes are invalid for the bound decoder"
+                      {:batch-size batch-size :lanes lanes})))
+    (when (or (some nil? continuation-ids)
+              (not= (count continuation-ids) (count (set continuation-ids))))
+      (throw (ex-info "Active decode continuation identities must be unique"
+                      {:continuation-ids continuation-ids})))
+    lane-work))
+
+(defn- scatter-route-values
+  [batch-size pages-per-sequence lanes route-values]
+  (let [page-table (int-array (* batch-size pages-per-sequence) -1)
+        lengths (int-array batch-size)
+        start-positions (int-array batch-size)
+        compact-pages ^ints (:page-table route-values)
+        compact-lengths ^ints (:lengths route-values)
+        compact-starts ^ints (:start-positions route-values)]
+    (doseq [[source-row lane] (map-indexed vector lanes)]
+      (System/arraycopy compact-pages (* (long source-row) pages-per-sequence)
+                        page-table (* (long lane) pages-per-sequence)
+                        pages-per-sequence)
+      (aset lengths (int lane) (aget compact-lengths source-row))
+      (aset start-positions (int lane) (aget compact-starts source-row)))
+    {:page-table page-table
+     :lengths lengths
+     :start-positions start-positions}))
+
+(defn step-lanes!
+  "Advance any nonempty subset of a fixed paged decode batch.
+
+  Each work item is `{:lane index :continuation-id id :position absolute-pos}`.
+  Active routes reserve and publish one K/V row; inactive lanes receive append
+  slot `-1` and an empty attention route, so they consume no pages and mutate no
+  continuation. Results are lane-ordered maps with an added `:token`."
+  [decoder lane-work]
   (require-open! decoder)
   (let [{:keys [sess batch-size]} (:decode-state decoder)
         batch-size (long (or batch-size 1))
-        continuation-ids (vec continuation-ids)
-        positions (mapv long positions)]
-    (when-not (and (= batch-size (count continuation-ids))
-                   (= batch-size (count positions)))
-      (throw (ex-info "Paged step does not match the bound decode batch"
-                      {:batch-size batch-size
-                       :continuation-count (count continuation-ids)
-                       :position-count (count positions)})))
-    (doseq [[continuation-id position] (map vector continuation-ids positions)]
+        lane-work (checked-active-lanes decoder lane-work)
+        lanes (mapv :lane lane-work)
+        continuation-ids (mapv :continuation-id lane-work)]
+    (doseq [{:keys [continuation-id position]} lane-work]
       (let [route (or (page-pool/route (:pool decoder) continuation-id)
                       (throw (ex-info "Continuation is not resident"
                                       {:continuation-id continuation-id})))
@@ -394,33 +438,69 @@
         (let [entries (paged-append/reservation-entries batch)
               lease (page-pool/acquire-prospective-lease! (:pool decoder) entries)]
           (try
-            (let [route-values
+            (let [compact-route-values
                   (page-pool/leased-dense-route-values
                    (:pool decoder) lease
                    {:pages-per-sequence (:pages-per-sequence decoder)})
+                  route-values
+                  (scatter-route-values batch-size (:pages-per-sequence decoder)
+                                        lanes compact-route-values)
+                  slots (int-array batch-size -1)
+                  positions (int-array batch-size)
+                  compact-slots ^ints (paged-append/slot-values batch)
                   keys (:descriptor-keys decoder)]
+              (doseq [[source-row {:keys [lane position]}]
+                      (map-indexed vector lane-work)]
+                (aset slots (int lane) (aget compact-slots source-row))
+                (aset positions (int lane) (int position)))
               (gpu/upload-ranges!
                sess
-               [[(:slots keys) (paged-append/slot-values batch)
-                 {:elements batch-size}]
+               [[(:slots keys) slots {:elements batch-size}]
                 [(:row-offsets keys) (int-array (range (inc batch-size)))
                  {:elements (inc batch-size)}]
-                [(:positions keys) (int-array positions) {:elements batch-size}]
+                [(:positions keys) positions {:elements batch-size}]
                 [(:page-table keys) (:page-table route-values)
                  {:elements (alength ^ints (:page-table route-values))}]
                 [(:lengths keys) (:lengths route-values)
-                 {:elements (alength ^ints (:lengths route-values))}]
+                 {:elements batch-size}]
                 [(:start-positions keys) (:start-positions route-values)
-                 {:elements (alength ^ints (:start-positions route-values))}]])
+                 {:elements batch-size}]])
               (gpu-link/run! (:executable decoder)))
             (finally
               (page-pool/release-lease! (:pool decoder) lease))))
         (paged-append/commit-batch! batch)
-        (mapv long (gpu/download sess :tokbuf))
+        (let [tokens ^ints (gpu/download sess :tokbuf)]
+          (mapv #(assoc % :token (long (aget tokens (int (:lane %))))) lane-work))
         (catch Throwable error
           (when (= :reserved @(:state batch))
             (paged-append/abort-batch! batch))
           (throw error))))))
+
+(defn step-batch!
+  "Process one resident token for every continuation in a fixed decode batch.
+
+  `continuation-ids` and `positions` must each have the decoder's bound batch
+  size and retain lane order. Every position must extend its route. The complete
+  batch reserves, executes, and publishes atomically with respect to logical
+  route lengths; on failure all still-pending reservations are aborted. Returns
+  the next greedy token id for each lane in the same order."
+  [decoder continuation-ids positions]
+  (let [{:keys [batch-size]} (:decode-state decoder)
+        batch-size (long (or batch-size 1))
+        continuation-ids (vec continuation-ids)
+        positions (mapv long positions)]
+    (when-not (and (= batch-size (count continuation-ids))
+                   (= batch-size (count positions)))
+      (throw (ex-info "Paged step does not match the bound decode batch"
+                      {:batch-size batch-size
+                       :continuation-count (count continuation-ids)
+                       :position-count (count positions)})))
+    (mapv :token
+          (step-lanes!
+           decoder
+           (mapv (fn [lane continuation-id position]
+                   {:lane lane :continuation-id continuation-id :position position})
+                 (range batch-size) continuation-ids positions)))))
 
 (defn step!
   "Process the resident input token and append one K/V row atomically.
