@@ -115,6 +115,11 @@ continuation boundary as uninterrupted inference.
 ;; dstate is a bound pretrained.decoder-gpu state; prompt-ids is a token vector.
 (bench/benchmark-gpu-prefix! manager dstate fingerprint prompt-ids
                              {:warmups 1 :iterations 5})
+
+;; For a paged decoder, includes mmap/scatter and exact suffix completion:
+(bench/benchmark-paged-prefix! manager engine fingerprint prompt-ids
+                               {:warmups 1 :iterations 5
+                                :probe-prompt-ids partially-matching-ids})
 ```
 
 The benchmark separates prefill, checkpoint submission/drain, first measured

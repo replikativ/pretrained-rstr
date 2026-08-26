@@ -7,7 +7,9 @@
   cold-SSD measurement."
   (:require [pretrained.continuation :as continuation]
             [pretrained.continuation.gpu :as continuation-gpu]
-            [pretrained.continuation.manager :as manager])
+            [pretrained.continuation.manager :as manager]
+            [pretrained.continuation.page-pool :as page-pool]
+            [pretrained.continuation.paged-decoder :as paged-decoder])
   (:import [java.util.concurrent CompletableFuture]))
 
 (defn- timed
@@ -113,6 +115,82 @@
              :speedup {:first-measured (/ prefill-median first-ms)
                        :warm (/ prefill-median warm-median)}
              :cache-stats (manager/stats cache)}
+      probe (assoc :probe probe))))
+
+(defn benchmark-paged-prefix!
+  "Benchmark paged prompt computation against durable prefix restoration.
+
+  The cache manager and paged decoder must already be open. Every sample uses a
+  fresh continuation identity and releases its route afterwards. Restore timing
+  includes mmap/scatter plus `prime-prompt!`, so a partial hit also measures
+  computation of the exact uncached suffix. Checkpoint submission, local
+  capture, and durable publication remain separately visible."
+  [cache decoder model-fingerprint prompt-ids
+   {:keys [iterations warmups probe-prompt-ids]
+    :or {iterations 5 warmups 1}}]
+  (let [pool (:pool decoder)
+        prompt-ids (vec prompt-ids)
+        with-route
+        (fn [operation]
+          (let [continuation-id (random-uuid)]
+            (try
+              (operation continuation-id)
+              (finally
+                (when (page-pool/route pool continuation-id)
+                  (page-pool/release-route! pool continuation-id))))))
+        prefill-operation
+        #(with-route (fn [continuation-id]
+                       (paged-decoder/prime-prompt! decoder continuation-id prompt-ids)))
+        _ (prefill-operation)
+        prefill (measure! prefill-operation
+                          {:iterations iterations :warmups warmups})
+        source-id (random-uuid)
+        _ (paged-decoder/prime-prompt! decoder source-id prompt-ids)
+        checkpoint
+        (let [submission
+              (timed #(accepted-ticket!
+                       (manager/checkpoint-paged-chunks-async!
+                        cache pool source-id model-fingerprint prompt-ids)))
+              ticket (:value submission)
+              capture (timed #(.get ^CompletableFuture (:captured ticket)))
+              publication (timed #(.get ^CompletableFuture (:published ticket)))]
+          {:submission-ms (:milliseconds submission)
+           :capture-drain-ms (:milliseconds capture)
+           :publication-drain-ms (:milliseconds publication)
+           :chunks (count (:value capture))
+           :stored-bytes (reduce + 0 (map :bytes (:value capture)))})
+        _ (page-pool/release-route! pool source-id)
+        restore-ready
+        (fn [tokens]
+          (with-route
+            (fn [continuation-id]
+              (let [restored (manager/restore-paged-prefix!
+                              cache pool continuation-id model-fingerprint tokens)]
+                (paged-decoder/prime-prompt! decoder continuation-id tokens)
+                restored))))
+        restore #(restore-ready prompt-ids)
+        first-restore (timed restore)
+        warm-restore (measure! restore {:iterations iterations :warmups warmups})
+        prefill-median (:median-ms prefill)
+        first-ms (:milliseconds first-restore)
+        warm-median (:median-ms warm-restore)
+        probe
+        (when probe-prompt-ids
+          (let [probe-prompt-ids (vec probe-prompt-ids)
+                result (timed #(restore-ready probe-prompt-ids))]
+            {:milliseconds (:milliseconds result)
+             :cached-token-count (get-in result [:value :cached-token-count])
+             :processed-token-count (dec (count probe-prompt-ids))
+             :speedup-vs-prefill (/ prefill-median (:milliseconds result))}))]
+    (cond->
+     {:prompt {:logical-token-count (count prompt-ids)
+               :processed-token-count (dec (count prompt-ids))}
+      :checkpoint checkpoint
+      :prefill prefill
+      :restore {:first-measured-ms first-ms :warm warm-restore}
+      :speedup {:first-measured (/ prefill-median first-ms)
+                :warm (/ prefill-median warm-median)}
+      :cache-stats (manager/stats cache)}
       probe (assoc :probe probe))))
 
 (defn benchmark-cpu-snapshot!
