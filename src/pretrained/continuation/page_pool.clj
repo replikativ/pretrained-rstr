@@ -52,6 +52,67 @@
     0
     (inc (quot (dec token-count) page-size))))
 
+(defn- transfer-runs
+  [resident-route start token-count page-size]
+  (loop [relative-token 0
+         runs []]
+    (if (= relative-token token-count)
+      runs
+      (let [logical-token (+ start relative-token)
+            logical-page (quot logical-token page-size)
+            offset-in-page (rem logical-token page-size)
+            physical-page (nth (:pages resident-route) logical-page)
+            run-tokens (min (- token-count relative-token)
+                            (- page-size offset-in-page))
+            physical-token (+ (* physical-page page-size) offset-in-page)
+            previous (peek runs)]
+        (if (and previous
+                 (= physical-token
+                    (+ (:physical-token previous) (:token-count previous))))
+          (recur (+ relative-token run-tokens)
+                 (update-in runs [(dec (count runs)) :token-count] + run-tokens))
+          (recur (+ relative-token run-tokens)
+                 (conj runs {:relative-token relative-token
+                             :physical-token physical-token
+                             :token-count run-tokens})))))))
+
+(defn- record-transfer!
+  [pool measurement]
+  (let [counter-key [(:direction measurement)
+                     (:timing-source measurement)
+                     (boolean (:asynchronous? measurement))]]
+    (swap! (:state pool)
+           (fn [state]
+             (-> state
+                 (assoc-in [:transfers :last] measurement)
+                 (update-in [:transfers :counters counter-key :submissions]
+                            (fnil inc 0))
+                 (update-in [:transfers :counters counter-key :bytes]
+                            (fnil + 0) (long (:bytes measurement 0)))
+                 (update-in [:transfers :counters counter-key :commands]
+                            (fnil + 0) (long (:commands measurement 0)))
+                 (update-in [:transfers :counters counter-key :elapsed-ns]
+                            (fnil + 0) (long (:elapsed-ns measurement 0)))
+                 (update-in [:transfers :counters counter-key :submit-host-ns]
+                            (fnil + 0) (long (:submit-host-ns measurement 0)))
+                 (update-in [:transfers :counters counter-key :host-wall-ns]
+                            (fnil + 0) (long (:host-wall-ns measurement 0))))))))
+
+(defn- transfer-ranges-measured!
+  [pool direction entries]
+  (let [session (:session pool)
+        event ((case direction
+                 :upload gpu/submit-upload-ranges!
+                 :download gpu/submit-download-ranges!)
+               session entries)]
+    (try
+      (let [value (gpu/await-event! session event)
+            measurement (gpu/event-measurement session event)]
+        (record-transfer! pool measurement)
+        value)
+      (finally
+        (gpu/release-event! session event)))))
+
 (defn- buffer-key
   [prefix slab layer]
   (keyword (str prefix "-" (name (:name slab)) "-" (long layer))))
@@ -112,7 +173,8 @@
        (atom {:free (apply sorted-set (range physical-pages))
               :refcounts {}
               :leases {}
-              :routes {}})))))
+              :routes {}
+              :transfers {:counters {} :last nil}})))))
 
 (defn buffer-keys
   "Return `{[slab-name layer] session-buffer-key}` for `pool`."
@@ -177,6 +239,15 @@
      :shared-pages (count (filter #(> % 1) (vals refcounts)))
      :resident-routes (count routes)
      :active-leases (count leases)}))
+
+(defn transfer-stats
+  "Return cumulative measured cache-transfer counters and the last measurement.
+
+  Counters are keyed by `[direction timing-source asynchronous?]`, preserving
+  the distinction between device-event timings and inline host-coherent copies.
+  Values are immutable snapshots suitable for metrics and benchmark reports."
+  [pool]
+  (or (:transfers @(:state pool)) {:counters {} :last nil}))
 
 (defn- take-free-pages
   [state n continuation-id]
@@ -408,6 +479,19 @@
                         :shape [elements]
                         :id [key physical-page]}))))
 
+(defn- token-range-view
+  [pool slab layer physical-token token-count]
+  (let [key (get (:buffer-keys pool) [(:name slab) layer])
+        per-token (:elements-per-token slab)
+        elements (checked-product :token-range [token-count per-token])
+        element-offset (checked-product :token-range-offset
+                                        [physical-token per-token])
+        element-bytes (case (:dtype pool) :half 2 :float 4)]
+    (gpu/buffer-view (:session pool) key
+                     {:byte-offset (* element-offset element-bytes)
+                      :shape [elements]
+                      :id [key physical-token token-count]})))
+
 (defn- copy-page!
   [pool source-page destination-page]
   (doseq [slab (:slabs (:layout pool))
@@ -624,32 +708,23 @@
                       {:pool-dtype (:dtype pool)})))
     (let [source (half-payload payload source-dtype expected-elements)
           slab-by-name (into {} (map (juxt :name identity)) (:slabs (:layout pool)))
+          runs (transfer-runs resident-route start token-count (:page-size pool))
           entries
           (vec
            (mapcat
             (fn [{:keys [slab layer element-offset]}]
               (let [slab-layout (get slab-by-name slab)
                     per-token (:elements-per-token slab-layout)]
-                (loop [relative-token 0
-                       transfers []]
-                  (if (= relative-token token-count)
-                    transfers
-                    (let [logical-token (+ start relative-token)
-                          logical-page (quot logical-token (:page-size pool))
-                          offset-in-page (rem logical-token (:page-size pool))
-                          physical-page (nth (:pages resident-route) logical-page)
-                          transfer-tokens (min (- token-count relative-token)
-                                               (- (:page-size pool) offset-in-page))]
-                      (recur
-                       (+ relative-token transfer-tokens)
-                       (conj transfers
-                             [(page-view pool slab layer physical-page)
-                              source
-                              {:src-element (+ element-offset (* relative-token per-token))
-                               :dst-element (* offset-in-page per-token)
-                               :elements (* transfer-tokens per-token)}])))))))
+                (mapv
+                 (fn [{:keys [relative-token physical-token token-count]}]
+                   [(token-range-view pool slab-layout layer physical-token token-count)
+                    source
+                    {:src-element (+ element-offset (* relative-token per-token))
+                     :dst-element 0
+                     :elements (* token-count per-token)}])
+                 runs)))
             plan))]
-      (gpu/upload-ranges! (:session pool) entries)
+      (transfer-ranges-measured! pool :upload entries)
       resident-route)))
 
 (defn export-chunk
@@ -685,33 +760,23 @@
             halfs (short-array payload-elements)
             slab-by-name (into {} (map (juxt :name identity))
                                (:slabs (:layout pool)))
+            runs (transfer-runs resident-route start token-count (:page-size pool))
             entries
             (vec
              (mapcat
               (fn [{:keys [slab layer element-offset]}]
                 (let [slab-layout (get slab-by-name slab)
                       per-token (:elements-per-token slab-layout)]
-                  (loop [relative-token 0
-                         transfers []]
-                    (if (= relative-token token-count)
-                      transfers
-                      (let [logical-token (+ start relative-token)
-                            logical-page (quot logical-token (:page-size pool))
-                            offset-in-page (rem logical-token (:page-size pool))
-                            physical-page (nth (:pages resident-route) logical-page)
-                            transfer-tokens (min (- token-count relative-token)
-                                                 (- (:page-size pool) offset-in-page))]
-                        (recur
-                         (+ relative-token transfer-tokens)
-                         (conj transfers
-                               [(page-view pool slab layer physical-page)
-                                halfs
-                                {:src-element (* offset-in-page per-token)
-                                 :dst-element (+ element-offset
-                                                 (* relative-token per-token))
-                                 :elements (* transfer-tokens per-token)}])))))))
+                  (mapv
+                   (fn [{:keys [relative-token physical-token token-count]}]
+                     [(token-range-view pool slab-layout layer physical-token token-count)
+                      halfs
+                      {:src-element 0
+                       :dst-element (+ element-offset (* relative-token per-token))
+                       :elements (* token-count per-token)}])
+                   runs)))
               plan))]
-        (gpu/download-ranges! (:session pool) entries)
+        (transfer-ranges-measured! pool :download entries)
         (let [durable-layout (assoc (:layout pool)
                                     :dtype :float16
                                     :byte-order :little-endian)]

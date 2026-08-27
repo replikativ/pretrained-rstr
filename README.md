@@ -133,6 +133,13 @@ cold SSD. The continuation benchmark additionally separates prefix loading,
 uncached suffix completion, first-token latency, and steady decode. Each raw
 decode sample records its absolute position and visible context size, providing
 a stable comparison for attention traversal and history-tiling schedules.
+Paged checkpoint and restore results also contain `:transfer` or
+`:prefix-transfer` counters keyed by
+`[direction timing-source asynchronous?]`. These report Raster's measured bytes,
+commands, device/host elapsed time, submission time, and wall time, keeping
+OpenCL event timing distinct from Level Zero host-coherent copies. Adjacent
+physical pages are submitted as one contiguous run per KV slab/layer; fragmented
+routes remain correct and produce one command per physical run.
 Chunk identities use Hasch and are published as Datahike
 `:db.type/store-ref` values, while the prefix hash separately identifies the
 causal token chain.

@@ -24,6 +24,37 @@
         index (min (dec n) (dec (long (Math/ceil (* fraction n)))))]
     (nth sorted-samples (max 0 index))))
 
+(defn- transfer-snapshot
+  [pool]
+  (when (page-pool/page-pool? pool)
+    (:counters (page-pool/transfer-stats pool))))
+
+(defn- transfer-difference
+  [before after]
+  (when (and before after)
+    {:counters
+     (into {}
+           (keep
+            (fn [counter-key]
+              (let [previous (get before counter-key {})
+                    current (get after counter-key {})
+                    delta (into {}
+                                (for [field [:submissions :bytes :commands :elapsed-ns
+                                             :submit-host-ns :host-wall-ns]]
+                                  [field (- (long (get current field 0))
+                                            (long (get previous field 0)))]))]
+                (when (pos? (:submissions delta)) [counter-key delta])))
+            (set (concat (keys before) (keys after)))))}))
+
+(defn- sum-transfer-differences
+  [differences]
+  {:counters
+   (reduce
+    (fn [totals difference]
+      (merge-with #(merge-with + %1 %2) totals (:counters difference)))
+    {}
+    differences)})
+
 (declare accepted-ticket!)
 
 (defn- summarize-ms
@@ -38,25 +69,33 @@
 
 (defn- checkpoint-paged!
   [cache pool continuation-id model-fingerprint prompt-ids]
-  (let [submission
+  (let [transfers-before (transfer-snapshot pool)
+        submission
         (timed #(accepted-ticket!
                  (manager/checkpoint-paged-chunks-async!
                   cache pool continuation-id model-fingerprint prompt-ids)))
         ticket (:value submission)
         capture (timed #(.get ^CompletableFuture (:captured ticket)))
-        publication (timed #(.get ^CompletableFuture (:published ticket)))]
-    {:submission-ms (:milliseconds submission)
-     :capture-drain-ms (:milliseconds capture)
-     :publication-drain-ms (:milliseconds publication)
-     :chunks (count (:value capture))
-     :stored-bytes (reduce + 0 (map :bytes (:value capture)))}))
+        publication (timed #(.get ^CompletableFuture (:published ticket)))
+        transfer (transfer-difference transfers-before (transfer-snapshot pool))]
+    (cond->
+     {:submission-ms (:milliseconds submission)
+      :capture-drain-ms (:milliseconds capture)
+      :publication-drain-ms (:milliseconds publication)
+      :chunks (count (:value capture))
+      :stored-bytes (reduce + 0 (map :bytes (:value capture)))}
+      transfer (assoc :transfer transfer))))
 
 (defn- continuation-sample!
   [decoder prompt-ids decode-tokens restore!]
   (let [pool (:pool decoder)
         continuation-id (random-uuid)]
     (try
-      (let [restore (when restore! (timed #(restore! continuation-id)))
+      (let [transfers-before (when restore! (transfer-snapshot pool))
+            restore (when restore! (timed #(restore! continuation-id)))
+            transfer (when restore!
+                       (transfer-difference transfers-before
+                                            (transfer-snapshot pool)))
             completion (timed #(paged-decoder/prime-prompt!
                                 decoder continuation-id prompt-ids))
             steps
@@ -89,7 +128,9 @@
           restore
           (assoc :prefix-load-ms restore-ms
                  :cached-token-count
-                 (get-in restore [:value :cached-token-count]))))
+                 (get-in restore [:value :cached-token-count]))
+          transfer
+          (assoc :prefix-transfer transfer)))
       (finally
         (when (page-pool/route pool continuation-id)
           (page-pool/release-route! pool continuation-id))))))
@@ -99,7 +140,8 @@
   (dotimes [_ (long warmups)] (operation))
   (let [samples (mapv (fn [_] (operation)) (range (long iterations)))
         step-times (mapv :milliseconds (mapcat :steps samples))
-        decode-summary (summarize-ms step-times)]
+        decode-summary (summarize-ms step-times)
+        transfer-samples (vec (keep :prefix-transfer samples))]
     {:iterations (long iterations)
      :warmups (long warmups)
      :samples samples
@@ -110,7 +152,10 @@
                     :tokens-per-second (/ 1000.0 (:median-ms decode-summary)))
      :total (summarize-ms (mapv :total-ms samples))
      :prefix-load (when (every? :prefix-load-ms samples)
-                    (summarize-ms (mapv :prefix-load-ms samples)))}))
+                    (summarize-ms (mapv :prefix-load-ms samples)))
+     :prefix-transfer (when (seq transfer-samples)
+                        {:samples transfer-samples
+                         :totals (sum-transfer-differences transfer-samples)})}))
 
 (defn measure!
   "Measure a zero-argument operation after explicit warm-up iterations.

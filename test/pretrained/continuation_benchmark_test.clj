@@ -85,7 +85,17 @@
 
 (deftest paged-continuation-benchmark-records-restore-ttft-and-context-steps
   (let [resident (atom {})
-        completed (fn [value] (CompletableFuture/completedFuture value))]
+        transfers (atom {:counters {}})
+        completed (fn [value] (CompletableFuture/completedFuture value))
+        record-transfer!
+        (fn [direction]
+          (swap! transfers update-in
+                 [:counters [direction :device-event true]]
+                 #(merge-with +
+                              (or % {})
+                              {:submissions 1 :bytes 80 :commands 2
+                               :elapsed-ns 20 :submit-host-ns 3
+                               :host-wall-ns 25})))]
     (with-redefs [paged-decoder/prime-prompt!
                   (fn [_ continuation-id tokens]
                     (swap! resident update continuation-id
@@ -103,13 +113,17 @@
                     (let [present? (contains? @resident continuation-id)]
                       (swap! resident dissoc continuation-id)
                       present?))
+                  page-pool/page-pool? (constantly true)
+                  page-pool/transfer-stats (fn [_] @transfers)
                   manager/checkpoint-paged-chunks-async!
                   (fn [& _]
+                    (record-transfer! :download)
                     {:accepted? true
                      :captured (completed [{:bytes 80}])
                      :published (completed ::published)})
                   manager/restore-paged-prefix!
                   (fn [_ _ continuation-id _ tokens]
+                    (record-transfer! :upload)
                     (let [cached (dec (count tokens))]
                       (swap! resident assoc continuation-id
                              {:continuation-id continuation-id
@@ -130,6 +144,12 @@
                (mapv :token (:steps first-restored))))
         (is (= 6 (count (get-in result [:restored :warm :decode :samples-ms]))))
         (is (pos? (get-in result [:restored :warm :decode :tokens-per-second])))
+        (is (= 1 (get-in result
+                         [:checkpoint :transfer :counters
+                          [:download :device-event true] :submissions])))
+        (is (= 2 (get-in result
+                         [:restored :warm :prefix-transfer :totals :counters
+                          [:upload :device-event true] :submissions])))
         (is (= {:full-hits 4} (:cache-stats result)))
         (is (empty? @resident)
             "benchmark releases warmup, source, and measured routes")))))

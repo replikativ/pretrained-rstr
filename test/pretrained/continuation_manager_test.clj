@@ -252,7 +252,8 @@
                                  (map #(Float/floatToFloat16 (float %)) values))})))
                     gpu/buffer-view
                     (fn [_ key opts] {:key key :opts opts})
-                    gpu/upload-ranges!
+                    gpu/submit-upload-ranges! (fn [_ entries] entries)
+                    gpu/await-event!
                     (fn [_ entries]
                       (swap! uploads into
                              (mapv (fn [[view ^MemorySegment source
@@ -267,7 +268,12 @@
                                         (mapv #(Float/float16ToFloat %) values)
                                         spec]))
                                    entries))
-                      (mapv second entries))]
+                      (mapv second entries))
+                    gpu/event-measurement
+                    (fn [& _] {:direction :upload :timing-source :host-monotonic
+                               :asynchronous? false :bytes 32 :commands 4
+                               :elapsed-ns 40 :submit-host-ns 40 :host-wall-ns 40})
+                    gpu/release-event! (fn [& _] nil)]
         (let [ticket (manager/checkpoint-paged-chunks-async!
                       cache pool :source "fixture-paged-v1" [1 2 3 4 5])
               _ (.get ^java.util.concurrent.CompletableFuture
