@@ -14,6 +14,10 @@
       (catch Throwable _
         false))))
 
+(def ^:private intel-device-desc
+  {:device-type :gpu :vendor "Intel"
+   :subgroup-size 16 :max-workgroup-size 256})
+
 (defn- decode-halfs
   [^shorts values]
   (mapv #(double (Float/float16ToFloat %)) values))
@@ -42,6 +46,7 @@
           (with-open [runner
                       (paged-attention/open-runner!
                        pool {:id :device-fixture
+                             :device-desc intel-device-desc
                              :key-prefix "device-attention"
                              :layer 0
                              :batch-size 2
@@ -67,6 +72,7 @@
           (with-open [runner
                       (paged-attention/open-runner!
                        pool {:id :windowed-device-fixture
+                             :device-desc intel-device-desc
                              :key-prefix "windowed-device-attention"
                              :layer 0
                              :batch-size 2
@@ -95,6 +101,7 @@
             (with-open [runner
                         (paged-attention/open-runner!
                          pool {:id :resident-device-fixture
+                               :device-desc intel-device-desc
                                :key-prefix "resident-device-attention"
                                :layer 0
                                :batch-size 2

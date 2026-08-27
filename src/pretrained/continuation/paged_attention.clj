@@ -16,6 +16,10 @@
 
 (declare close-runner!)
 
+(def ^:private portable-reference-desc
+  {:device-type :gpu
+   :segmented-weighted-reduction-schedule :reference})
+
 (defrecord PagedAttentionRunner
            [session pool problem handle buffer-keys graph-key state]
   Closeable
@@ -70,7 +74,11 @@
     slab-layout))
 
 (defn reference-plan
-  "Build Raster's executable FP16-KV reference attention plan without touching a GPU.
+  "Build Raster's executable FP16-KV attention plan without touching a GPU.
+
+  The legacy name reflects the portable reference default. Supplying Raster's
+  `:device-desc` allows its router to select a target-legal optimized schedule;
+  omitting it explicitly retains the portable reference leaf.
 
   Required options are `:layer`, `:batch-size`, `:total-query-tokens`,
   `:q-heads`, `:kv-heads`, `:qk-head-dim`, `:value-head-dim`, and
@@ -88,7 +96,7 @@
   [pool {:keys [id layer batch-size total-query-tokens q-heads kv-heads
                 qk-head-dim value-head-dim pages-per-sequence scale key-prefix
                 query-view query-positions-view output-view query-dtype output-dtype
-                visibility]
+                visibility device-desc]
          :as opts}]
   (when-not (page-pool/page-pool? pool)
     (throw (ex-info "Paged attention requires a DevicePagePool" {:pool pool})))
@@ -159,7 +167,7 @@
                   :k-layout :page-major
                   :v-layout :page-major
                   :visibility visibility})
-        routed (attention-route/route! problem)
+        routed (attention-route/route! problem (or device-desc portable-reference-desc))
         specs (attention/buffer-specs problem)
         _ (checked-resident-view :query query-view)
         _ (checked-resident-view :query-positions query-positions-view)
@@ -194,6 +202,8 @@
     {:problem problem
      :graph (:graph routed)
      :strategy (:strategy routed)
+     :reference? (:reference? routed)
+     :declines (:declines routed)
      :ids ids
      :buffer-keys keys
      :bindings bindings
@@ -206,15 +216,18 @@
                      :pages-per-sequence pages-per-sequence
                      :query-dtype query-dtype
                      :output-dtype output-dtype
-                     :visibility visibility)}))
+                     :visibility visibility
+                     :device-desc device-desc)}))
 
 (defn open-runner!
-  "Allocate and bind a fixed-capacity Raster paged-attention reference runner.
+  "Allocate and bind a fixed-capacity Raster paged-attention runner.
 
   The caller owns `pool`, its Raster session, and any `:query-view` or
   `:output-view`. Closing the runner releases its graph and private buffers, but
-  not the page pool or caller-owned views. Raster validates view dtype, extent,
-  allocation lifetime, and session identity while binding."
+  not the page pool or caller-owned views. Pass Raster's `:device-desc` to permit
+  target-specific scheduling; without it the runner uses the portable reference
+  leaf. Raster validates view dtype, extent, allocation lifetime, and session
+  identity while binding."
   [pool opts]
   (let [{:keys [problem graph buffer-keys bindings allocations] :as plan}
         (reference-plan pool opts)

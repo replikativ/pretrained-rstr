@@ -60,6 +60,33 @@
     (is (identical? visibility (get-in plan [:problem :visibility])))
     (is (identical? visibility (get-in plan [:options :visibility])))))
 
+(deftest explicit-target-controls-attention-schedule-legality
+  (let [options {:id :target-fixture
+                 :layer 0
+                 :batch-size 1
+                 :total-query-tokens 1
+                 :q-heads 4
+                 :kv-heads 2
+                 :qk-head-dim 8
+                 :value-head-dim 8
+                 :pages-per-sequence 4}
+        intel {:device-type :gpu :vendor "Intel"
+               :subgroup-size 16 :max-workgroup-size 256}
+        nvidia {:device-type :gpu :vendor "NVIDIA"
+                :subgroup-size 32 :max-workgroup-size 1024
+                :matrix {:family :mma :subgroup 32}}
+        optimized (paged-attention/reference-plan
+                   (pool) (assoc options :device-desc intel))
+        fallback (paged-attention/reference-plan
+                  (pool) (assoc options :device-desc nvidia))]
+    (is (= :routed-paged-subgroup-online-score-reuse (:strategy optimized)))
+    (is (false? (:reference? optimized)))
+    (is (empty? (:declines optimized)))
+    (is (= :fp16-reference (:strategy fallback)))
+    (is (:reference? fallback))
+    (is (= :score-reuse-requires-intel-subgroup-dialect
+           (get-in fallback [:declines 0 :reason])))))
+
 (deftest resident-views-compose-attention-with-adjacent-device-graphs
   (let [page-pool (pool)
         query-view (Object.)

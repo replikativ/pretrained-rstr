@@ -22,6 +22,7 @@
             [raster.dl.array-ops :as aops]
             [raster.dl.nn :as nn]
             [raster.dl.attention :as attn]
+            [raster.compiler.core.hardware :as hardware]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as gpu-link]
             [raster.compiler.ir.link-plan :as link]
@@ -933,6 +934,7 @@
         :or {maxpos 64 rms-style :map-void device-id :ze:0 cache-mode :contiguous
              batch-size 1}}]
   (let [_ (gpu/backend-type device-id)
+        device-desc (hardware/descriptor-for device-id)
         batch-size (long batch-size)
         _ (when-not (pos? batch-size)
             (throw (ex-info "Decode batch size must be positive"
@@ -1019,7 +1021,7 @@
                                             norm-names)})]
         (merge {:sess sess :model m :maxpos maxpos :prefill-T prefill-T
                 :batch-size batch-size
-                :cache-mode cache-mode :device-id device-id}
+                :cache-mode cache-mode :device-id device-id :device-desc device-desc}
                execution prefill-execution))
       (catch Throwable error
         (try (gpu/close-session! sess) (catch Throwable _))
