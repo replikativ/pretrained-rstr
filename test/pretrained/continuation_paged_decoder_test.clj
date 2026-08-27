@@ -4,6 +4,7 @@
             [pretrained.attention-state :as attention-state]
             [pretrained.continuation.page-pool :as page-pool]
             [pretrained.continuation.paged-decoder :as paged-decoder]
+            [raster.compiler.ir.attention :as attention]
             [raster.compiler.ir.kernel-abi :as kernel-abi]
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.kernel-launch :as kernel-launch]
@@ -105,6 +106,23 @@
                          :start-positions :start-positions}
        :pages-per-sequence 2
        :state (atom {:closed? false})})}))
+
+(deftest paged-visibility-follows-model-layer-semantics
+  (let [model {:desc {:flags {:sliding-window {:size 4}
+                              :global-layer-pattern 2}}}
+        local (#'paged-decoder/layer-visibility model 0)
+        global (#'paged-decoder/layer-visibility model 1)]
+    (is (attention/interval-visibility? local))
+    (is (= {:causal? true :window-left 3 :window-right nil}
+           (into {} local)))
+    (is (= {:causal? true :window-left nil :window-right nil}
+           (into {} global)))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"at least one token"
+         (#'paged-decoder/layer-visibility
+          {:desc {:flags {:sliding-window {:size 0}
+                          :global-layers #{}}}}
+          0)))))
 
 (deftest routed-graphs-compose-between-generated-stages-before-gpu-allocation
   (let [one-layer-model {:n-layers 1 :n-q 2 :n-kv 1 :head-dim 4

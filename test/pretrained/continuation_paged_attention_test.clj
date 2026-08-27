@@ -43,6 +43,23 @@
     (is (= #{:half :int}
            (set (map first (vals (:allocations plan))))))))
 
+(deftest reference-plan-preserves-logical-interval-visibility
+  (let [visibility (attention/visibility {:causal? true :window-left 3})
+        plan (paged-attention/reference-plan
+              (pool)
+              {:id :windowed-fixture
+               :layer 0
+               :batch-size 1
+               :total-query-tokens 1
+               :q-heads 4
+               :kv-heads 2
+               :qk-head-dim 8
+               :value-head-dim 8
+               :pages-per-sequence 4
+               :visibility visibility})]
+    (is (identical? visibility (get-in plan [:problem :visibility])))
+    (is (identical? visibility (get-in plan [:options :visibility])))))
+
 (deftest resident-views-compose-attention-with-adjacent-device-graphs
   (let [page-pool (pool)
         query-view (Object.)

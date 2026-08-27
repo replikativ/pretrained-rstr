@@ -76,6 +76,8 @@
   `:q-heads`, `:kv-heads`, `:qk-head-dim`, `:value-head-dim`, and
   `:pages-per-sequence`. `:scale` defaults to `1/sqrt(qk-head-dim)`.
   `:query-dtype` and `:output-dtype` accept `:half` (the default) or `:float`.
+  Optional `:visibility` accepts a Raster interval visibility and defaults to
+  full causal attention.
   Optional `:query-view`, `:query-positions-view`, and `:output-view` bind
   caller-owned Raster resident views instead of allocating private buffers.
   Sharing the positions view lets buffered RoPE and routed attention consume
@@ -85,7 +87,8 @@
   concrete allocation specs used by `open-runner!`."
   [pool {:keys [id layer batch-size total-query-tokens q-heads kv-heads
                 qk-head-dim value-head-dim pages-per-sequence scale key-prefix
-                query-view query-positions-view output-view query-dtype output-dtype]
+                query-view query-positions-view output-view query-dtype output-dtype
+                visibility]
          :as opts}]
   (when-not (page-pool/page-pool? pool)
     (throw (ex-info "Paged attention requires a DevicePagePool" {:pool pool})))
@@ -102,6 +105,10 @@
         pages-per-sequence (checked-positive :pages-per-sequence pages-per-sequence)
         query-dtype (checked-io-dtype :query-dtype (or query-dtype :half))
         output-dtype (checked-io-dtype :output-dtype (or output-dtype :half))
+        visibility (or visibility (attention/visibility {:causal? true}))
+        _ (when-not (attention/interval-visibility? visibility)
+            (throw (ex-info "Paged reference attention requires interval visibility"
+                            {:visibility visibility})))
         _ (slab pool :key layer (* kv-heads qk-head-dim))
         _ (slab pool :value layer (* kv-heads value-head-dim))
         prefix (or key-prefix (str "paged-attention-" (UUID/randomUUID)))
@@ -151,7 +158,7 @@
                   :accumulator-dtype :float
                   :k-layout :page-major
                   :v-layout :page-major
-                  :visibility (attention/visibility {:causal? true})})
+                  :visibility visibility})
         routed (attention-route/route! problem)
         specs (attention/buffer-specs problem)
         _ (checked-resident-view :query query-view)
@@ -198,7 +205,8 @@
                      :total-query-tokens total-query-tokens
                      :pages-per-sequence pages-per-sequence
                      :query-dtype query-dtype
-                     :output-dtype output-dtype)}))
+                     :output-dtype output-dtype
+                     :visibility visibility)}))
 
 (defn open-runner!
   "Allocate and bind a fixed-capacity Raster paged-attention reference runner.
