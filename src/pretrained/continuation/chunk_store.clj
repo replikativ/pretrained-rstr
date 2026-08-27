@@ -1,9 +1,9 @@
 (ns pretrained.continuation.chunk-store
   "Immutable KV chunks in a local Boring-backed Konserve filestore.
 
-  Every value has one contiguous `:chunk/payload` float array. Konserve 0.9.379
-  can expose that nested RFC 8746 payload as a scoped read-only MemorySegment,
-  avoiding decode and heap copies on the SSD-to-GPU path."
+  Every value has one contiguous primitive `:chunk/payload` array. Konserve
+  0.9.379 can expose that nested RFC 8746 payload as a scoped read-only
+  MemorySegment, avoiding decode and heap copies on the SSD-to-GPU path."
   (:require [boring.core]
             [clojure.core.async :refer [<!!]]
             [clojure.string :as str]
@@ -20,9 +20,9 @@
 (defn content-id
   "Return the Hasch identity for a tensor chunk and its logical prefix.
 
-  Hasch canonicalizes primitive float arrays across platforms. The domain tag
-  prevents an equal EDN value used by another object type from aliasing this
-  store-ref identity."
+  Hasch canonicalizes primitive FP32 and signed-16 carrier arrays across
+  platforms. The domain tag prevents an equal EDN value used by another object
+  type from aliasing this store-ref identity."
   [chunk]
   (let [fingerprint (:chunk/model-fingerprint chunk)]
     (when-not (and (string? fingerprint) (not (str/blank? fingerprint)))
@@ -117,7 +117,7 @@
    (k/get store store-key not-found {:sync? true})))
 
 (defn mmap-payload
-  "Return `[payload arena]` for a stored chunk's no-copy FP32 payload.
+  "Return `[payload arena]` for a stored chunk's no-copy primitive payload.
 
   `payload` is Konserve's descriptor, including `:segment`, and is valid only
   until the caller closes `arena`. Prefer `with-mmap-payload`."

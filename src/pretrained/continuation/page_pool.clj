@@ -6,8 +6,7 @@
   while Raster owns the stable device allocations and checked buffer views."
   (:require [pretrained.attention-state :as attention-state]
             [raster.gpu.core :as gpu])
-  (:import [java.lang.foreign MemorySegment ValueLayout]
-           [java.nio ByteOrder]
+  (:import [java.lang.foreign MemorySegment]
            [java.util UUID]))
 
 (defrecord DevicePagePool
@@ -556,26 +555,12 @@
     :else (throw (ex-info "Attention-state payload has an unsupported representation"
                           {:payload-type (type payload)}))))
 
-(defn- fp32-segment->halfs
-  [^MemorySegment segment elements]
-  (when-not (= (.byteSize segment) (* 4 elements))
-    (throw (ex-info "Mapped FP32 payload length differs from its descriptor"
-                    {:expected-bytes (* 4 elements) :actual-bytes (.byteSize segment)})))
-  (let [layout (.withOrder ValueLayout/JAVA_FLOAT_UNALIGNED (ByteOrder/nativeOrder))
-        result (short-array elements)]
-    (dotimes [index elements]
-      (aset result index
-            (Float/floatToFloat16 (.get segment layout (* 4 (long index))))))
-    result))
-
-(defn- fp16-segment->halfs
+(defn- checked-fp16-segment
   [^MemorySegment segment elements]
   (when-not (= (.byteSize segment) (* 2 elements))
     (throw (ex-info "Mapped FP16 payload length differs from its descriptor"
                     {:expected-bytes (* 2 elements) :actual-bytes (.byteSize segment)})))
-  (let [result (short-array elements)]
-    (MemorySegment/copy segment 0 (MemorySegment/ofArray result) 0 (.byteSize segment))
-    result))
+  segment)
 
 (defn- half-payload
   [payload source-dtype elements]
@@ -588,18 +573,15 @@
                           {:expected elements :actual (alength ^shorts payload)})))
         payload)
 
+      (and (= :half source-dtype) (instance? MemorySegment payload))
+      (checked-fp16-segment payload elements)
+
       (and (= :float source-dtype) (instance? (Class/forName "[F") payload))
       (do
         (when-not (= elements (alength ^floats payload))
           (throw (ex-info "FP32 payload length differs from its descriptor"
                           {:expected elements :actual (alength ^floats payload)})))
         (short-array (map #(Float/floatToFloat16 (float %)) payload)))
-
-      (and (= :float source-dtype) (instance? MemorySegment payload))
-      (fp32-segment->halfs payload elements)
-
-      (and (= :half source-dtype) (instance? MemorySegment payload))
-      (fp16-segment->halfs payload elements)
 
       :else
       (throw (ex-info "Payload dtype and representation cannot be restored to FP16"
@@ -610,9 +592,8 @@
   "Scatter one durable chunk payload into an allocated resident route.
 
   The chunk may begin/end inside pages and cross arbitrary physical-page IDs.
-  Current Raster attention consumes FP16 pools; version-1 FP32 payloads are
-  converted once on the worker before the validated batched upload. Returns the
-  resident route."
+  Current Raster attention consumes FP16 pools. FP16 mmap segments upload
+  directly without an intermediate JVM array. Returns the resident route."
   [pool continuation-id descriptor payload]
   (let [resident-route (route pool continuation-id)
         start (long (:chunk/start descriptor))
@@ -672,7 +653,7 @@
       resident-route)))
 
 (defn export-chunk
-  "Gather one immutable route range into the durable FP32 chunk format.
+  "Gather one immutable route range into the durable FP16 chunk format.
 
   The route is leased for the complete device-to-host transfer, so eviction,
   release, and copy-on-write cannot recycle its pages while capture is in
@@ -731,21 +712,18 @@
                                  :elements (* transfer-tokens per-token)}])))))))
               plan))]
         (gpu/download-ranges! (:session pool) entries)
-        (let [payload (float-array payload-elements)]
-          (dotimes [index payload-elements]
-            (aset payload index (Float/float16ToFloat (aget halfs index))))
+        (let [durable-layout (assoc (:layout pool)
+                                    :dtype :float16
+                                    :byte-order :little-endian)]
           (cond->
            (merge descriptor
-                  {:chunk/version 2
+                  {:chunk/version 3
                    :chunk/model-fingerprint model-fingerprint
-                   :chunk/layout
-                   {:dtype :float32
-                    :byte-order (if (= ByteOrder/LITTLE_ENDIAN
-                                       (ByteOrder/nativeOrder))
-                                  :little-endian :big-endian)
-                    :attention-state (:layout pool)}
+                   :chunk/layout {:dtype :float16
+                                  :byte-order :little-endian
+                                  :attention-state durable-layout}
                    :chunk/slabs plan
-                   :chunk/payload payload})
+                   :chunk/payload halfs})
             (apply = (map :elements plan))
             (assoc :chunk/elements-per-slab (:elements (first plan))))))
       (finally

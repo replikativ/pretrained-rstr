@@ -85,9 +85,11 @@
                                :start-position 0}}}))
         descriptor {:chunk/start 2
                     :chunk/token-count 4
-                    :chunk/layout (continuation/model-layout model)}
+                    :chunk/layout
+                    (assoc-in (continuation/model-layout model)
+                              [:attention-state :dtype] :float16)}
         ;; 2 slabs × 2 layers × 4 tokens × 2 elements/token
-        payload (float-array (map float (range 32)))]
+        payload (short-array (map #(Float/floatToFloat16 (float %)) (range 32)))]
     (with-redefs [gpu/buffer-view (fn [_ key opts] {:key key :opts opts})
                   gpu/upload-ranges!
                   (fn [_ entries] (reset! uploads entries) (mapv second entries))]
@@ -132,10 +134,10 @@
                     (mapv second entries))]
       (let [chunk (page-pool/export-chunk
                    pool :continuation "fixture-paged-v1" descriptor)]
-        (is (= 2 (:chunk/version chunk)))
+        (is (= 3 (:chunk/version chunk)))
         (is (= "fixture-paged-v1" (:chunk/model-fingerprint chunk)))
-        (is (= :float32 (get-in chunk [:chunk/layout :dtype])))
-        (is (= (mapv float (range 1 33))
+        (is (= :float16 (get-in chunk [:chunk/layout :dtype])))
+        (is (= (mapv #(Float/floatToFloat16 (float %)) (range 1 33))
                (vec (:chunk/payload chunk))))
         (is (= 8 (count @downloads))
             "every slab/layer splits at the physical page boundary")
