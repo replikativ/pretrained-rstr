@@ -82,3 +82,54 @@
         (is (pos? @primes))
         (is (empty? @resident)
             "every benchmark sample releases its worker-local pages")))))
+
+(deftest paged-continuation-benchmark-records-restore-ttft-and-context-steps
+  (let [resident (atom {})
+        completed (fn [value] (CompletableFuture/completedFuture value))]
+    (with-redefs [paged-decoder/prime-prompt!
+                  (fn [_ continuation-id tokens]
+                    (swap! resident update continuation-id
+                           #(or % {:continuation-id continuation-id
+                                   :token-count (dec (count tokens))})))
+                  paged-decoder/step!
+                  (fn [_ continuation-id position]
+                    (swap! resident update-in [continuation-id :token-count] inc)
+                    (+ 100 position))
+                  page-pool/route
+                  (fn [_ continuation-id]
+                    (get @resident continuation-id))
+                  page-pool/release-route!
+                  (fn [_ continuation-id]
+                    (let [present? (contains? @resident continuation-id)]
+                      (swap! resident dissoc continuation-id)
+                      present?))
+                  manager/checkpoint-paged-chunks-async!
+                  (fn [& _]
+                    {:accepted? true
+                     :captured (completed [{:bytes 80}])
+                     :published (completed ::published)})
+                  manager/restore-paged-prefix!
+                  (fn [_ _ continuation-id _ tokens]
+                    (let [cached (dec (count tokens))]
+                      (swap! resident assoc continuation-id
+                             {:continuation-id continuation-id
+                              :token-count cached})
+                      {:cached-token-count cached}))
+                  manager/stats (fn [_] {:full-hits 4})]
+      (let [result
+            (benchmark/benchmark-paged-continuation!
+             ::cache {:pool ::pool :decode-state {:batch-size 1}}
+             "fixture-v1" [1 2 3 4]
+             {:iterations 2 :warmups 1 :decode-tokens 3})
+            first-restored (get-in result [:restored :first-measured])]
+        (is (= 80 (get-in result [:checkpoint :stored-bytes])))
+        (is (= 3 (:cached-token-count first-restored)))
+        (is (= [4 5 6]
+               (mapv :context-token-count (:steps first-restored))))
+        (is (= [103 104 105]
+               (mapv :token (:steps first-restored))))
+        (is (= 6 (count (get-in result [:restored :warm :decode :samples-ms]))))
+        (is (pos? (get-in result [:restored :warm :decode :tokens-per-second])))
+        (is (= {:full-hits 4} (:cache-stats result)))
+        (is (empty? @resident)
+            "benchmark releases warmup, source, and measured routes")))))

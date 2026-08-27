@@ -120,13 +120,35 @@ continuation boundary as uninterrupted inference.
 (bench/benchmark-paged-prefix! manager engine fingerprint prompt-ids
                                {:warmups 1 :iterations 5
                                 :probe-prompt-ids partially-matching-ids})
+
+;; Add time-to-first-token and a context-indexed trace for every decode step:
+(bench/benchmark-paged-continuation!
+ manager engine fingerprint prompt-ids
+ {:warmups 1 :iterations 5 :decode-tokens 8})
 ```
 
 The benchmark separates prefill, checkpoint submission/drain, first measured
 restore, and process/page-cache-warm restore; it does not label warm pages as
-cold SSD. Chunk identities use Hasch and are published as Datahike
+cold SSD. The continuation benchmark additionally separates prefix loading,
+uncached suffix completion, first-token latency, and steady decode. Each raw
+decode sample records its absolute position and visible context size, providing
+a stable comparison for attention traversal and history-tiling schedules.
+Chunk identities use Hasch and are published as Datahike
 `:db.type/store-ref` values, while the prefix hash separately identifies the
 causal token chain.
+
+For an already loaded Gemma model, the REPL helper owns and closes the temporary
+decoder, cache manager, and session while keeping model loading out of the
+measurement:
+
+```clojure
+(require '[pretrained.kv-continuation-demo :as demo])
+
+(demo/run-paged-continuation-benchmark!
+ model prompt-ids datahike-config "/var/tmp/gemma-kv-benchmark"
+ {:max-position 2048 :chunk-size 256 :decode-tokens 16
+  :warmups 1 :iterations 5})
+```
 
 For cluster durability, pass an already connected authoritative Konserve store
 (for example Konserve-S3) as `:chunk-backend-store`. The manager owns its local

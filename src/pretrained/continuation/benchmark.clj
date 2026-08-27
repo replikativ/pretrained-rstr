@@ -24,6 +24,94 @@
         index (min (dec n) (dec (long (Math/ceil (* fraction n)))))]
     (nth sorted-samples (max 0 index))))
 
+(declare accepted-ticket!)
+
+(defn- summarize-ms
+  [samples]
+  (let [samples (mapv double samples)
+        sorted-samples (vec (sort samples))]
+    {:samples-ms samples
+     :min-ms (first sorted-samples)
+     :median-ms (percentile sorted-samples 0.5)
+     :p95-ms (percentile sorted-samples 0.95)
+     :max-ms (peek sorted-samples)}))
+
+(defn- checkpoint-paged!
+  [cache pool continuation-id model-fingerprint prompt-ids]
+  (let [submission
+        (timed #(accepted-ticket!
+                 (manager/checkpoint-paged-chunks-async!
+                  cache pool continuation-id model-fingerprint prompt-ids)))
+        ticket (:value submission)
+        capture (timed #(.get ^CompletableFuture (:captured ticket)))
+        publication (timed #(.get ^CompletableFuture (:published ticket)))]
+    {:submission-ms (:milliseconds submission)
+     :capture-drain-ms (:milliseconds capture)
+     :publication-drain-ms (:milliseconds publication)
+     :chunks (count (:value capture))
+     :stored-bytes (reduce + 0 (map :bytes (:value capture)))}))
+
+(defn- continuation-sample!
+  [decoder prompt-ids decode-tokens restore!]
+  (let [pool (:pool decoder)
+        continuation-id (random-uuid)]
+    (try
+      (let [restore (when restore! (timed #(restore! continuation-id)))
+            completion (timed #(paged-decoder/prime-prompt!
+                                decoder continuation-id prompt-ids))
+            steps
+            (loop [index 0
+                   position (dec (count prompt-ids))
+                   result []]
+              (if (< index decode-tokens)
+                (let [step (timed #(paged-decoder/step!
+                                    decoder continuation-id position))]
+                  (recur (inc index) (inc position)
+                         (conj result
+                               {:index index
+                                :position position
+                                :context-token-count (inc position)
+                                :token (:value step)
+                                :milliseconds (:milliseconds step)})))
+                result))
+            restore-ms (or (:milliseconds restore) 0.0)
+            first-token-ms (:milliseconds (first steps))
+            decode-ms (reduce + 0.0 (map :milliseconds steps))]
+        (cond->
+         {:prompt-completion-ms (:milliseconds completion)
+          :first-token-ms first-token-ms
+          :ready-to-first-token-ms (+ restore-ms
+                                      (:milliseconds completion)
+                                      first-token-ms)
+          :decode-ms decode-ms
+          :total-ms (+ restore-ms (:milliseconds completion) decode-ms)
+          :steps steps}
+          restore
+          (assoc :prefix-load-ms restore-ms
+                 :cached-token-count
+                 (get-in restore [:value :cached-token-count]))))
+      (finally
+        (when (page-pool/route pool continuation-id)
+          (page-pool/release-route! pool continuation-id))))))
+
+(defn- continuation-series!
+  [operation iterations warmups]
+  (dotimes [_ (long warmups)] (operation))
+  (let [samples (mapv (fn [_] (operation)) (range (long iterations)))
+        step-times (mapv :milliseconds (mapcat :steps samples))
+        decode-summary (summarize-ms step-times)]
+    {:iterations (long iterations)
+     :warmups (long warmups)
+     :samples samples
+     :prompt-completion (summarize-ms (mapv :prompt-completion-ms samples))
+     :first-token (summarize-ms (mapv :first-token-ms samples))
+     :ready-to-first-token (summarize-ms (mapv :ready-to-first-token-ms samples))
+     :decode (assoc decode-summary
+                    :tokens-per-second (/ 1000.0 (:median-ms decode-summary)))
+     :total (summarize-ms (mapv :total-ms samples))
+     :prefix-load (when (every? :prefix-load-ms samples)
+                    (summarize-ms (mapv :prefix-load-ms samples)))}))
+
 (defn measure!
   "Measure a zero-argument operation after explicit warm-up iterations.
 
@@ -146,19 +234,7 @@
                           {:iterations iterations :warmups warmups})
         source-id (random-uuid)
         _ (paged-decoder/prime-prompt! decoder source-id prompt-ids)
-        checkpoint
-        (let [submission
-              (timed #(accepted-ticket!
-                       (manager/checkpoint-paged-chunks-async!
-                        cache pool source-id model-fingerprint prompt-ids)))
-              ticket (:value submission)
-              capture (timed #(.get ^CompletableFuture (:captured ticket)))
-              publication (timed #(.get ^CompletableFuture (:published ticket)))]
-          {:submission-ms (:milliseconds submission)
-           :capture-drain-ms (:milliseconds capture)
-           :publication-drain-ms (:milliseconds publication)
-           :chunks (count (:value capture))
-           :stored-bytes (reduce + 0 (map :bytes (:value capture)))})
+        checkpoint (checkpoint-paged! cache pool source-id model-fingerprint prompt-ids)
         _ (page-pool/release-route! pool source-id)
         restore-ready
         (fn [tokens]
@@ -192,6 +268,79 @@
                 :warm (/ prefill-median warm-median)}
       :cache-stats (manager/stats cache)}
       probe (assoc :probe probe))))
+
+(defn benchmark-paged-continuation!
+  "Benchmark a paged continuation through readiness and autoregressive decode.
+
+  The cache manager and single-lane paged decoder must already be open and the
+  model graph must already be bound. This function warms graph execution, stores
+  one prompt prefix, and compares uncached prompt processing with process-warm
+  restoration of the same prefix. Each sample reports prefix loading, uncached
+  suffix completion, time to first generated token, and every subsequent decode
+  step with its absolute position and visible context size.
+
+  `opts` accepts positive `:iterations` (default 5), non-negative `:warmups`
+  (default 1), and positive `:decode-tokens` (default 4). The first restored
+  sample is kept separate because it can include first-use storage and mmap
+  costs. No operating-system caches are dropped, so it is not a cold-SSD result.
+
+  Returns serializable raw samples, phase summaries, checkpoint drain costs,
+  continuation speedups, and cache-manager counters. Every temporary resident
+  route is released, including when execution fails."
+  [cache decoder model-fingerprint prompt-ids
+   {:keys [iterations warmups decode-tokens]
+    :or {iterations 5 warmups 1 decode-tokens 4}}]
+  (when-not (and (pos? iterations) (not (neg? warmups)) (pos? decode-tokens))
+    (throw (ex-info "Continuation benchmark counts are invalid"
+                    {:iterations iterations
+                     :warmups warmups
+                     :decode-tokens decode-tokens})))
+  (when-not (= 1 (long (get-in decoder [:decode-state :batch-size] 1)))
+    (throw (ex-info "Continuation benchmark currently requires a single decode lane"
+                    {:batch-size (get-in decoder [:decode-state :batch-size])})))
+  (let [pool (:pool decoder)
+        prompt-ids (vec prompt-ids)
+        _ (when-not (seq prompt-ids)
+            (throw (ex-info "Continuation benchmark requires a nonempty prompt" {})))
+        uncached-operation #(continuation-sample!
+                             decoder prompt-ids (long decode-tokens) nil)
+        _ (uncached-operation)
+        uncached-first (uncached-operation)
+        uncached-warm (continuation-series!
+                       uncached-operation iterations warmups)
+        source-id (random-uuid)
+        checkpoint (try
+                     (paged-decoder/prime-prompt! decoder source-id prompt-ids)
+                     (checkpoint-paged!
+                      cache pool source-id model-fingerprint prompt-ids)
+                     (finally
+                       (when (page-pool/route pool source-id)
+                         (page-pool/release-route! pool source-id))))
+        restore! #(manager/restore-paged-prefix!
+                   cache pool % model-fingerprint prompt-ids)
+        restored-operation #(continuation-sample!
+                              decoder prompt-ids (long decode-tokens) restore!)
+        restored-first (restored-operation)
+        restored-warm (continuation-series!
+                       restored-operation iterations warmups)
+        uncached-ready (get-in uncached-warm
+                               [:ready-to-first-token :median-ms])
+        restored-ready (get-in restored-warm
+                               [:ready-to-first-token :median-ms])
+        restored-first-ready (:ready-to-first-token-ms restored-first)]
+    {:prompt {:logical-token-count (count prompt-ids)
+              :processed-token-count (dec (count prompt-ids))}
+     :decode-tokens (long decode-tokens)
+     :checkpoint checkpoint
+     :uncached {:first-measured uncached-first
+                :warm uncached-warm}
+     :restored {:first-measured restored-first
+                :warm restored-warm}
+     :speedup {:first-restored-vs-uncached-warm
+               (/ uncached-ready restored-first-ready)
+               :warm-restored-vs-uncached-warm
+               (/ uncached-ready restored-ready)}
+     :cache-stats (manager/stats cache)}))
 
 (defn benchmark-cpu-snapshot!
   "Benchmark CPU prompt processing against whole-snapshot mmap restoration.

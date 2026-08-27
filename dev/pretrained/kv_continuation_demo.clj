@@ -1,11 +1,15 @@
 (ns pretrained.kv-continuation-demo
   "REPL showcases for durable CPU round-trips and asynchronous GPU checkpoints."
   (:require [pretrained.continuation :as continuation]
+            [pretrained.continuation.benchmark :as benchmark]
             [pretrained.continuation.gpu :as continuation-gpu]
             [pretrained.continuation.manager :as manager]
+            [pretrained.continuation.paged-decoder :as paged-decoder]
             [pretrained.continuation.residency :as residency]
             [pretrained.continuation.scheduler :as scheduler]
-            [pretrained.model-identity :as model-identity]))
+            [pretrained.decoder-gpu :as decoder-gpu]
+            [pretrained.model-identity :as model-identity]
+            [raster.gpu.core :as gpu]))
 
 (defn- fingerprint
   [model opts]
@@ -158,4 +162,48 @@
          :restore-ms (:milliseconds restore)
          :cache-stats (manager/stats cache)})
       (finally
+        (.close cache)))))
+
+(defn run-paged-continuation-benchmark!
+  "Benchmark a loaded decoder model through durable paged continuation reuse.
+
+  Intended for an nREPL with `:dev`. Model loading is deliberately outside the
+  measurement. `opts` requires `:max-position` and may contain `:page-size`,
+  `:physical-pages`, `:chunk-size`, `:iterations`, `:warmups`,
+  `:decode-tokens`, and the fingerprint options accepted by `fingerprint`.
+
+  Returns the instrumented benchmark plus the first restored token sequence.
+  The function closes the temporary manager, paged decoder, and Raster session."
+  [model prompt-ids datahike-config cache-directory opts]
+  (let [{:keys [max-position page-size physical-pages chunk-size
+                iterations warmups decode-tokens]
+         :or {page-size 16 iterations 5 warmups 1 decode-tokens 4}} opts
+        model-fingerprint (fingerprint model opts)
+        _ (when-not (and (integer? max-position) (pos? max-position))
+            (throw (ex-info "Paged benchmark requires a positive :max-position"
+                            {:max-position max-position})))
+        cache (manager/open-manager
+               datahike-config cache-directory
+               (cond-> {} chunk-size (assoc :chunk-size chunk-size)))
+        dstate (volatile! nil)
+        decoder (volatile! nil)]
+    (try
+      (vreset! dstate
+               (decoder-gpu/bind-decode!
+                model :maxpos max-position :cache-mode :paged :batch-size 1))
+      (vreset! decoder
+               (paged-decoder/open!
+                @dstate :page-size page-size :physical-pages physical-pages))
+      (let [result
+            (benchmark/benchmark-paged-continuation!
+             cache @decoder model-fingerprint (vec prompt-ids)
+             {:iterations iterations
+              :warmups warmups
+              :decode-tokens decode-tokens})]
+        (assoc result
+               :first-restored-tokens
+               (mapv :token (get-in result [:restored :first-measured :steps]))))
+      (finally
+        (when @decoder (paged-decoder/close! @decoder))
+        (when @dstate (gpu/close-session! (:sess @dstate)))
         (.close cache)))))
