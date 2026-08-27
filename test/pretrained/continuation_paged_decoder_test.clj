@@ -124,8 +124,9 @@
               [['r0 :float :read] ['at :float :read] ['r1 :float :write]]
               {:r0 :input :at :input} [:r1])
         head (staged-executable
-              :head [['r1 :float :read] ['tokbuf :int :write]]
-              {:r1 :input} [:tokbuf])
+              :head [['r1 :float :read] ['tokbuf :int :write]
+                     ['r0 :float :write]]
+              {:r1 :input :r0 :state} [:tokbuf])
         decode-state {:sess ::session
                       :model one-layer-model
                       :maxpos 8
@@ -152,6 +153,8 @@
                [(-> @captured :instances first :id)
                 (-> @captured :instances last :id)]))
         (is (= :internal (get-in @captured [:nodes :at :role])))
+        (is (= :state (get-in @captured [:nodes :r0 :role]))
+            "the decoder tail feeds the next token embedding back into r0")
         (is (= :state (get-in @captured [:nodes :k0 :role])))
         (is (= [:tokbuf] (:outputs @captured)))))))
 

@@ -178,6 +178,41 @@
           (when @decoder (close-paged @decoder))
           (when @dstate (close-session (:sess @dstate))))))))
 
+(deftest ^:anchors ^:gpu gemma-paged-continuous-batch-anchor
+  (if-not (and (have? "gemma-3-270m-it")
+               (.exists (java.io.File. (mdir "gemma-3-270m-it")))
+               (gpu-up?))
+    (println "SKIP Gemma paged continuous-batch anchor (weights or GPU not present)")
+    (let [from (requiring-resolve 'pretrained.loader/from-pretrained)
+          bind (requiring-resolve 'pretrained.decoder-gpu/bind-decode!)
+          open-paged (requiring-resolve 'pretrained.continuation.paged-decoder/open!)
+          generate (requiring-resolve 'pretrained.continuation.worker/generate-continuously!)
+          close-paged (requiring-resolve 'pretrained.continuation.paged-decoder/close!)
+          close-session (requiring-resolve 'raster.gpu.core/close-session!)
+          g (from (mdir "gemma-3-270m-it"))
+          {:keys [tok encode decode]} (:tokenizer g)
+          prompts (mapv #(vec (encode tok %))
+                        ["The capital of France is" "The capital of Germany is"])
+          dstate (volatile! nil)
+          decoder (volatile! nil)]
+      (try
+        (is (apply = (map count prompts))
+            "the current paged prefill contract requires equal work suffixes")
+        (vreset! dstate (bind g :maxpos 64 :cache-mode :paged :batch-size 2))
+        (vreset! decoder
+                 (open-paged @dstate :page-size 16 :physical-pages 16))
+        (let [[france germany]
+              (generate @decoder [:france :germany] prompts 4)
+              france-text (decode tok france)
+              germany-text (decode tok germany)]
+          (is (.contains ^String france-text "Paris") france-text)
+          (is (.contains ^String germany-text "Berlin") germany-text)
+          (is (not= france germany)
+              "independent rows retain distinct KV routes and outputs"))
+        (finally
+          (when @decoder (close-paged @decoder))
+          (when @dstate (close-session (:sess @dstate))))))))
+
 (deftest ^:anchors ^:gpu gemma-gpu-continuation-roundtrip-anchor
   (if-not (and (have? "gemma-3-270m-it") (.exists (java.io.File. (mdir "gemma-3-270m-it")))
                (gpu-up?))

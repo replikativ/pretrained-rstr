@@ -206,7 +206,8 @@
               [(:plan (:head-tail staged))]))
             stage-nodes (merge-first (map :nodes stage-plans))
             graph-roles (merge (zipmap descriptor-keys (repeat :input))
-                               {(:key positions-view) :input}
+                               {(:key positions-view) :input
+                                :r0 :state}
                                (zipmap page-keys (repeat :state))
                                (zipmap [(:key query-view) (:key key-view)
                                         (:key value-view) (:key output-view)]
