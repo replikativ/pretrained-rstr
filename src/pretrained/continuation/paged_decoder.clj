@@ -11,6 +11,7 @@
             [pretrained.continuation.paged-append :as paged-append]
             [pretrained.continuation.paged-attention :as paged-attention]
             [pretrained.decoder-gpu :as decoder-gpu]
+            [raster.compiler.ir.attention :as attention]
             [raster.compiler.ir.kernel-executable :as kernel-executable]
             [raster.compiler.ir.link-plan :as link]
             [raster.gpu.core :as gpu]
@@ -145,6 +146,28 @@
             (reduce-kv #(if (contains? %1 %2) %1 (assoc %1 %2 %3)) result values))
           {} maps))
 
+(defn- global-layer?
+  [model layer]
+  (let [flags (get-in model [:desc :flags])]
+    (cond
+      (:global-layers flags) (contains? (:global-layers flags) layer)
+      (:global-layer-pattern flags)
+      (zero? (mod (inc (long layer)) (long (:global-layer-pattern flags))))
+      :else true)))
+
+(defn- layer-visibility
+  [model layer]
+  (if-let [window (and (not (global-layer? model layer))
+                       (get-in model [:desc :flags :sliding-window :size]))]
+    (do
+      (when-not (and (integer? window) (pos? window))
+        (throw (ex-info "Sliding attention window must contain at least one token"
+                        {:layer layer :window window})))
+      ;; Raster windows are inclusive distances. A model window of N tokens
+      ;; therefore admits q-(N-1) through q.
+      (attention/visibility {:causal? true :window-left (dec (long window))}))
+    (attention/visibility {:causal? true})))
+
 (defn- linked-paged-executable!
   [decode-state pool batch-size pages-per-sequence prefix query-view positions-view
    key-view value-view output-view]
@@ -176,6 +199,7 @@
                        :value-head-dim (:head-dim model)
                        :pages-per-sequence pages-per-sequence
                        :scale (:attn-scale model)
+                       :visibility (layer-visibility model layer)
                        :query-dtype :float
                        :output-dtype :float
                        :query-view query-view

@@ -3,6 +3,7 @@
             [pretrained.attention-state :as attention-state]
             [pretrained.continuation.page-pool :as page-pool]
             [pretrained.continuation.paged-attention :as paged-attention]
+            [raster.compiler.ir.attention :as attention]
             [raster.gpu.core :as gpu]))
 
 (def ^:private level-zero-available?
@@ -63,6 +64,29 @@
               (is (every? true?
                           (map #(< (Math/abs (- %1 %2)) 0.04)
                                expected actual)))))
+          (with-open [runner
+                      (paged-attention/open-runner!
+                       pool {:id :windowed-device-fixture
+                             :key-prefix "windowed-device-attention"
+                             :layer 0
+                             :batch-size 2
+                             :total-query-tokens 2
+                             :q-heads 1
+                             :kv-heads 1
+                             :qk-head-dim 2
+                             :value-head-dim 2
+                             :pages-per-sequence 2
+                             :visibility (attention/visibility
+                                          {:causal? true :window-left 0})})]
+            (let [actual
+                  (decode-halfs
+                   (paged-attention/run!
+                    runner
+                    {:continuation-ids [:a :b]
+                     :query-values (float-array [1 0, 1 0])
+                     :row-offsets [0 1 2]
+                     :positions [1 0]}))]
+              (is (= [30.0 40.0 5.0 7.0] actual))))
           (gpu/alloc! session
                       {:resident-query [:float 4 (float-array [1 0 1 0])]
                        :resident-output [:float 4 nil]})
