@@ -222,18 +222,6 @@
         config {:store {:backend :memory :id (random-uuid)}
                 :schema-flexibility :write :keep-history? false :value-caps :default}
         model {:n-layers 1 :n-kv 1 :head-dim 2}
-        cpu-state {:continuation/backend :cpu
-                   :continuation/model model
-                   :continuation/model-fingerprint "fixture-paged-v1"
-                   :continuation/layout (continuation/model-layout model)
-                   :continuation/max-position 8
-                   :continuation/processed-count 4
-                   :continuation/pending-token 5
-                   :continuation/tokens [1 2 3 4 5]
-                   :continuation/keys [(float-array [10 11 20 21 30 31 40 41
-                                                     0 0 0 0 0 0 0 0])]
-                   :continuation/values [(float-array [50 51 60 61 70 71 80 81
-                                                       0 0 0 0 0 0 0 0])]}
         pool (page-pool/->DevicePagePool
               ::session (attention-state/layout model) 2 4 :half
               {[:key 0] :pool-k0, [:value 0] :pool-v0}
@@ -243,24 +231,55 @@
         uploads (atom [])
         cache (manager/open-manager config directory {:chunk-size 2})]
     (try
-      (manager/checkpoint-cpu-chunks! cache cpu-state)
-      (with-redefs [gpu/buffer-view
+      (page-pool/allocate-route! pool :source 4)
+      (with-redefs [page-pool/export-chunk
+                    (fn [_ _ model-fingerprint descriptor]
+                      (let [values (if (zero? (:chunk/start descriptor))
+                                     [10 11 20 21 50 51 60 61]
+                                     [30 31 40 41 70 71 80 81])]
+                        (merge descriptor
+                               {:chunk/version 3
+                                :chunk/model-fingerprint model-fingerprint
+                                :chunk/layout
+                                {:dtype :float16
+                                 :byte-order :little-endian
+                                 :attention-state
+                                 (assoc (attention-state/layout model)
+                                        :dtype :float16)}
+                                :chunk/elements-per-slab 4
+                                :chunk/payload
+                                (short-array
+                                 (map #(Float/floatToFloat16 (float %)) values))})))
+                    gpu/buffer-view
                     (fn [_ key opts] {:key key :opts opts})
-                    gpu/upload-ranges!
+                    gpu/submit-upload-ranges! (fn [_ entries] entries)
+                    gpu/await-event!
                     (fn [_ entries]
                       (swap! uploads into
-                             (mapv (fn [[view ^shorts source
+                             (mapv (fn [[view ^MemorySegment source
                                         {:keys [src-element elements] :as spec}]]
-                                     [(:key view)
-                                      (quot (get-in view [:opts :byte-offset]) 2)
-                                      (mapv #(Float/float16ToFloat
-                                              (aget source (int %)))
-                                            (range src-element
-                                                   (+ src-element elements)))
-                                      spec])
+                                     (let [values (short-array elements)]
+                                       (MemorySegment/copy
+                                        source (* 2 src-element)
+                                        (MemorySegment/ofArray values) 0
+                                        (* 2 elements))
+                                       [(:key view)
+                                        (quot (get-in view [:opts :byte-offset]) 2)
+                                        (mapv #(Float/float16ToFloat %) values)
+                                        spec]))
                                    entries))
-                      (mapv second entries))]
-        (let [result (manager/restore-paged-prefix!
+                      (mapv second entries))
+                    gpu/event-measurement
+                    (fn [& _] {:direction :upload :timing-source :host-monotonic
+                               :asynchronous? false :bytes 32 :commands 4
+                               :elapsed-ns 40 :submit-host-ns 40 :host-wall-ns 40})
+                    gpu/release-event! (fn [& _] nil)]
+        (let [ticket (manager/checkpoint-paged-chunks-async!
+                      cache pool :source "fixture-paged-v1" [1 2 3 4 5])
+              _ (.get ^java.util.concurrent.CompletableFuture
+                      (:published ticket) 5 TimeUnit/SECONDS)
+              _ (page-pool/release-route! pool :source)
+              result (manager/restore-paged-prefix!
                       cache pool :request-a "fixture-paged-v1"
                       [1 2 3 4 5 6 7])]
           (is (= 4 (:cached-token-count result)))

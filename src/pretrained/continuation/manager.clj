@@ -254,9 +254,9 @@
   `tokens` contains the exact token history for the route. The route's current
   logical token count defines the processed prefix; a later pending token may be
   present in `tokens`. The accepted capture worker leases and gathers physical
-  FP16 pages, converts them to the existing portable FP32 chunk format, writes
-  through the local/tiered Konserve store, and publishes Datahike only after
-  durability. Queue saturation rejects the optional checkpoint immediately."
+  FP16 pages into their exact signed-16 carrier representation, writes through
+  the local/tiered Konserve store, and publishes Datahike only after durability.
+  Queue saturation rejects the optional checkpoint immediately."
   [^Manager manager pool continuation-id model-fingerprint tokens]
   (let [tokens (vec tokens)]
     (submit-chunk-checkpoint!
@@ -369,9 +369,9 @@
          (chunk-store/with-mmap-payload
           (:chunk-store manager) (:kv/store-key entry)
           (fn [payload]
-            (when-not (and (= :float32 (:element-type payload))
+            (when-not (and (= :int16 (:element-type payload))
                            (= :little-endian (:byte-order payload)))
-              (throw (ex-info "Stored KV chunk is not a little-endian FP32 payload"
+              (throw (ex-info "Stored KV chunk is not a little-endian FP16 carrier payload"
                               {:store-key (:kv/store-key entry)
                                :element-type (:element-type payload)
                                :byte-order (:byte-order payload)})))
@@ -379,8 +379,9 @@
              pool continuation-id
              {:chunk/start (:kv/start-token entry)
               :chunk/token-count (:kv/token-count entry)
-              :chunk/layout {:dtype :float32
-                             :attention-state (:layout pool)}}
+              :chunk/layout {:dtype :float16
+                             :attention-state
+                             (assoc (:layout pool) :dtype :float16)}}
              (:segment payload)))))
        (swap! (:metrics manager)
               (fn [metrics]

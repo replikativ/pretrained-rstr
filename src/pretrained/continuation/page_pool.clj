@@ -6,8 +6,7 @@
   while Raster owns the stable device allocations and checked buffer views."
   (:require [pretrained.attention-state :as attention-state]
             [raster.gpu.core :as gpu])
-  (:import [java.lang.foreign MemorySegment ValueLayout]
-           [java.nio ByteOrder]
+  (:import [java.lang.foreign MemorySegment]
            [java.util UUID]))
 
 (defrecord DevicePagePool
@@ -52,6 +51,67 @@
   (if (zero? token-count)
     0
     (inc (quot (dec token-count) page-size))))
+
+(defn- transfer-runs
+  [resident-route start token-count page-size]
+  (loop [relative-token 0
+         runs []]
+    (if (= relative-token token-count)
+      runs
+      (let [logical-token (+ start relative-token)
+            logical-page (quot logical-token page-size)
+            offset-in-page (rem logical-token page-size)
+            physical-page (nth (:pages resident-route) logical-page)
+            run-tokens (min (- token-count relative-token)
+                            (- page-size offset-in-page))
+            physical-token (+ (* physical-page page-size) offset-in-page)
+            previous (peek runs)]
+        (if (and previous
+                 (= physical-token
+                    (+ (:physical-token previous) (:token-count previous))))
+          (recur (+ relative-token run-tokens)
+                 (update-in runs [(dec (count runs)) :token-count] + run-tokens))
+          (recur (+ relative-token run-tokens)
+                 (conj runs {:relative-token relative-token
+                             :physical-token physical-token
+                             :token-count run-tokens})))))))
+
+(defn- record-transfer!
+  [pool measurement]
+  (let [counter-key [(:direction measurement)
+                     (:timing-source measurement)
+                     (boolean (:asynchronous? measurement))]]
+    (swap! (:state pool)
+           (fn [state]
+             (-> state
+                 (assoc-in [:transfers :last] measurement)
+                 (update-in [:transfers :counters counter-key :submissions]
+                            (fnil inc 0))
+                 (update-in [:transfers :counters counter-key :bytes]
+                            (fnil + 0) (long (:bytes measurement 0)))
+                 (update-in [:transfers :counters counter-key :commands]
+                            (fnil + 0) (long (:commands measurement 0)))
+                 (update-in [:transfers :counters counter-key :elapsed-ns]
+                            (fnil + 0) (long (:elapsed-ns measurement 0)))
+                 (update-in [:transfers :counters counter-key :submit-host-ns]
+                            (fnil + 0) (long (:submit-host-ns measurement 0)))
+                 (update-in [:transfers :counters counter-key :host-wall-ns]
+                            (fnil + 0) (long (:host-wall-ns measurement 0))))))))
+
+(defn- transfer-ranges-measured!
+  [pool direction entries]
+  (let [session (:session pool)
+        event ((case direction
+                 :upload gpu/submit-upload-ranges!
+                 :download gpu/submit-download-ranges!)
+               session entries)]
+    (try
+      (let [value (gpu/await-event! session event)
+            measurement (gpu/event-measurement session event)]
+        (record-transfer! pool measurement)
+        value)
+      (finally
+        (gpu/release-event! session event)))))
 
 (defn- buffer-key
   [prefix slab layer]
@@ -113,7 +173,8 @@
        (atom {:free (apply sorted-set (range physical-pages))
               :refcounts {}
               :leases {}
-              :routes {}})))))
+              :routes {}
+              :transfers {:counters {} :last nil}})))))
 
 (defn buffer-keys
   "Return `{[slab-name layer] session-buffer-key}` for `pool`."
@@ -178,6 +239,15 @@
      :shared-pages (count (filter #(> % 1) (vals refcounts)))
      :resident-routes (count routes)
      :active-leases (count leases)}))
+
+(defn transfer-stats
+  "Return cumulative measured cache-transfer counters and the last measurement.
+
+  Counters are keyed by `[direction timing-source asynchronous?]`, preserving
+  the distinction between device-event timings and inline host-coherent copies.
+  Values are immutable snapshots suitable for metrics and benchmark reports."
+  [pool]
+  (or (:transfers @(:state pool)) {:counters {} :last nil}))
 
 (defn- take-free-pages
   [state n continuation-id]
@@ -409,6 +479,19 @@
                         :shape [elements]
                         :id [key physical-page]}))))
 
+(defn- token-range-view
+  [pool slab layer physical-token token-count]
+  (let [key (get (:buffer-keys pool) [(:name slab) layer])
+        per-token (:elements-per-token slab)
+        elements (checked-product :token-range [token-count per-token])
+        element-offset (checked-product :token-range-offset
+                                        [physical-token per-token])
+        element-bytes (case (:dtype pool) :half 2 :float 4)]
+    (gpu/buffer-view (:session pool) key
+                     {:byte-offset (* element-offset element-bytes)
+                      :shape [elements]
+                      :id [key physical-token token-count]})))
+
 (defn- copy-page!
   [pool source-page destination-page]
   (doseq [slab (:slabs (:layout pool))
@@ -556,26 +639,12 @@
     :else (throw (ex-info "Attention-state payload has an unsupported representation"
                           {:payload-type (type payload)}))))
 
-(defn- fp32-segment->halfs
-  [^MemorySegment segment elements]
-  (when-not (= (.byteSize segment) (* 4 elements))
-    (throw (ex-info "Mapped FP32 payload length differs from its descriptor"
-                    {:expected-bytes (* 4 elements) :actual-bytes (.byteSize segment)})))
-  (let [layout (.withOrder ValueLayout/JAVA_FLOAT_UNALIGNED (ByteOrder/nativeOrder))
-        result (short-array elements)]
-    (dotimes [index elements]
-      (aset result index
-            (Float/floatToFloat16 (.get segment layout (* 4 (long index))))))
-    result))
-
-(defn- fp16-segment->halfs
+(defn- checked-fp16-segment
   [^MemorySegment segment elements]
   (when-not (= (.byteSize segment) (* 2 elements))
     (throw (ex-info "Mapped FP16 payload length differs from its descriptor"
                     {:expected-bytes (* 2 elements) :actual-bytes (.byteSize segment)})))
-  (let [result (short-array elements)]
-    (MemorySegment/copy segment 0 (MemorySegment/ofArray result) 0 (.byteSize segment))
-    result))
+  segment)
 
 (defn- half-payload
   [payload source-dtype elements]
@@ -588,18 +657,15 @@
                           {:expected elements :actual (alength ^shorts payload)})))
         payload)
 
+      (and (= :half source-dtype) (instance? MemorySegment payload))
+      (checked-fp16-segment payload elements)
+
       (and (= :float source-dtype) (instance? (Class/forName "[F") payload))
       (do
         (when-not (= elements (alength ^floats payload))
           (throw (ex-info "FP32 payload length differs from its descriptor"
                           {:expected elements :actual (alength ^floats payload)})))
         (short-array (map #(Float/floatToFloat16 (float %)) payload)))
-
-      (and (= :float source-dtype) (instance? MemorySegment payload))
-      (fp32-segment->halfs payload elements)
-
-      (and (= :half source-dtype) (instance? MemorySegment payload))
-      (fp16-segment->halfs payload elements)
 
       :else
       (throw (ex-info "Payload dtype and representation cannot be restored to FP16"
@@ -610,9 +676,8 @@
   "Scatter one durable chunk payload into an allocated resident route.
 
   The chunk may begin/end inside pages and cross arbitrary physical-page IDs.
-  Current Raster attention consumes FP16 pools; version-1 FP32 payloads are
-  converted once on the worker before the validated batched upload. Returns the
-  resident route."
+  Current Raster attention consumes FP16 pools. FP16 mmap segments upload
+  directly without an intermediate JVM array. Returns the resident route."
   [pool continuation-id descriptor payload]
   (let [resident-route (route pool continuation-id)
         start (long (:chunk/start descriptor))
@@ -643,36 +708,27 @@
                       {:pool-dtype (:dtype pool)})))
     (let [source (half-payload payload source-dtype expected-elements)
           slab-by-name (into {} (map (juxt :name identity)) (:slabs (:layout pool)))
+          runs (transfer-runs resident-route start token-count (:page-size pool))
           entries
           (vec
            (mapcat
             (fn [{:keys [slab layer element-offset]}]
               (let [slab-layout (get slab-by-name slab)
                     per-token (:elements-per-token slab-layout)]
-                (loop [relative-token 0
-                       transfers []]
-                  (if (= relative-token token-count)
-                    transfers
-                    (let [logical-token (+ start relative-token)
-                          logical-page (quot logical-token (:page-size pool))
-                          offset-in-page (rem logical-token (:page-size pool))
-                          physical-page (nth (:pages resident-route) logical-page)
-                          transfer-tokens (min (- token-count relative-token)
-                                               (- (:page-size pool) offset-in-page))]
-                      (recur
-                       (+ relative-token transfer-tokens)
-                       (conj transfers
-                             [(page-view pool slab layer physical-page)
-                              source
-                              {:src-element (+ element-offset (* relative-token per-token))
-                               :dst-element (* offset-in-page per-token)
-                               :elements (* transfer-tokens per-token)}])))))))
+                (mapv
+                 (fn [{:keys [relative-token physical-token token-count]}]
+                   [(token-range-view pool slab-layout layer physical-token token-count)
+                    source
+                    {:src-element (+ element-offset (* relative-token per-token))
+                     :dst-element 0
+                     :elements (* token-count per-token)}])
+                 runs)))
             plan))]
-      (gpu/upload-ranges! (:session pool) entries)
+      (transfer-ranges-measured! pool :upload entries)
       resident-route)))
 
 (defn export-chunk
-  "Gather one immutable route range into the durable FP32 chunk format.
+  "Gather one immutable route range into the durable FP16 chunk format.
 
   The route is leased for the complete device-to-host transfer, so eviction,
   release, and copy-on-write cannot recycle its pages while capture is in
@@ -704,48 +760,35 @@
             halfs (short-array payload-elements)
             slab-by-name (into {} (map (juxt :name identity))
                                (:slabs (:layout pool)))
+            runs (transfer-runs resident-route start token-count (:page-size pool))
             entries
             (vec
              (mapcat
               (fn [{:keys [slab layer element-offset]}]
                 (let [slab-layout (get slab-by-name slab)
                       per-token (:elements-per-token slab-layout)]
-                  (loop [relative-token 0
-                         transfers []]
-                    (if (= relative-token token-count)
-                      transfers
-                      (let [logical-token (+ start relative-token)
-                            logical-page (quot logical-token (:page-size pool))
-                            offset-in-page (rem logical-token (:page-size pool))
-                            physical-page (nth (:pages resident-route) logical-page)
-                            transfer-tokens (min (- token-count relative-token)
-                                                 (- (:page-size pool) offset-in-page))]
-                        (recur
-                         (+ relative-token transfer-tokens)
-                         (conj transfers
-                               [(page-view pool slab layer physical-page)
-                                halfs
-                                {:src-element (* offset-in-page per-token)
-                                 :dst-element (+ element-offset
-                                                 (* relative-token per-token))
-                                 :elements (* transfer-tokens per-token)}])))))))
+                  (mapv
+                   (fn [{:keys [relative-token physical-token token-count]}]
+                     [(token-range-view pool slab-layout layer physical-token token-count)
+                      halfs
+                      {:src-element 0
+                       :dst-element (+ element-offset (* relative-token per-token))
+                       :elements (* token-count per-token)}])
+                   runs)))
               plan))]
-        (gpu/download-ranges! (:session pool) entries)
-        (let [payload (float-array payload-elements)]
-          (dotimes [index payload-elements]
-            (aset payload index (Float/float16ToFloat (aget halfs index))))
+        (transfer-ranges-measured! pool :download entries)
+        (let [durable-layout (assoc (:layout pool)
+                                    :dtype :float16
+                                    :byte-order :little-endian)]
           (cond->
            (merge descriptor
-                  {:chunk/version 2
+                  {:chunk/version 3
                    :chunk/model-fingerprint model-fingerprint
-                   :chunk/layout
-                   {:dtype :float32
-                    :byte-order (if (= ByteOrder/LITTLE_ENDIAN
-                                       (ByteOrder/nativeOrder))
-                                  :little-endian :big-endian)
-                    :attention-state (:layout pool)}
+                   :chunk/layout {:dtype :float16
+                                  :byte-order :little-endian
+                                  :attention-state durable-layout}
                    :chunk/slabs plan
-                   :chunk/payload payload})
+                   :chunk/payload halfs})
             (apply = (map :elements plan))
             (assoc :chunk/elements-per-slab (:elements (first plan))))))
       (finally

@@ -85,12 +85,20 @@
                                :start-position 0}}}))
         descriptor {:chunk/start 2
                     :chunk/token-count 4
-                    :chunk/layout (continuation/model-layout model)}
+                    :chunk/layout
+                    (assoc-in (continuation/model-layout model)
+                              [:attention-state :dtype] :float16)}
         ;; 2 slabs × 2 layers × 4 tokens × 2 elements/token
-        payload (float-array (map float (range 32)))]
+        payload (short-array (map #(Float/floatToFloat16 (float %)) (range 32)))]
     (with-redefs [gpu/buffer-view (fn [_ key opts] {:key key :opts opts})
-                  gpu/upload-ranges!
-                  (fn [_ entries] (reset! uploads entries) (mapv second entries))]
+                  gpu/submit-upload-ranges!
+                  (fn [_ entries] (reset! uploads entries) entries)
+                  gpu/await-event! (fn [_ entries] (mapv second entries))
+                  gpu/event-measurement
+                  (fn [& _] {:direction :upload :timing-source :device-event
+                             :asynchronous? true :bytes 64 :commands 8
+                             :elapsed-ns 40 :submit-host-ns 4 :host-wall-ns 50})
+                  gpu/release-event! (fn [& _] nil)]
       (page-pool/restore-chunk! pool :continuation descriptor payload)
       (testing "each slab/layer splits at the logical page boundary"
         (is (= 8 (count @uploads)))
@@ -98,14 +106,49 @@
                 :pool-v0 :pool-v0 :pool-v1 :pool-v1]
                (mapv #(get-in % [0 :key]) @uploads))))
       (testing "logical tokens 2-3 target physical page 5; 4-5 target page 1"
-        (is (= [40 8 40 8 40 8 40 8]
+        (is (= [44 8 44 8 44 8 44 8]
                (mapv #(quot (get-in % [0 :opts :byte-offset]) 2) @uploads)))
-        (is (= [4 0 4 0 4 0 4 0]
+        (is (= [0 0 0 0 0 0 0 0]
                (mapv #(get-in % [2 :dst-element]) @uploads))))
       (testing "source slices follow slab/layer payload order"
         (is (= [0 4 8 12 16 20 24 28]
                (mapv #(get-in % [2 :src-element]) @uploads)))
-        (is (every? #(= 4 (get-in % [2 :elements])) @uploads))))))
+        (is (every? #(= 4 (get-in % [2 :elements])) @uploads)))
+      (is (= 64 (get-in (page-pool/transfer-stats pool)
+                        [:counters [:upload :device-event true] :bytes]))))))
+
+(deftest durable-chunk-coalesces-contiguous-physical-pages
+  (let [uploads (atom nil)
+        pool (fixture-pool
+              (atom {:free (sorted-set 0 3 4 5 6 7)
+                     :refcounts {1 1, 2 1}
+                     :routes {:continuation
+                              {:continuation-id :continuation
+                               :pages [1 2]
+                               :token-count 8
+                               :start-position 0}}}))
+        descriptor {:chunk/start 2
+                    :chunk/token-count 4
+                    :chunk/layout
+                    (assoc-in (continuation/model-layout model)
+                              [:attention-state :dtype] :float16)}
+        payload (short-array 32)]
+    (with-redefs [gpu/buffer-view (fn [_ key opts] {:key key :opts opts})
+                  gpu/submit-upload-ranges!
+                  (fn [_ entries] (reset! uploads entries) entries)
+                  gpu/await-event! (fn [_ entries] (mapv second entries))
+                  gpu/event-measurement
+                  (fn [& _] {:direction :upload :timing-source :device-event
+                             :asynchronous? true :bytes 64 :commands 4
+                             :elapsed-ns 30 :submit-host-ns 3 :host-wall-ns 40})
+                  gpu/release-event! (fn [& _] nil)]
+      (page-pool/restore-chunk! pool :continuation descriptor payload)
+      (is (= 4 (count @uploads))
+          "one contiguous run is submitted for each slab/layer")
+      (is (= [12 12 12 12]
+             (mapv #(quot (get-in % [0 :opts :byte-offset]) 2) @uploads)))
+      (is (= [0 8 16 24] (mapv #(get-in % [2 :src-element]) @uploads)))
+      (is (every? #(= 8 (get-in % [2 :elements])) @uploads)))))
 
 (deftest resident-pages-gather-into-the-portable-durable-chunk-layout
   (let [downloads (atom nil)
@@ -120,7 +163,9 @@
                                :start-position 0}}}))
         descriptor {:chunk/start 2 :chunk/token-count 4}]
     (with-redefs [gpu/buffer-view (fn [_ key opts] {:key key :opts opts})
-                  gpu/download-ranges!
+                  gpu/submit-download-ranges!
+                  (fn [_ entries] (reset! downloads entries) entries)
+                  gpu/await-event!
                   (fn [_ entries]
                     (reset! downloads entries)
                     (doseq [[_ ^shorts destination {:keys [dst-element elements]}] entries
@@ -129,17 +174,24 @@
                         (aset destination destination-index
                               (Float/floatToFloat16
                                (float (inc destination-index))))))
-                    (mapv second entries))]
+                    (mapv second entries))
+                  gpu/event-measurement
+                  (fn [& _] {:direction :download :timing-source :host-monotonic
+                             :asynchronous? false :bytes 64 :commands 8
+                             :elapsed-ns 60 :submit-host-ns 60 :host-wall-ns 60})
+                  gpu/release-event! (fn [& _] nil)]
       (let [chunk (page-pool/export-chunk
                    pool :continuation "fixture-paged-v1" descriptor)]
-        (is (= 2 (:chunk/version chunk)))
+        (is (= 3 (:chunk/version chunk)))
         (is (= "fixture-paged-v1" (:chunk/model-fingerprint chunk)))
-        (is (= :float32 (get-in chunk [:chunk/layout :dtype])))
-        (is (= (mapv float (range 1 33))
+        (is (= :float16 (get-in chunk [:chunk/layout :dtype])))
+        (is (= (mapv #(Float/floatToFloat16 (float %)) (range 1 33))
                (vec (:chunk/payload chunk))))
         (is (= 8 (count @downloads))
             "every slab/layer splits at the physical page boundary")
-        (is (zero? (:active-leases (page-pool/stats pool))))))))
+        (is (zero? (:active-leases (page-pool/stats pool))))
+        (is (= :host-monotonic
+               (get-in (page-pool/transfer-stats pool) [:last :timing-source])))))))
 
 (deftest dense-routes-compose-unrelated-continuations-into-a-batch
   (let [pool (fixture-pool

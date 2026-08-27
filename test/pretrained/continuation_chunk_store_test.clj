@@ -14,19 +14,24 @@
       (Files/deleteIfExists path)))
   (Files/deleteIfExists directory))
 
-(deftest stores-and-maps-one-contiguous-fp32-payload
+(deftest stores-and-maps-one-contiguous-fp16-carrier-payload
   (let [directory (Files/createTempDirectory
                    "pretrained-kv-chunks-"
                    (make-array java.nio.file.attribute.FileAttribute 0))
         store (chunk-store/open-store directory)
-        chunk {:chunk/version 2
+        values [1 2 3 4 5 6 7 8]
+        chunk {:chunk/version 3
                :chunk/model-fingerprint "fixture-v1"
-               :chunk/layout (continuation/model-layout
-                              {:n-layers 1 :n-kv 1 :head-dim 2})
+               :chunk/layout
+               (-> (continuation/model-layout
+                    {:n-layers 1 :n-kv 1 :head-dim 2})
+                   (assoc :dtype :float16 :byte-order :little-endian)
+                   (assoc-in [:attention-state :dtype] :float16))
                :chunk/start 0
                :chunk/token-count 2
                :chunk/prefix-hash (random-uuid)
-               :chunk/payload (float-array [1 2 3 4 5 6 7 8])}]
+               :chunk/payload
+               (short-array (map #(Float/floatToFloat16 (float %)) values))}]
     (try
       (let [first-write (chunk-store/put! store chunk)
             second-write (chunk-store/put! store chunk)]
@@ -38,11 +43,14 @@
          store (:store-key first-write)
          (fn [payload]
            (let [^MemorySegment segment (:segment payload)
-                 float-le (.withOrder ValueLayout/JAVA_FLOAT_UNALIGNED
+                 short-le (.withOrder ValueLayout/JAVA_SHORT_UNALIGNED
                                       ByteOrder/LITTLE_ENDIAN)]
-             (is (= :float32 (:element-type payload)))
+             (is (= :int16 (:element-type payload)))
              (is (= 8 (:element-count payload)))
-             (is (= [1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0]
-                    (mapv #(.getAtIndex segment float-le %) (range 8))))))))
+             (is (= (mapv double values)
+                    (mapv #(double
+                            (Float/float16ToFloat
+                             (.getAtIndex segment short-le %)))
+                          (range 8))))))))
       (finally
         (delete-directory! directory)))))
