@@ -171,7 +171,7 @@
 (defn- linked-paged-executable!
   [decode-state pool batch-size pages-per-sequence prefix query-view positions-view
    key-view value-view output-view]
-  (let [{:keys [sess model device-id]} decode-state
+  (let [{:keys [sess model device-id device-desc]} decode-state
         staged (staged-executables! decode-state)
         slot-prefix (str prefix "-append")
         route-prefix (str prefix "-attention")
@@ -200,6 +200,7 @@
                        :pages-per-sequence pages-per-sequence
                        :scale (:attn-scale model)
                        :visibility (layer-visibility model layer)
+                       :device-desc device-desc
                        :query-dtype :float
                        :output-dtype :float
                        :query-view query-view

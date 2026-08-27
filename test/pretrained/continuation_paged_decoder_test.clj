@@ -149,6 +149,8 @@
                       :model one-layer-model
                       :maxpos 8
                       :device-id :ocl:0
+                      :device-desc {:device-type :gpu :vendor "Intel"
+                                    :subgroup-size 16 :max-workgroup-size 256}
                       :stage-executables
                       {:layers [{:pre pre :post post}]
                        :head-tail head}}
@@ -171,6 +173,10 @@
                [(-> @captured :instances first :id)
                 (-> @captured :instances last :id)]))
         (is (= :internal (get-in @captured [:nodes :at :role])))
+        (is (= :routed-paged-subgroup-online-score-reuse
+               (->> (:instances @captured)
+                    (some #(when (= [::paged-decoder/attention 0] (:id %)) %))
+                    :descriptor :steps first :artifact :attributes :strategy)))
         (is (= :state (get-in @captured [:nodes :r0 :role]))
             "the decoder tail feeds the next token embedding back into r0")
         (is (= :state (get-in @captured [:nodes :k0 :role])))
