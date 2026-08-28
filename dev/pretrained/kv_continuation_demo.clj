@@ -4,6 +4,7 @@
             [pretrained.continuation.benchmark :as benchmark]
             [pretrained.continuation.gpu :as continuation-gpu]
             [pretrained.continuation.manager :as manager]
+            [pretrained.continuation.page-pool :as page-pool]
             [pretrained.continuation.paged-decoder :as paged-decoder]
             [pretrained.continuation.residency :as residency]
             [pretrained.continuation.scheduler :as scheduler]
@@ -204,6 +205,12 @@
                :first-restored-tokens
                (mapv :token (get-in result [:restored :first-measured :steps]))))
       (finally
-        (when @decoder (paged-decoder/close! @decoder))
-        (when @dstate (gpu/close-session! (:sess @dstate)))
-        (.close cache)))))
+        (try
+          (when @decoder
+            (try
+              (paged-decoder/close! @decoder)
+              (finally
+                (page-pool/close-transfer-engines! (:pool @decoder)))))
+          (finally
+            (when @dstate (gpu/close-session! (:sess @dstate)))
+            (.close cache)))))))

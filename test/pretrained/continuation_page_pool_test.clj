@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [pretrained.attention-state :as attention-state]
             [pretrained.continuation :as continuation]
+            [pretrained.continuation.block-transfer :as block-transfer]
             [pretrained.continuation.page-pool :as page-pool]
             [raster.gpu.core :as gpu]))
 
@@ -149,6 +150,72 @@
              (mapv #(quot (get-in % [0 :opts :byte-offset]) 2) @uploads)))
       (is (= [0 8 16 24] (mapv #(get-in % [2 :src-element]) @uploads)))
       (is (every? #(= 8 (get-in % [2 :elements])) @uploads)))))
+
+(deftest fragmented-durable-chunk-uses-dense-resident-block-staging
+  (let [opened (atom [])
+        runs (atom [])
+        submissions (atom [])
+        pool (fixture-pool
+              (atom {:free (sorted-set 3 5 7)
+                     :refcounts {0 1, 1 1, 2 1, 4 1, 6 1}
+                     :routes {:continuation
+                              {:continuation-id :continuation
+                               :pages [0 2 4 6 1]
+                               :token-count 20
+                               :start-position 0}}}))
+        descriptor {:chunk/start 0
+                    :chunk/token-count 20
+                    :chunk/layout
+                    (assoc-in (continuation/model-layout model)
+                              [:attention-state :dtype] :float16)}
+        payload (short-array (* 2 2 20 2))]
+    (with-redefs [block-transfer/open!
+                  (fn [_ _ _ _ _ nblocks]
+                    (let [engine {:nblocks nblocks}]
+                      (swap! opened conj engine)
+                      engine))
+                  block-transfer/index-buffer-key
+                  (fn [engine] [:indices (:nblocks engine)])
+                  block-transfer/staging-buffer-key
+                  (fn [engine slab layer]
+                    [:staging (:nblocks engine) slab layer])
+                  block-transfer/run!
+                  (fn [engine direction]
+                    (swap! runs conj [(:nblocks engine) direction]))
+                  gpu/submit-upload-ranges!
+                  (fn [_ entries]
+                    (let [event {:direction :upload :entries (vec entries)}]
+                      (swap! submissions conj event)
+                      event))
+                  gpu/submit-download-ranges!
+                  (fn [_ entries]
+                    (let [event {:direction :download :entries (vec entries)}]
+                      (swap! submissions conj event)
+                      event))
+                  gpu/await-event!
+                  (fn [_ event] (mapv second (:entries event)))
+                  gpu/event-measurement
+                  (fn [_ event]
+                    {:direction (:direction event)
+                     :timing-source :host-monotonic
+                     :asynchronous? false
+                     :bytes 160
+                     :commands (count (:entries event))
+                     :elapsed-ns 40 :submit-host-ns 40 :host-wall-ns 40})
+                  gpu/release-event! (fn [& _] nil)]
+      (is (= {:page-blocks 5 :token-capacity 20
+              :staging-bytes 320 :index-bytes 20 :workspace-bytes 340}
+             (page-pool/prepare-block-transfer! pool 17)))
+      (page-pool/restore-chunk! pool :continuation descriptor payload)
+      (let [chunk (page-pool/export-chunk
+                   pool :continuation "fragmented-fixture" descriptor)]
+        (is (= (alength payload) (alength ^shorts (:chunk/payload chunk)))))
+      (is (= [{:nblocks 5}] @opened))
+      (is (= [[5 :scatter] [5 :gather]] @runs))
+      (is (= [[:upload 5] [:upload 1] [:download 4]]
+             (mapv (juxt :direction (comp count :entries)) @submissions)))
+      (is (= #{5}
+             (set (keys (:block-transfer-engines @(:state pool)))))))))
 
 (deftest resident-pages-gather-into-the-portable-durable-chunk-layout
   (let [downloads (atom nil)

@@ -115,6 +115,10 @@
                       present?))
                   page-pool/page-pool? (constantly true)
                   page-pool/transfer-stats (fn [_] @transfers)
+                  page-pool/prepare-block-transfer!
+                  (fn [_ token-count]
+                    {:page-blocks 1 :token-capacity token-count
+                     :workspace-bytes 80})
                   manager/checkpoint-paged-chunks-async!
                   (fn [& _]
                     (record-transfer! :download)
@@ -137,6 +141,8 @@
              {:iterations 2 :warmups 1 :decode-tokens 3})
             first-restored (get-in result [:restored :first-measured])]
         (is (= 80 (get-in result [:checkpoint :stored-bytes])))
+        (is (= 80 (get-in result
+                          [:block-transfer-preparation :workspace-bytes])))
         (is (= 3 (:cached-token-count first-restored)))
         (is (= [4 5 6]
                (mapv :context-token-count (:steps first-restored))))
