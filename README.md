@@ -138,8 +138,15 @@ Paged checkpoint and restore results also contain `:transfer` or
 `[direction timing-source asynchronous?]`. These report Raster's measured bytes,
 commands, device/host elapsed time, submission time, and wall time, keeping
 OpenCL event timing distinct from Level Zero host-coherent copies. Adjacent
-physical pages are submitted as one contiguous run per KV slab/layer; fragmented
-routes remain correct and produce one command per physical run.
+physical pages are submitted as one contiguous run per KV slab/layer. Highly
+fragmented page-aligned chunks instead upload/download dense staging buffers and
+run a composed Raster block scatter/gather graph resident-side. Chunks that
+overlap shared page boundaries retain the exact physical-range path.
+`benchmark-paged-continuation!` prepares the chunk-sized shared staging engine
+before measuring continuation latency and reports its one-time compile/allocation
+cost and workspace bytes as `:block-transfer-preparation`. Serving schedulers can
+call `pretrained.continuation.page-pool/prepare-block-transfer!` at worker startup
+for the chunk sizes they admit.
 Chunk identities use Hasch and are published as Datahike
 `:db.type/store-ref` values, while the prefix hash separately identifies the
 causal token chain.

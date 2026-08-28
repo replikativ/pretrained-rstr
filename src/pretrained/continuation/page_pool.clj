@@ -5,6 +5,7 @@
   Continuations therefore share, copy, and release a coherent model state page,
   while Raster owns the stable device allocations and checked buffer views."
   (:require [pretrained.attention-state :as attention-state]
+            [pretrained.continuation.block-transfer :as block-transfer]
             [raster.gpu.core :as gpu])
   (:import [java.lang.foreign MemorySegment]
            [java.util UUID]))
@@ -113,6 +114,82 @@
       (finally
         (gpu/release-event! session event)))))
 
+(def ^:private fragmented-run-threshold 4)
+
+(defn- block-transfer-eligible?
+  [pool resident-route start token-count runs]
+  (let [page-size (:page-size pool)
+        end (+ start token-count)]
+    (and (= :half (:dtype pool))
+         (> (count runs) fragmented-run-threshold)
+         (zero? (rem start page-size))
+         (or (zero? (rem end page-size))
+             (= end (:token-count resident-route))))))
+
+(defn- block-engine!
+  [pool nblocks]
+  (locking pool
+    (or (get-in @(:state pool) [:block-transfer-engines nblocks])
+        (let [engine (block-transfer/open!
+                      (:session pool) (:layout pool) (:page-size pool)
+                      (:physical-pages pool) (:buffer-keys pool) nblocks)]
+          (swap! (:state pool) assoc-in [:block-transfer-engines nblocks] engine)
+          engine))))
+
+(defn- block-page-indices
+  [resident-route start token-count page-size]
+  (let [first-page (quot start page-size)
+        nblocks (page-count token-count page-size)]
+    (int-array (subvec (:pages resident-route)
+                       first-page (+ first-page nblocks)))))
+
+(defn- restore-blocks!
+  [pool resident-route start token-count plan source]
+  (let [nblocks (page-count token-count (:page-size pool))
+        engine (block-engine! pool nblocks)
+        indices (block-page-indices resident-route start token-count
+                                    (:page-size pool))
+        slab-by-name (into {} (map (juxt :name identity)) (:slabs (:layout pool)))
+        entries
+        (into
+         [[(block-transfer/index-buffer-key engine) indices {:elements nblocks}]]
+         (map
+          (fn [{:keys [slab layer element-offset]}]
+            (let [per-token (:elements-per-token (get slab-by-name slab))]
+              [(block-transfer/staging-buffer-key engine slab layer)
+               source
+               {:src-element element-offset
+                :dst-element 0
+                :elements (* token-count per-token)}]))
+          plan))]
+    (locking engine
+      (transfer-ranges-measured! pool :upload entries)
+      (block-transfer/run! engine :scatter))))
+
+(defn- export-blocks!
+  [pool resident-route start token-count plan destination]
+  (let [nblocks (page-count token-count (:page-size pool))
+        engine (block-engine! pool nblocks)
+        indices (block-page-indices resident-route start token-count
+                                    (:page-size pool))
+        slab-by-name (into {} (map (juxt :name identity)) (:slabs (:layout pool)))]
+    (locking engine
+      (transfer-ranges-measured!
+       pool :upload
+       [[(block-transfer/index-buffer-key engine) indices {:elements nblocks}]])
+      (block-transfer/run! engine :gather)
+      (transfer-ranges-measured!
+       pool :download
+       (mapv
+        (fn [{:keys [slab layer element-offset]}]
+          (let [per-token (:elements-per-token (get slab-by-name slab))]
+            [(block-transfer/staging-buffer-key engine slab layer)
+             destination
+             {:src-element 0
+              :dst-element element-offset
+              :elements (* token-count per-token)}]))
+        plan)))))
+
 (defn- buffer-key
   [prefix slab layer]
   (keyword (str prefix "-" (name (:name slab)) "-" (long layer))))
@@ -174,6 +251,7 @@
               :refcounts {}
               :leases {}
               :routes {}
+              :block-transfer-engines {}
               :transfers {:counters {} :last nil}})))))
 
 (defn buffer-keys
@@ -248,6 +326,60 @@
   Values are immutable snapshots suitable for metrics and benchmark reports."
   [pool]
   (or (:transfers @(:state pool)) {:counters {} :last nil}))
+
+(defn prepare-block-transfer!
+  "Prepare shared FP16 gather/scatter staging for `token-count` tokens.
+
+  This moves one-time Raster graph compilation and staging allocation out of a
+  latency-sensitive fragmented restore or checkpoint. Engines are reused by
+  page count, so repeated calls for token counts in the same page-count bucket
+  do not reserve more memory. Returns the prepared page and workspace capacity.
+
+  Throws when `pool` is not FP16, `token-count` is not positive, or the requested
+  staging extent exceeds the physical page pool."
+  [pool token-count]
+  (when-not (= :half (:dtype pool))
+    (throw (ex-info "Block-transfer staging requires an FP16 page pool"
+                    {:dtype (:dtype pool)})))
+  (when-not (and (integer? token-count) (pos? token-count))
+    (throw (ex-info "Block-transfer staging requires a positive token count"
+                    {:token-count token-count})))
+  (let [nblocks (page-count (long token-count) (:page-size pool))]
+    (when (> nblocks (:physical-pages pool))
+      (throw (ex-info "Block-transfer staging exceeds page-pool capacity"
+                      {:token-count token-count
+                       :page-blocks nblocks
+                       :physical-pages (:physical-pages pool)})))
+    (block-engine! pool nblocks)
+    (let [elements-per-page
+          (reduce + 0
+                  (map #(* (long (:count %))
+                           (long (:elements-per-token %))
+                           (long (:page-size pool)))
+                       (:slabs (:layout pool))))
+          staging-bytes (* 2 nblocks elements-per-page)
+          index-bytes (* Integer/BYTES nblocks)]
+      {:page-blocks nblocks
+       :token-capacity (* nblocks (:page-size pool))
+       :staging-bytes staging-bytes
+       :index-bytes index-bytes
+       :workspace-bytes (+ staging-bytes index-bytes)})))
+
+(defn close-transfer-engines!
+  "Release lazily compiled fragmented-route staging engines owned by `pool`.
+
+  The page pool's attention-state buffers remain resident. Call this before
+  closing the owning Raster session when a pool is managed independently."
+  [pool]
+  (let [engines
+        (locking pool
+          (let [engines (vals (:block-transfer-engines @(:state pool)))]
+            (swap! (:state pool) assoc :block-transfer-engines {})
+            engines))]
+    (doseq [engine engines]
+      (locking engine
+        (block-transfer/close! engine))))
+  nil)
 
 (defn- take-free-pages
   [state n continuation-id]
@@ -676,8 +808,9 @@
   "Scatter one durable chunk payload into an allocated resident route.
 
   The chunk may begin/end inside pages and cross arbitrary physical-page IDs.
-  Current Raster attention consumes FP16 pools. FP16 mmap segments upload
-  directly without an intermediate JVM array. Returns the resident route."
+  Contiguous runs upload directly. Highly fragmented page-aligned ranges use
+  dense FP16 staging plus one composed Raster block-scatter graph. FP16 mmap
+  segments require no intermediate JVM array. Returns the resident route."
   [pool continuation-id descriptor payload]
   (let [resident-route (route pool continuation-id)
         start (long (:chunk/start descriptor))
@@ -707,24 +840,29 @@
       (throw (ex-info "Chunk restore conversion currently targets FP16 device pools"
                       {:pool-dtype (:dtype pool)})))
     (let [source (half-payload payload source-dtype expected-elements)
-          slab-by-name (into {} (map (juxt :name identity)) (:slabs (:layout pool)))
-          runs (transfer-runs resident-route start token-count (:page-size pool))
-          entries
-          (vec
-           (mapcat
-            (fn [{:keys [slab layer element-offset]}]
-              (let [slab-layout (get slab-by-name slab)
-                    per-token (:elements-per-token slab-layout)]
-                (mapv
-                 (fn [{:keys [relative-token physical-token token-count]}]
-                   [(token-range-view pool slab-layout layer physical-token token-count)
-                    source
-                    {:src-element (+ element-offset (* relative-token per-token))
-                     :dst-element 0
-                     :elements (* token-count per-token)}])
-                 runs)))
-            plan))]
-      (transfer-ranges-measured! pool :upload entries)
+          runs (transfer-runs resident-route start token-count (:page-size pool))]
+      (if (block-transfer-eligible? pool resident-route start token-count runs)
+        (restore-blocks! pool resident-route start token-count plan source)
+        (let [slab-by-name (into {} (map (juxt :name identity))
+                                 (:slabs (:layout pool)))
+              entries
+              (vec
+               (mapcat
+                (fn [{:keys [slab layer element-offset]}]
+                  (let [slab-layout (get slab-by-name slab)
+                        per-token (:elements-per-token slab-layout)]
+                    (mapv
+                     (fn [{:keys [relative-token physical-token token-count]}]
+                       [(token-range-view pool slab-layout layer
+                                          physical-token token-count)
+                        source
+                        {:src-element (+ element-offset
+                                         (* relative-token per-token))
+                         :dst-element 0
+                         :elements (* token-count per-token)}])
+                     runs)))
+                plan))]
+          (transfer-ranges-measured! pool :upload entries)))
       resident-route)))
 
 (defn export-chunk
@@ -733,9 +871,10 @@
   The route is leased for the complete device-to-host transfer, so eviction,
   release, and copy-on-write cannot recycle its pages while capture is in
   flight. Physical page boundaries are independent of the requested durable
-  chunk. Current exact-prefix identity assumes absolute positions start at zero;
-  compacted nonzero-position routes are rejected until position semantics are
-  included in the content identity."
+  chunk. Highly fragmented page-aligned ranges gather through dense resident
+  staging; other ranges transfer their exact physical runs. Current exact-prefix
+  identity assumes absolute positions start at zero; compacted nonzero-position
+  routes are rejected until position semantics enter the content identity."
   [pool continuation-id model-fingerprint descriptor]
   (when-not (= :half (:dtype pool))
     (throw (ex-info "Paged chunk export currently requires an FP16 page pool"
@@ -758,25 +897,29 @@
             plan (attention-state/payload-plan (:layout pool) token-count)
             payload-elements (reduce + 0 (map :elements plan))
             halfs (short-array payload-elements)
-            slab-by-name (into {} (map (juxt :name identity))
-                               (:slabs (:layout pool)))
-            runs (transfer-runs resident-route start token-count (:page-size pool))
-            entries
-            (vec
-             (mapcat
-              (fn [{:keys [slab layer element-offset]}]
-                (let [slab-layout (get slab-by-name slab)
-                      per-token (:elements-per-token slab-layout)]
-                  (mapv
-                   (fn [{:keys [relative-token physical-token token-count]}]
-                     [(token-range-view pool slab-layout layer physical-token token-count)
-                      halfs
-                      {:src-element 0
-                       :dst-element (+ element-offset (* relative-token per-token))
-                       :elements (* token-count per-token)}])
-                   runs)))
-              plan))]
-        (transfer-ranges-measured! pool :download entries)
+            runs (transfer-runs resident-route start token-count (:page-size pool))]
+        (if (block-transfer-eligible? pool resident-route start token-count runs)
+          (export-blocks! pool resident-route start token-count plan halfs)
+          (let [slab-by-name (into {} (map (juxt :name identity))
+                                   (:slabs (:layout pool)))
+                entries
+                (vec
+                 (mapcat
+                  (fn [{:keys [slab layer element-offset]}]
+                    (let [slab-layout (get slab-by-name slab)
+                          per-token (:elements-per-token slab-layout)]
+                      (mapv
+                       (fn [{:keys [relative-token physical-token token-count]}]
+                         [(token-range-view pool slab-layout layer
+                                            physical-token token-count)
+                          halfs
+                          {:src-element 0
+                           :dst-element (+ element-offset
+                                           (* relative-token per-token))
+                           :elements (* token-count per-token)}])
+                       runs)))
+                  plan))]
+            (transfer-ranges-measured! pool :download entries)))
         (let [durable-layout (assoc (:layout pool)
                                     :dtype :float16
                                     :byte-order :little-endian)]

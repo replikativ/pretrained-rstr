@@ -347,6 +347,12 @@
         prompt-ids (vec prompt-ids)
         _ (when-not (seq prompt-ids)
             (throw (ex-info "Continuation benchmark requires a nonempty prompt" {})))
+        preparation
+        (timed #(page-pool/prepare-block-transfer!
+                 pool
+                 (min (long (or (:chunk-size cache)
+                                (max 1 (dec (count prompt-ids)))))
+                      (max 1 (dec (count prompt-ids))))))
         uncached-operation #(continuation-sample!
                              decoder prompt-ids (long decode-tokens) nil)
         _ (uncached-operation)
@@ -376,6 +382,8 @@
     {:prompt {:logical-token-count (count prompt-ids)
               :processed-token-count (dec (count prompt-ids))}
      :decode-tokens (long decode-tokens)
+     :block-transfer-preparation
+     (assoc (:value preparation) :milliseconds (:milliseconds preparation))
      :checkpoint checkpoint
      :uncached {:first-measured uncached-first
                 :warm uncached-warm}
