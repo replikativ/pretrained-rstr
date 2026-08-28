@@ -6,10 +6,11 @@
  ;; compilable blocks + quant kernels stay in raster.
  ;;
  ;; raster is released on Clojars (Maven-resolvable; its POM declares TypedClojure).
- ;; 0.2.395 adds bounded routed-attention traversal, resident block transfers,
- ;; and measurable asynchronous range transfers across the GPU backends.
+ ;; 0.2.396 adds bounded routed-attention traversal, resident block transfers,
+ ;; measurable asynchronous range transfers, and verified KernelBody lowering
+ ;; for scheduled weighted reductions across the GPU backends.
  ;; The :dev alias overrides raster with the sibling checkout for local work.
- :deps {org.replikativ/raster {:mvn/version "0.2.395"}
+ :deps {org.replikativ/raster {:mvn/version "0.2.396"}
         org.replikativ/boring {:mvn/version "0.1.27"}
         org.replikativ/hasch {:mvn/version "0.4.103"}
         org.replikativ/konserve {:mvn/version "0.9.379"}
