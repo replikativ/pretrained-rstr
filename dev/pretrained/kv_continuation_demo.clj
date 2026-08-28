@@ -171,14 +171,18 @@
   Intended for an nREPL with `:dev`. Model loading is deliberately outside the
   measurement. `opts` requires `:max-position` and may contain `:page-size`,
   `:physical-pages`, `:chunk-size`, `:iterations`, `:warmups`,
-  `:decode-tokens`, and the fingerprint options accepted by `fingerprint`.
+  `:decode-tokens`, `:attention-schedule`, `:history-tile-size`, and the
+  fingerprint options accepted by `fingerprint`. `:device-id` defaults to
+  Raster's `:ze:0` and may select an OpenCL device such as `:ocl:0`.
 
   Returns the instrumented benchmark plus the first restored token sequence.
   The function closes the temporary manager, paged decoder, and Raster session."
   [model prompt-ids datahike-config cache-directory opts]
   (let [{:keys [max-position page-size physical-pages chunk-size
-                iterations warmups decode-tokens]
-         :or {page-size 16 iterations 5 warmups 1 decode-tokens 4}} opts
+                iterations warmups decode-tokens attention-schedule
+                history-tile-size device-id]
+         :or {page-size 16 iterations 5 warmups 1 decode-tokens 4
+              device-id :ze:0}} opts
         model-fingerprint (fingerprint model opts)
         _ (when-not (and (integer? max-position) (pos? max-position))
             (throw (ex-info "Paged benchmark requires a positive :max-position"
@@ -191,10 +195,15 @@
     (try
       (vreset! dstate
                (decoder-gpu/bind-decode!
-                model :maxpos max-position :cache-mode :paged :batch-size 1))
+                model :maxpos max-position :cache-mode :paged :batch-size 1
+                :device-id device-id))
       (vreset! decoder
                (paged-decoder/open!
-                @dstate :page-size page-size :physical-pages physical-pages))
+                @dstate
+                :page-size page-size
+                :physical-pages physical-pages
+                :attention-schedule attention-schedule
+                :history-tile-size history-tile-size))
       (let [result
             (benchmark/benchmark-paged-continuation!
              cache @decoder model-fingerprint (vec prompt-ids)

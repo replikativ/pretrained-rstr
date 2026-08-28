@@ -97,6 +97,7 @@ continuation boundary as uninterrupted inference.
 ```clojure
 (require '[pretrained.continuation.benchmark :as bench]
          '[pretrained.continuation.manager :as cache]
+         '[pretrained.continuation.paged-decoder :as paged]
          '[pretrained.model-identity :as identity])
 
 (def fingerprint
@@ -126,6 +127,27 @@ continuation boundary as uninterrupted inference.
  manager engine fingerprint prompt-ids
  {:warmups 1 :iterations 5 :decode-tokens 8})
 ```
+
+Paged decoder construction may pin Raster's attention policy for reproducible
+comparisons. Tiled history keeps its partial online-softmax state compiler-owned;
+the decoder exposes only immutable strategy, tile geometry, launch stages, and
+workspace accounting:
+
+```clojure
+(def tiled-engine
+  (paged/open! dstate
+               :page-size 16
+               :physical-pages 1024
+               :attention-schedule :subgroup-online-tiled-history
+               :history-tile-size 256))
+
+(paged/attention-execution tiled-engine)
+;; => {:strategies {:routed-paged-subgroup-online-tiled-history n-layers}
+;;     :temporary-bytes ... :layers [...]}
+```
+
+Explicit optimized policies fail with Raster's structured decline when the
+target cannot emit them; `:auto` retains Raster's legal fallback behavior.
 
 The benchmark separates prefill, checkpoint submission/drain, first measured
 restore, and process/page-cache-warm restore; it does not label warm pages as
@@ -161,7 +183,8 @@ measurement:
 (demo/run-paged-continuation-benchmark!
  model prompt-ids datahike-config "/var/tmp/gemma-kv-benchmark"
  {:max-position 2048 :chunk-size 256 :decode-tokens 16
-  :warmups 1 :iterations 5})
+  :attention-schedule :subgroup-online-tiled-history
+  :history-tile-size 256 :warmups 1 :iterations 5})
 ```
 
 For cluster durability, pass an already connected authoritative Konserve store
