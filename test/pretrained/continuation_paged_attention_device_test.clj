@@ -1,5 +1,6 @@
 (ns pretrained.continuation-paged-attention-device-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is]]
             [pretrained.attention-state :as attention-state]
             [pretrained.continuation.page-pool :as page-pool]
             [pretrained.continuation.paged-attention :as paged-attention]
@@ -14,6 +15,22 @@
       (catch Throwable _
         false))))
 
+(def ^:private opencl-fp16-available?
+  (delay
+    (try
+      ((requiring-resolve 'raster.gpu.ocl-runtime/init!))
+      (boolean
+       (some #(str/includes? (or (:extensions %) "") "cl_khr_fp16")
+             ((requiring-resolve 'raster.gpu.ocl-runtime/query-devices))))
+      (catch Throwable _ false))))
+
+(defn- available-device
+  []
+  (cond
+    @level-zero-available? :ze:0
+    @opencl-fp16-available? :ocl:0
+    :else nil))
+
 (def ^:private intel-device-desc
   {:device-type :gpu :vendor "Intel"
    :subgroup-size 16 :max-workgroup-size 256})
@@ -23,9 +40,8 @@
   (mapv #(double (Float/float16ToFloat %)) values))
 
 (deftest resident-pages-feed-a-real-raster-attention-graph
-  (if-not @level-zero-available?
-    (is true "Level Zero device unavailable")
-    (let [session (gpu/make-session :ze:0)
+  (if-let [device-id (available-device)]
+    (let [session (gpu/make-session device-id)
           model {:n-layers 1 :n-kv 1 :head-dim 2}]
       (try
         (let [pool (page-pool/open-pool!
@@ -66,6 +82,33 @@
                      :positions [1 0]}))
                   expected [16.6048 26.6048 5.0 7.0]]
               (is (= 4 (count actual)))
+              (is (every? true?
+                          (map #(< (Math/abs (- %1 %2)) 0.04)
+                               expected actual)))))
+          (with-open [runner
+                      (paged-attention/open-runner!
+                       pool {:id :tiled-device-fixture
+                             :device-desc intel-device-desc
+                             :attention-schedule :subgroup-online-tiled-history
+                             :history-tile-size 1
+                             :key-prefix "tiled-device-attention"
+                             :layer 0
+                             :batch-size 2
+                             :total-query-tokens 2
+                             :q-heads 1
+                             :kv-heads 1
+                             :qk-head-dim 2
+                             :value-head-dim 2
+                             :pages-per-sequence 2})]
+            (let [actual
+                  (decode-halfs
+                   (paged-attention/run!
+                    runner
+                    {:continuation-ids [:a :b]
+                     :query-values (float-array [1 0, 1 0])
+                     :row-offsets [0 1 2]
+                     :positions [1 0]}))
+                  expected [16.6048 26.6048 5.0 7.0]]
               (is (every? true?
                           (map #(< (Math/abs (- %1 %2)) 0.04)
                                expected actual)))))
@@ -130,4 +173,5 @@
             (is (some? (gpu/buffer session :resident-query)))
             (is (some? (gpu/buffer session :resident-output)))))
         (finally
-          (gpu/close-session! session))))))
+          (gpu/close-session! session))))
+    (is true "Level Zero and FP16 OpenCL devices unavailable")))

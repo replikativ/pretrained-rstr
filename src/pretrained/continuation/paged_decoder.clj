@@ -22,7 +22,8 @@
 (declare close!)
 
 (defrecord PagedDecoder
-           [decode-state pool executable descriptor-keys pages-per-sequence state]
+           [decode-state pool executable descriptor-keys pages-per-sequence
+            attention-execution state]
   Closeable
   (close [decoder]
     (close! decoder)))
@@ -170,7 +171,7 @@
 
 (defn- linked-paged-executable!
   [decode-state pool batch-size pages-per-sequence prefix query-view positions-view
-   key-view value-view output-view]
+   key-view value-view output-view attention-options]
   (let [{:keys [sess model device-id device-desc]} decode-state
         staged (staged-executables! decode-state)
         slot-prefix (str prefix "-append")
@@ -201,6 +202,8 @@
                        :scale (:attn-scale model)
                        :visibility (layer-visibility model layer)
                        :device-desc device-desc
+                       :attention-schedule (:attention-schedule attention-options)
+                       :history-tile-size (:history-tile-size attention-options)
                        :query-dtype :float
                        :output-dtype :float
                        :query-view query-view
@@ -276,7 +279,9 @@
                           (or (gpu/buffer sess allocation-id)
                               (throw (ex-info "Paged LinkPlan allocation is not resident"
                                               {:allocation allocation-id})))]))
-                  allocation-ids)]
+                  allocation-ids)
+            layer-execution (mapv paged-attention/execution-summary
+                                  attention-plans)]
         {:executable (gpu-link/instantiate!
                       plan {:session sess :external-buffers external-buffers})
          :descriptor-keys
@@ -285,7 +290,12 @@
           :positions (get-in (first attention-plans) [:buffer-keys :query-positions])
           :page-table (get-in (first attention-plans) [:buffer-keys :page-table])
           :lengths (get-in (first attention-plans) [:buffer-keys :lengths])
-          :start-positions (get-in (first attention-plans) [:buffer-keys :start-positions])}
+          :start-positions (get-in (first attention-plans)
+                                   [:buffer-keys :start-positions])}
+         :attention-execution
+         {:layers layer-execution
+          :strategies (frequencies (map :strategy layer-execution))
+          :temporary-bytes (reduce + 0 (map :temporary-bytes layer-execution))}
          :owned-buffer-keys descriptor-keys})
       (catch Throwable error
         (doseq [key descriptor-keys]
@@ -300,11 +310,16 @@
   - `:page-size` defaults to 16 tokens.
   - `:physical-pages` defaults to enough pages for one full route per batch lane.
   - `:key-prefix` optionally supplies deterministic session buffer names.
+  - `:attention-schedule` selects Raster's `:auto`, `:reference`,
+    `:subgroup-online-score-reuse`, or `:subgroup-online-tiled-history` policy.
+  - `:history-tile-size` overrides the tiled schedule's default and is rejected
+    for other policies.
 
   The decoder owns its linked graph but not the decode state, Raster session, or
   page-pool allocations. Closing it releases the graph and descriptor buffers;
   close the decode state's session to release all resident tensors."
-  [decode-state & {:keys [page-size physical-pages key-prefix]
+  [decode-state & {:keys [page-size physical-pages key-prefix attention-schedule
+                          history-tile-size]
                    :or {page-size 16}}]
   (when-not (= :paged (:cache-mode decode-state))
     (throw (ex-info "Paged decoder requires bind-decode! with :cache-mode :paged"
@@ -336,17 +351,29 @@
                                              :id [prefix :value]})
         output-view (gpu/buffer-view sess :at {:shape [q-elements]
                                                :id [prefix :output]})
-        {:keys [executable descriptor-keys owned-buffer-keys]}
+        {:keys [executable descriptor-keys owned-buffer-keys attention-execution]}
         (linked-paged-executable!
          decode-state pool batch-size pages-per-sequence prefix
-         query-view positions-view key-view value-view output-view)]
+         query-view positions-view key-view value-view output-view
+         {:attention-schedule attention-schedule
+          :history-tile-size history-tile-size})]
     (map->PagedDecoder
      {:decode-state decode-state
       :pool pool
       :executable executable
       :descriptor-keys descriptor-keys
       :pages-per-sequence pages-per-sequence
+      :attention-execution attention-execution
       :state (atom {:closed? false :owned-buffer-keys owned-buffer-keys})})))
+
+(defn attention-execution
+  "Return selected per-layer attention strategies and temporary workspace.
+
+  The immutable result is derived from Raster's verified plans when `decoder`
+  is opened and contains no runtime handles. Throws when the decoder is closed."
+  [decoder]
+  (require-open! decoder)
+  (:attention-execution decoder))
 
 (defn allocate-continuation!
   "Allocate an empty resident route for `continuation-id` and return it.

@@ -8,6 +8,7 @@
   geometry remain stable."
   (:refer-clojure :exclude [run!])
   (:require [pretrained.continuation.page-pool :as page-pool]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.attention :as attention]
             [raster.compiler.passes.parallel.attention-route :as attention-route]
             [raster.gpu.core :as gpu])
@@ -19,6 +20,10 @@
 (def ^:private portable-reference-desc
   {:device-type :gpu
    :segmented-weighted-reduction-schedule :reference})
+
+(def ^:private attention-schedules
+  #{:auto :reference :subgroup-score-reuse :subgroup-online-score-reuse
+    :subgroup-online-tiled-history})
 
 (defrecord PagedAttentionRunner
            [session pool problem handle buffer-keys graph-key state]
@@ -56,6 +61,57 @@
                     {:role role :binding view :actual (type view)})))
   view)
 
+(defn- scheduled-device-desc
+  [device-desc attention-schedule history-tile-size]
+  (when (and attention-schedule
+             (not (contains? attention-schedules attention-schedule)))
+    (throw (ex-info "Paged-attention schedule is unsupported"
+                    {:attention-schedule attention-schedule
+                     :supported attention-schedules})))
+  (when (and history-tile-size
+             (not (and (integer? history-tile-size) (pos? history-tile-size))))
+    (throw (ex-info "Paged-attention history tile size must be positive"
+                    {:history-tile-size history-tile-size})))
+  (when (and history-tile-size
+             (not= :subgroup-online-tiled-history attention-schedule))
+    (throw (ex-info "History tile size requires the tiled-history schedule"
+                    {:attention-schedule attention-schedule
+                     :history-tile-size history-tile-size})))
+  (cond-> (or device-desc portable-reference-desc)
+    attention-schedule
+    (assoc :segmented-weighted-reduction-schedule attention-schedule)
+
+    history-tile-size
+    (assoc :segmented-weighted-reduction-history-tile-size
+           (long history-tile-size))))
+
+(defn execution-summary
+  "Summarize a plan's selected schedule and compiler-owned temporary workspace.
+
+  `plan` is the value returned by `reference-plan`. The result is immutable and
+  contains no runtime handles, making it suitable for scheduler budgets,
+  benchmark output, and Datahike observations."
+  [plan]
+  (let [temporary-buffers
+        (mapv (fn [{:keys [id dtype elements]}]
+                {:id id
+                 :dtype dtype
+                 :elements elements
+                 :bytes (* (long elements) (long (dtype/bytes-of dtype)))})
+              (get-in plan [:graph :temporaries]))]
+    {:strategy (:strategy plan)
+     :reference? (:reference? plan)
+     :declines (:declines plan)
+     :schedule (:schedule plan)
+     :optimization-tier (get-in plan [:graph :attributes :optimization-tier])
+     :target-dialect (get-in plan [:graph :attributes :target-dialect])
+     :membership-tiling
+     (get-in plan [:graph :attributes
+                   :segmented-weighted-reduction-schedule
+                   :membership-tiling])
+     :temporary-buffers temporary-buffers
+     :temporary-bytes (reduce + 0 (map :bytes temporary-buffers))}))
+
 (defn- slab
   [pool slab-name layer expected-elements]
   (let [slab-layout (some #(when (= slab-name (:name %)) %)
@@ -84,6 +140,9 @@
   `:q-heads`, `:kv-heads`, `:qk-head-dim`, `:value-head-dim`, and
   `:pages-per-sequence`. `:scale` defaults to `1/sqrt(qk-head-dim)`.
   `:query-dtype` and `:output-dtype` accept `:half` (the default) or `:float`.
+  `:attention-schedule` may explicitly select a Raster schedule. A positive
+  `:history-tile-size` is accepted only with
+  `:subgroup-online-tiled-history`; Raster otherwise supplies its default.
   Optional `:visibility` accepts a Raster interval visibility and defaults to
   full causal attention.
   Optional `:query-view`, `:query-positions-view`, and `:output-view` bind
@@ -96,7 +155,7 @@
   [pool {:keys [id layer batch-size total-query-tokens q-heads kv-heads
                 qk-head-dim value-head-dim pages-per-sequence scale key-prefix
                 query-view query-positions-view output-view query-dtype output-dtype
-                visibility device-desc]
+                visibility device-desc attention-schedule history-tile-size]
          :as opts}]
   (when-not (page-pool/page-pool? pool)
     (throw (ex-info "Paged attention requires a DevicePagePool" {:pool pool})))
@@ -167,7 +226,9 @@
                   :k-layout :page-major
                   :v-layout :page-major
                   :visibility visibility})
-        routed (attention-route/route! problem (or device-desc portable-reference-desc))
+        scheduled-desc (scheduled-device-desc device-desc attention-schedule
+                                              history-tile-size)
+        routed (attention-route/route! problem scheduled-desc)
         specs (attention/buffer-specs problem)
         _ (checked-resident-view :query query-view)
         _ (checked-resident-view :query-positions query-positions-view)
@@ -204,6 +265,7 @@
      :strategy (:strategy routed)
      :reference? (:reference? routed)
      :declines (:declines routed)
+     :schedule (:schedule routed)
      :ids ids
      :buffer-keys keys
      :bindings bindings
@@ -217,7 +279,12 @@
                      :query-dtype query-dtype
                      :output-dtype output-dtype
                      :visibility visibility
-                     :device-desc device-desc)}))
+                     :device-desc scheduled-desc
+                     :attention-schedule
+                     (:segmented-weighted-reduction-schedule scheduled-desc)
+                     :history-tile-size
+                     (:segmented-weighted-reduction-history-tile-size
+                      scheduled-desc))}))
 
 (defn open-runner!
   "Allocate and bind a fixed-capacity Raster paged-attention runner.

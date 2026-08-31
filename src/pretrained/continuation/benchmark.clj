@@ -306,6 +306,7 @@
     (cond->
      {:prompt {:logical-token-count (count prompt-ids)
                :processed-token-count (dec (count prompt-ids))}
+      :attention-execution (paged-decoder/attention-execution decoder)
       :checkpoint checkpoint
       :prefill prefill
       :restore {:first-measured-ms first-ms :warm warm-restore}
@@ -382,6 +383,7 @@
     {:prompt {:logical-token-count (count prompt-ids)
               :processed-token-count (dec (count prompt-ids))}
      :decode-tokens (long decode-tokens)
+     :attention-execution (paged-decoder/attention-execution decoder)
      :block-transfer-preparation
      (assoc (:value preparation) :milliseconds (:milliseconds preparation))
      :checkpoint checkpoint

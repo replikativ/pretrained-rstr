@@ -87,6 +87,50 @@
     (is (= :score-reuse-requires-intel-subgroup-dialect
            (get-in fallback [:declines 0 :reason])))))
 
+(deftest tiled-history-plan-reports-compiler-owned-workspace
+  (let [plan (paged-attention/reference-plan
+              (pool)
+              {:id :tiled-fixture
+               :layer 0
+               :batch-size 1
+               :total-query-tokens 1
+               :q-heads 4
+               :kv-heads 2
+               :qk-head-dim 8
+               :value-head-dim 8
+               :pages-per-sequence 4
+               :device-desc {:device-type :gpu :vendor "Intel"
+                             :subgroup-size 16 :max-workgroup-size 256}
+               :attention-schedule :subgroup-online-tiled-history
+               :history-tile-size 4})
+        summary (paged-attention/execution-summary plan)]
+    (is (= :routed-paged-subgroup-online-tiled-history (:strategy summary)))
+    (is (false? (:reference? summary)))
+    (is (= 2 (count (get-in summary [:schedule :stages]))))
+    (is (= {:kind :static-contiguous-tiles
+            :tile-size 4
+            :tile-count 4
+            :membership-capacity 16
+            :merge-order :increasing-membership-tile}
+           (:membership-tiling summary)))
+    (is (= 4 (count (:temporary-buffers summary))))
+    (is (= 704 (:temporary-bytes summary)))
+    (is (= 4 (get-in plan [:options :history-tile-size])))))
+
+(deftest history-tile-size-requires-an-explicit-tiled-policy
+  (let [options {:layer 0 :batch-size 1 :total-query-tokens 1
+                 :q-heads 4 :kv-heads 2 :qk-head-dim 8 :value-head-dim 8
+                 :pages-per-sequence 4}]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"requires the tiled-history schedule"
+         (paged-attention/reference-plan
+          (pool) (assoc options :attention-schedule :auto
+                        :history-tile-size 4))))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"schedule is unsupported"
+         (paged-attention/reference-plan
+          (pool) (assoc options :attention-schedule :invented))))))
+
 (deftest resident-views-compose-attention-with-adjacent-device-graphs
   (let [page-pool (pool)
         query-view (Object.)

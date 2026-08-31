@@ -54,6 +54,9 @@
                   (fn [_ continuation-id _]
                     (swap! resident conj continuation-id)
                     (swap! primes inc))
+                  paged-decoder/attention-execution
+                  (fn [_] {:strategies {:fp16-reference 2}
+                           :temporary-bytes 0})
                   page-pool/route
                   (fn [_ continuation-id]
                     (when (contains? @resident continuation-id)
@@ -78,6 +81,8 @@
                      :probe-prompt-ids [1 2 9 4]})]
         (is (= 48 (get-in result [:checkpoint :stored-bytes])))
         (is (= 2 (get-in result [:probe :cached-token-count])))
+        (is (= {:fp16-reference 2}
+               (get-in result [:attention-execution :strategies])))
         (is (= {:full-hits 4 :partial-hits 1} (:cache-stats result)))
         (is (pos? @primes))
         (is (empty? @resident)
@@ -101,6 +106,10 @@
                     (swap! resident update continuation-id
                            #(or % {:continuation-id continuation-id
                                    :token-count (dec (count tokens))})))
+                  paged-decoder/attention-execution
+                  (fn [_]
+                    {:strategies {:routed-paged-subgroup-online-tiled-history 2}
+                     :temporary-bytes 4096})
                   paged-decoder/step!
                   (fn [_ continuation-id position]
                     (swap! resident update-in [continuation-id :token-count] inc)
@@ -143,6 +152,7 @@
         (is (= 80 (get-in result [:checkpoint :stored-bytes])))
         (is (= 80 (get-in result
                           [:block-transfer-preparation :workspace-bytes])))
+        (is (= 4096 (get-in result [:attention-execution :temporary-bytes])))
         (is (= 3 (:cached-token-count first-restored)))
         (is (= [4 5 6]
                (mapv :context-token-count (:steps first-restored))))

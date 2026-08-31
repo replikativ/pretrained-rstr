@@ -166,17 +166,22 @@
       (let [result
             (#'paged-decoder/linked-paged-executable!
              decode-state pool 1 2 "fixture"
-             (view :qr) (view :positions) (view :kr) (view :v) (view :at))]
+             (view :qr) (view :positions) (view :kr) (view :v) (view :at)
+             {:attention-schedule :subgroup-online-tiled-history
+              :history-tile-size 2})]
         (is (= ::composite (:executable result)))
         (is (= 5 (count (:instances @captured))))
         (is (= [:pre :head]
                [(-> @captured :instances first :id)
                 (-> @captured :instances last :id)]))
         (is (= :internal (get-in @captured [:nodes :at :role])))
-        (is (= :routed-paged-subgroup-online-score-reuse
+        (is (= :routed-paged-subgroup-online-tiled-history
                (->> (:instances @captured)
                     (some #(when (= [::paged-decoder/attention 0] (:id %)) %))
                     :descriptor :steps first :artifact :attributes :strategy)))
+        (is (= {:routed-paged-subgroup-online-tiled-history 1}
+               (get-in result [:attention-execution :strategies])))
+        (is (= 224 (get-in result [:attention-execution :temporary-bytes])))
         (is (= :state (get-in @captured [:nodes :r0 :role]))
             "the decoder tail feeds the next token embedding back into r0")
         (is (= :state (get-in @captured [:nodes :k0 :role])))
