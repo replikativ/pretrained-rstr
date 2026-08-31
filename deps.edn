@@ -6,11 +6,11 @@
  ;; compilable blocks + quant kernels stay in raster.
  ;;
  ;; raster is released on Clojars (Maven-resolvable; its POM declares TypedClojure).
- ;; 0.2.398 adds bounded routed-attention traversal, resident block transfers,
- ;; measurable asynchronous range transfers, tiled-history weighted reductions,
- ;; and portable subgroup lowering through verified KernelBody programs.
+ ;; 0.2.425 is the current released Raster baseline. It retains the routed
+ ;; attention and resident-transfer contracts used here while moving scheduled
+ ;; reductions and contractions onto Raster's typed SOAC scheduling pipeline.
  ;; The :dev alias overrides raster with the sibling checkout for local work.
- :deps {org.replikativ/raster {:mvn/version "0.2.398"}
+ :deps {org.replikativ/raster {:mvn/version "0.2.425"}
         org.replikativ/boring {:mvn/version "0.1.27"}
         org.replikativ/hasch {:mvn/version "0.4.103"}
         org.replikativ/konserve {:mvn/version "0.9.379"}
@@ -18,7 +18,9 @@
         org.clojure/data.json {:mvn/version "2.5.0"}}
 
  :aliases
- {:dev {:extra-paths ["dev" "test"]
+ {:examples {:extra-paths ["dev"]}
+
+  :dev {:extra-paths ["dev" "test"]
         :extra-deps {org.replikativ/raster {:local/root "../raster"}
                      ;; embedding e2e consumers (grid S4 smoke): vector index + umap
                      io.replikativ/proximum {:local/root "../proximum"}
@@ -46,7 +48,7 @@
 
   ;; Model-free unit tests. Model-gated tests are ^:anchors-tagged and excluded here
   ;; (they need multi-GB weights and/or a GPU); CI runs exactly `clojure -M:test`.
-  :test {:extra-paths ["test"]
+  :test {:extra-paths ["test" "dev"]
          :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
          :jvm-opts ["--enable-native-access=ALL-UNNAMED"
                     "--add-modules=jdk.incubator.vector"

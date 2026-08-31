@@ -4,228 +4,162 @@
 [![CircleCI](https://circleci.com/gh/replikativ/pretrained-rstr.svg?style=shield)](https://circleci.com/gh/replikativ/pretrained-rstr)
 [![Slack](https://img.shields.io/badge/slack-join_chat-brightgreen.svg)](https://clojurians.slack.com/archives/C09622F337D)
 
-> ⚠️ **Experimental**: pretrained-rstr is under active development. APIs may change before 1.0. Feedback welcome!
+Run pretrained Hugging Face models natively on the JVM and treat their
+attention state as durable, forkable numerical memory.
 
-Run pretrained HuggingFace models — **text embeddings, speech-to-text, and decoder
-LLMs** — natively on the JVM, on the [raster](https://github.com/replikativ/raster)
-typed-dispatch compiler. No Python, no ONNX runtime: weights load from safetensors,
-quantize to int8/int4 streams, and run on raster's CPU int8-MAC kernels and
-GPU-resident Level Zero/OpenCL programs.
+pretrained-rstr loads safetensors directly, quantizes linear weights, and runs
+embeddings, speech recognition, and decoder LLMs through
+[Raster](https://github.com/replikativ/raster). Decoder state can be split into
+immutable prefix-hashed chunks, indexed by
+[Datahike](https://datahike.io/), stored through
+[Konserve](https://github.com/replikativ/konserve), restored into resident GPU
+pages, and shared copy-on-write between continuations.
+
+> **Experimental:** APIs and checkpoint formats may change before 1.0. The
+> repository contains tested research software, not a managed inference service.
+
+## What is here
+
+- Direct JVM inference without Python or an ONNX runtime.
+- Descriptor-driven decoder architectures with CPU Q4/Q8 and resident GPU
+  execution.
+- Exact CPU, contiguous-GPU, and paged-GPU continuation boundaries.
+- Content-addressed KV chunks, longest-prefix lookup, asynchronous publication,
+  tiered replicas, and mmap restoration.
+- Fixed-capacity continuous decode lanes, prefix-page sharing, copy-on-write,
+  and explainable admission/eviction decisions.
+- Model-free tests and demos for the control/data plane; hardware-gated parity
+  anchors for real models.
+
+The current proof is LLM inference. The same control-plane/data-plane split is a
+promising basis for larger numerical simulations, but this project does not yet
+provide a PDE solver, weather model, MPI runtime, or direct inter-node GPU
+transport. See [Numerical memory beyond LLM inference](doc/numerical-memory.md).
+
+## Install
+
+Use JDK 21 or newer and add the latest released library to `deps.edn`:
+
+```clojure
+{:deps {org.replikativ/pretrained-rstr {:mvn/version "0.1.26"}}}
+```
+
+The source tree currently targets Raster `0.2.425`. OpenBLAS is required for
+floating-point GEMM paths. ffmpeg is optional for non-WAV audio. GPU execution
+requires Level Zero on Intel or a compatible OpenCL ICD on Intel, NVIDIA, or AMD.
+
+## Quick start
+
+Every task-level API follows the same shape: load a curated registry entry or a
+known local model directory, then call the task verb.
 
 ```clojure
 (require '[pretrained.embed :as emb]
          '[pretrained.asr :as asr]
          '[pretrained.lm :as lm])
 
-;; every modality is the same shape: (load-X :key [dir] [opts]) then a task verb.
-;; a registry key auto-downloads weights from HF on first use; an explicit local dir
-;; skips the download (bring your own weights for a known model).
+;; Registry entries download pinned Hugging Face files on first use.
+(def embedder (emb/load-embedder :qwen3-embedding-0.6b))
+(emb/embed-texts embedder ["Durable numerical memory for model inference."])
+;; => {:data float-array, :n 1, :dim 1024}
 
-;; embeddings
-(def e (emb/load-embedder :qwen3-embedding-0.6b))
-(emb/embed-texts e ["Datahike is a durable Datalog database."])
-;; => {:data float[n*1024] :n 1 :dim 1024}   (L2-normalized rows)
+(def speech-model (asr/load-asr :moonshine-streaming-medium))
+(asr/transcribe speech-model "voice-note.wav")
+;; => "..."
 
-;; speech-to-text — any audio format (wav pure-JVM; mp3/ogg-opus/m4a via ffmpeg)
-(def m (asr/load-asr :moonshine-streaming-medium))
-(asr/transcribe m "voice-note.oga")
-;; => "And so my fellow Americans, ask not what your country can do for you, ..."
-(asr/transcribe m "talk.wav" {:timestamps? true})
-;; => {:text "..." :words [{:word "And" :start 0.0 :end 0.02} ...]}
+(def language-model (lm/load-lm :gemma-3-270m-it))
+(lm/generate-text language-model "The capital of France is" 20)
+;; => " Paris..."
 
-;; decoder LLMs
-(def g (lm/load-lm :gemma-3-270m-it))                ;; or (lm/load-lm :gemma-3-270m-it {:gpu? true})
-(lm/generate-text g "The capital of France is" 20)
-;; => " Paris. ..."
+;; Select resident GPU execution while loading a supported model.
+(def gpu-model (lm/load-lm :gemma-3-270m-it {:gpu? true}))
 ```
 
-## Models
+Downloads are sha-pinned and resume into `~/.cache/raster/models`. `HF_TOKEN` is
+honoured. Passing a local directory skips download.
 
-| Registry key | Task | Size | Quality (validated) |
-|---|---|---|---|
-| `:qwen3-embedding-0.6b` (+`-gpu`) | embeddings, last-token | 0.6B Q8 | cos 0.999 vs torch f32 |
-| `:embeddinggemma-300m` | embeddings, bidirectional + mean pool | 300M Q8 (GPU) | cos 0.99 vs torch; 768d matryoshka |
-| `:all-minilm-l6-v2`, `:bge-small-en-v1.5` | embeddings (BERT tier) | 23–33M f32 | parity with sentence-transformers |
-| `:moonshine-streaming-medium` | English ASR, **true streaming** | 245M | **WER 1.62% == HF torch** (LibriSpeech-100); word timestamps |
-| `:qwen3-asr-0.6b` / `-1.7b` | multilingual ASR (52 languages) | 0.6/1.7B | transcript char-identical to torch gold |
-| `:gemma-3-270m-it` / `:gemma-3-1b-it` | decoder LLM | ≤1B Q4/Q8 | token-exact GPU decode vs oracle; CPU ≈ llama.cpp speed |
-| `:qwen3-0.6b` / `:qwen3-1.7b`, `:smollm2-135m-instruct` / `:smollm2-360m-instruct` | decoder LLMs | ≤1.7B Q4/Q8 | same descriptor-driven engine (shared attention/norm stack) |
+## Validated model families
 
-Embeddings feed directly into [proximum](https://github.com/replikativ/proximum)
-(`emb/rows` → HNSW vector index) and [umap-rstr](https://github.com/replikativ/umap-rstr)
-(`emb/flat-doubles` → 2-D layouts). BERT-family sentence encoders (MiniLM/bge, mean-pool)
-run self-contained in `pretrained.arch.bert` — no extra dependency; `:engine :encoder`
-registry entries route there automatically.
+| Registry key | Task | Representation | Validation |
+| --- | --- | --- | --- |
+| `:qwen3-embedding-0.6b` (`-gpu`) | last-token embedding | 0.6B Q8 | cosine 0.999 vs Torch f32 |
+| `:embeddinggemma-300m` | mean-pooled embedding | 300M Q8 GPU | cosine 0.99; 768d matryoshka |
+| `:all-minilm-l6-v2`, `:bge-small-en-v1.5` | BERT embedding | 23–33M f32 | sentence-transformers parity |
+| `:moonshine-streaming-medium` | streaming English ASR | 245M | LibriSpeech-100 WER 1.62%, matching reference |
+| `:qwen3-asr-0.6b`, `:qwen3-asr-1.7b` | multilingual ASR | 0.6/1.7B | character-identical reference transcript |
+| `:gemma-3-270m-it`, `:gemma-3-1b-it` | decoder LLM | Q4/Q8 | token-exact GPU anchors |
+| Qwen3 and SmolLM2 registry entries | decoder LLM | Q4/Q8 | shared descriptor-driven engine |
 
-## How it works
+Architecture support and validated registry support are different claims. The
+generic loader can recognize additional compatible Hugging Face directories,
+but only curated registry entries carry the validation stated above.
 
-A model architecture is a *descriptor* — a role→tensor-name map plus ~10 flags (norm
-type/gain, rope variants, GQA, qk-norm, sliding windows, sandwich norms, MoE routing)
-— interpreted by one generic engine over raster's compilable `deftm` blocks. Adding a
-standard decoder-LM is a descriptor, not engine code.
+## Try numerical memory without a model
 
-- `pretrained.embed` / `pretrained.asr` / `pretrained.lm` — task-level APIs, all the same
-  shape: a curated registry + HF auto-download + `load-X`/task-verb (CPU or `{:gpu? true}`)
-- `pretrained.decoder` — the descriptor-driven decode engine (`load-hf`, `decode-step`,
-  `generate-cached`); GPU-resident decode/prefill in `pretrained.decoder-gpu`
-- `pretrained.loader` — the low-level generic loader: architecture registry, tokenizer
-  auto-detection, `from-pretrained` (dispatch any HF dir on `config.json` model_type — the
-  advanced, unvalidated path behind the curated `pretrained.lm` registry)
-- `pretrained.arch.*` — decoder descriptors as pure data: `gemma3`, `llama`, `qwen3`,
-  `qwen3-moe`, `embedding-gemma`, plus the self-contained BERT encoder `bert`;
-  `pretrained.asr.*` — moonshine, qwen3-asr
-- `pretrained.tokenizer.{sp,bpe,wordpiece}` — HF `tokenizer.json` tokenizers
-- `pretrained.hub` — sha-pinned downloads with resume + sha256 into
-  `~/.cache/raster/models` (`HF_TOKEN` honored; every `load-*` also accepts a local dir)
-- `pretrained.safetensors` / `pretrained.audio` — format frontends (bf16/f16 fast paths;
-  WAV pure-JVM, other audio via ffmpeg)
+This command creates 512 tokens of synthetic two-layer attention state, splits
+it into two immutable chunks, publishes their identities through an ephemeral
+Datahike catalog, proves a repeated checkpoint is deduplicated, queries the
+longest reusable prefix, and mmaps a primitive payload:
 
-**Quantized execution:** linear weights repack into int8/int4 streams executed by
-raster's spin-pool int8-MAC kernel (CPU) or GPU dp4a kernels. Q8_0 is measured
-lossless for embeddings; decode uses Q4. Quantized streams are disk-cached next to the
-weights — the first load quantizes once (~30s for 0.6B), warm loads take ~5s.
-
-## Durable attention-state cache
-
-Decoder inference can checkpoint immutable, prefix-hashed attention-state chunks
-without blocking the generation thread. Datahike indexes logical identity and
-placement policy; Konserve/Boring stores contiguous FP32 payloads; restore mmaps
-one chunk at a time and uploads its slices directly through Raster. The final
-prompt token remains pending, so restoring a prefix resumes at exactly the same
-continuation boundary as uninterrupted inference.
-
-```clojure
-(require '[pretrained.continuation.benchmark :as bench]
-         '[pretrained.continuation.manager :as cache]
-         '[pretrained.continuation.paged-decoder :as paged]
-         '[pretrained.model-identity :as identity])
-
-(def fingerprint
-  (identity/compatibility-fingerprint
-   model {:execution-variant {:backend :ze
-                              :linear-weights :q4k
-                              :attention-state :float32}}))
-
-(def manager
-  (cache/open-manager
-   {:store {:backend :memory :id (random-uuid)}
-    :schema-flexibility :write :keep-history? false :value-caps :default}
-   "/var/tmp/pretrained-kv"
-   {:chunk-size 256}))
-
-;; dstate is a bound pretrained.decoder-gpu state; prompt-ids is a token vector.
-(bench/benchmark-gpu-prefix! manager dstate fingerprint prompt-ids
-                             {:warmups 1 :iterations 5})
-
-;; For a paged decoder, includes mmap/scatter and exact suffix completion:
-(bench/benchmark-paged-prefix! manager engine fingerprint prompt-ids
-                               {:warmups 1 :iterations 5
-                                :probe-prompt-ids partially-matching-ids})
-
-;; Add time-to-first-token and a context-indexed trace for every decode step:
-(bench/benchmark-paged-continuation!
- manager engine fingerprint prompt-ids
- {:warmups 1 :iterations 5 :decode-tokens 8})
+```sh
+clojure -M:examples -m pretrained.numerical-memory-demo
 ```
 
-Paged decoder construction may pin Raster's attention policy for reproducible
-comparisons. Tiled history keeps its partial online-softmax state compiler-owned;
-the decoder exposes only immutable strategy, tile geometry, launch stages, and
-workspace accounting:
+After project dependencies resolve, the demo needs no model download, external
+service, or GPU. Pass a directory argument to retain the local chunk files for
+inspection:
 
-```clojure
-(def tiled-engine
-  (paged/open! dstate
-               :page-size 16
-               :physical-pages 1024
-               :attention-schedule :subgroup-online-tiled-history
-               :history-tile-size 256))
-
-(paged/attention-execution tiled-engine)
-;; => {:strategies {:routed-paged-subgroup-online-tiled-history n-layers}
-;;     :temporary-bytes ... :layers [...]}
+```sh
+clojure -M:examples -m pretrained.numerical-memory-demo /var/tmp/rstr-memory-demo
 ```
 
-Explicit optimized policies fail with Raster's structured decline when the
-target cannot emit them; `:auto` retains Raster's legal fallback behavior.
+The demo exercises the same content identity, Konserve payload, Datahike
+catalog, and mmap path used by real continuation checkpoints.
 
-The benchmark separates prefill, checkpoint submission/drain, first measured
-restore, and process/page-cache-warm restore; it does not label warm pages as
-cold SSD. The continuation benchmark additionally separates prefix loading,
-uncached suffix completion, first-token latency, and steady decode. Each raw
-decode sample records its absolute position and visible context size, providing
-a stable comparison for attention traversal and history-tiling schedules.
-Paged checkpoint and restore results also contain `:transfer` or
-`:prefix-transfer` counters keyed by
-`[direction timing-source asynchronous?]`. These report Raster's measured bytes,
-commands, device/host elapsed time, submission time, and wall time, keeping
-OpenCL event timing distinct from Level Zero host-coherent copies. Adjacent
-physical pages are submitted as one contiguous run per KV slab/layer. Highly
-fragmented page-aligned chunks instead upload/download dense staging buffers and
-run a composed Raster block scatter/gather graph resident-side. Chunks that
-overlap shared page boundaries retain the exact physical-range path.
-`benchmark-paged-continuation!` prepares the chunk-sized shared staging engine
-before measuring continuation latency and reports its one-time compile/allocation
-cost and workspace bytes as `:block-transfer-preparation`. Serving schedulers can
-call `pretrained.continuation.page-pool/prepare-block-transfer!` at worker startup
-for the chunk sizes they admit.
-Chunk identities use Hasch and are published as Datahike
-`:db.type/store-ref` values, while the prefix hash separately identifies the
-causal token chain.
+## Durable, forkable continuations
 
-For an already loaded Gemma model, the REPL helper owns and closes the temporary
-decoder, cache manager, and session while keeping model loading out of the
-measurement:
+A continuation has one exact boundary: its cache contains processed positions
+`[0, n)`, and its pending token is evaluated at position `n`. Checkpoints do not
+need transient logits or hidden activations.
+
+```text
+token history ──> prefix hash chain ──> Datahike catalog and placement
+                              │
+                              └──────> immutable Konserve tensor chunks
+                                                   │
+                                                   └──> Raster resident pages
+```
+
+The analogy to Git is precise but bounded: chunks are immutable objects, causal
+prefix hashes form parent links, and forks share unchanged pages until a write.
+There is no automatic semantic merge for divergent KV caches. Read the
+[continuation model](doc/continuation-model.md) for the invariants and stack
+ownership.
+
+For an already loaded model, the benchmark helper separates prefill, checkpoint
+submission and durability, prefix restore, uncached suffix work, first-token
+latency, and context-indexed steady decode:
 
 ```clojure
 (require '[pretrained.kv-continuation-demo :as demo])
 
 (demo/run-paged-continuation-benchmark!
  model prompt-ids datahike-config "/var/tmp/gemma-kv-benchmark"
- {:max-position 2048 :chunk-size 256 :decode-tokens 16
-  :attention-schedule :subgroup-online-tiled-history
-  :history-tile-size 256 :warmups 1 :iterations 5})
+ {:max-position 2048
+  :chunk-size 256
+  :page-size 16
+  :decode-tokens 16
+  :warmups 1
+  :iterations 5})
 ```
 
-For cluster durability, pass an already connected authoritative Konserve store
-(for example Konserve-S3) as `:chunk-backend-store`. The manager owns its local
-filestore but the caller retains ownership of the backend connection:
+The result reports transfer bytes and commands separately from wall time and
+distinguishes first measured restore from process/page-cache-warm restores. It
+does not label warm filesystem pages as cold SSD performance.
 
-```clojure
-(cache/open-manager datahike-config "/var/tmp/pretrained-kv"
-                    {:chunk-size 256
-                     :chunk-backend-store s3-store})
-```
-
-Chunk checkpoints write the local mmap-compatible frontend first. Their
-`:captured` future can therefore complete while the remote copy is in flight;
-`:published` completes only after every Konserve write-behind receipt succeeds
-and the Datahike transaction commits. Datahike never advertises a store-ref that
-only exists in one worker's cache.
-
-`pretrained.continuation.placement` records declarative per-worker demands and
-observed replicas. `pretrained.continuation.replica/open-executor` connects that
-control plane to a bounded background copy worker: it moves bytes off-band,
-verifies the immutable Hasch identity and catalog metadata, then transitions the
-target replica through `copying` to `ready` or `failed`. Transaction listeners
-only offer work and never perform I/O. The built-in promoter uses Konserve's
-tiered store to explicitly synchronize one content key from its authoritative
-backend into the worker's local filestore frontend. It waits for that write and
-verifies the frontend before publishing `ready`; restore then mmaps the concrete
-frontend, not the tiered wrapper. The current tier sync decodes once during
-promotion. Remote or raw-copy transports can implement the narrow
-`ReplicaPromoter` effect without replacing Konserve's storage API, and Yggdrasil
-can version the catalog through its Datahike adapter.
-
-The [distributed paged inference design](doc/serving-architecture.md) separates
-durable transfer chunks from GPU allocation pages and specifies the path to
-continuous batching, asynchronous restore/checkpoint streams, and explainable
-admission, prefetch, and eviction policy.
-
-With MinIO listening on `localhost:9000`, the optional cluster alias runs a
-self-cleaning, model-free end-to-end check. It writes through a worker-local
-filestore to S3, commits catalog and placement facts through a Kabel writer,
-promotes the chunks to a second worker, mmaps them, and restarts that worker:
+For the optional two-worker S3/Kabel showcase, start an S3-compatible MinIO
+service on `localhost:9000`, configure its credentials as documented in the demo
+namespace, and run:
 
 ```clojure
 ;; clojure -M:distributed-demo
@@ -233,217 +167,63 @@ promotes the chunks to a second worker, mmaps them, and restarts that worker:
 (distributed/run-minio-smoke!)
 ```
 
-`open-authority!` and `open-worker!` expose the topology. Contiguous model state
-uses `checkpoint-gpu-prefix!` / `restore-gpu-prefix!`; the paged executor uses
-`checkpoint-paged-prefix!` / `restore-paged-prefix!`. Both source phases return
-the same small serializable manifest and both destination phases report
-token-exact resumed output. Concurrent workers should run in separate JVMs; the
-smoke turns them over sequentially because distributed-scope intentionally keeps
-one in-process route per remote peer.
+The smoke writes through a worker-local filestore to S3, publishes catalog and
+placement facts through a Kabel-backed Datahike writer, promotes chunks to a
+second worker, mmaps them, checks token-exact resume, and restarts that worker.
 
-```clojure
-(require '[konserve.tiered :as tiered]
-         '[pretrained.continuation.placement :as placement]
-         '[pretrained.continuation.replica :as replica])
+## Architecture
 
-(def worker-b-tiered
-  (tiered/connect-tiered-store
-   worker-b-store shared-store
-   :write-policy :frontend-only
-   :read-policy :frontend-first
-   :opts {:sync? true}))
+A model architecture is a role-to-tensor descriptor plus numerical flags such
+as normalization, RoPE variant, GQA, sliding windows, and MoE routing. The generic
+engine interprets the descriptor using Raster-compilable blocks.
 
-(def executor
-  (replica/open-executor
-   connection "worker-b" :ssd
-   (replica/konserve-tiered-promoter worker-b-tiered)))
+| Namespace | Responsibility |
+| --- | --- |
+| `pretrained.embed`, `.asr`, `.lm` | curated task APIs and model registries |
+| `pretrained.loader`, `.hub`, `.safetensors` | model dispatch, pinned downloads, tensor files |
+| `pretrained.decoder`, `.decoder-gpu` | descriptor-driven CPU and resident GPU decoding |
+| `pretrained.continuation.*` | chunking, catalog, placement, page pools, scheduling, restore |
+| `pretrained.model-identity` | compatibility fingerprints for durable state |
+| `raster.*` | typed numerical compiler, schedules, kernels, buffers, and device runtime |
 
-(placement/request!
- connection {:model-fingerprint fingerprint :prefix-hash prefix
-             :node "worker-b" :tier :ssd :priority 10})
+Linear weights repack into int8/int4 streams for Raster's CPU int8-MAC or GPU
+dp4a kernels. Quantized streams are cached beside model weights: the first load
+performs conversion and warm loads reuse it.
+
+Further reading:
+
+- [Git-like continuation model](doc/continuation-model.md)
+- [Distributed paged inference architecture](doc/serving-architecture.md)
+- [Numerical memory and simulation direction](doc/numerical-memory.md)
+- [Contributing and validation](CONTRIBUTING.md)
+
+## Validation
+
+Model ports are compared layer-by-layer with their reference implementation,
+then checked end-to-end with token, transcript, or embedding anchors. Run the
+model-free suite with:
+
+```sh
+clojure -M:test
 ```
 
-### Resident paged attention
+Model and device anchors are tagged and excluded from default CI because they
+require multi-gigabyte weights or specific hardware. See
+`test/pretrained/anchors_test.clj` and [CONTRIBUTING.md](CONTRIBUTING.md) before
+making numerical or performance claims.
 
-`pretrained.continuation.page-pool` maps the same durable chunks into stable
-worker-local Raster allocations. A logical page covers every attention-state
-slab and layer, so full prefix pages can be shared safely while a partial tail
-uses copy-on-write. Durable chunk size and device page size are independent: a
-256-token Konserve object can scatter into sixteen 16-token GPU pages.
+## Ecosystem direction
 
-`pretrained.continuation.paged-attention` binds those pools to Raster's semantic
-`AttentionProblem` and verified `KernelGraph`. Fixed-capacity runners update
-packed query positions and dense page tables between submissions, allowing
-unrelated continuations to form one batch without changing graph pointers.
-
-`pretrained.continuation.paged-append` reserves one physical slot per batch
-lane and binds projected resident FP32 K/V rows directly to Raster's
-routed FP16 assignment graph. The same reservation batch is reused across
-layers and becomes visible only after every layer write succeeds. Attention may
-lease its prospective post-append route and queue behind assignment on the same
-in-order Raster session without publishing unfinished state.
-
-`pretrained.continuation.scheduler` plans bounded continuous batches with decode
-lanes first and chunked repair/prefill work in the remaining capacity. It also
-chooses between measured resident, restore, recompute, and explicitly enabled
-approximate-repair paths. `pretrained.continuation.residency` admits routes under
-GPU pressure with explainable cost-aware eviction; dirty, pinned, and leased
-routes are never victims.
-
-```clojure
-(require '[pretrained.attention-state :as attention-state]
-         '[pretrained.continuation.manager :as cache]
-         '[pretrained.continuation.page-pool :as pages]
-         '[pretrained.continuation.paged-attention :as paged-attn])
-
-(def pool
-  (pages/open-pool!
-   (:sess dstate)
-   (attention-state/layout (:model dstate))
-   {:page-size 16 :physical-pages 1024 :dtype :half}))
-
-(cache/restore-paged-prefix!
- manager pool :request-a fingerprint prompt-ids
- {:admit? true
-  :policy {:durable? true :reuse-probability 0.6
-           :recompute-ms 18.0 :reload-ms 5.0 :last-access 42}})
-
-(def runner
-  (paged-attn/open-runner!
-   pool {:layer 0 :batch-size 8 :total-query-tokens 8
-         :q-heads 4 :kv-heads 1 :qk-head-dim 64 :value-head-dim 64
-         :pages-per-sequence 128}))
-```
-
-For model execution, `:query-view` and `:output-view` may be FP16 or FP32 Raster
-`ResidentBufferView`s owned by adjacent projection and output graphs. The runner
-then uploads only small route descriptors and returns the resident output view
-after completion; query and attention tensors never cross the host.
-
-`pretrained.continuation.paged-decoder` replaces the contiguous K/V assignment
-and attention interval between generated pre-attention and post-attention
-stages. The adapter declares K/V as stage state and the attention result as its
-output; Raster's operation-neutral `ProgramStage` derives and validates the
-interval from executable effects. One `LinkPlan` then interleaves every layer's
-generated pre-stage, routed append graph, paged-attention graph, and generated
-post-stage before linking the token head/tail. A decode step uploads one shared
-set of route descriptors and replays this composite executable once. Pretrained
-owns page allocation, reservations, leases, and transactional publication, but
-neither scans kernel ABI names nor assembles raw compiler phase keys. Bind with
-`:cache-mode :paged` to omit the displaced per-layer K/V and score buffers:
-
-```clojure
-(require '[pretrained.loader :as loader]
-         '[pretrained.decoder-gpu :as decoder]
-         '[pretrained.continuation.page-pool :as pages]
-         '[pretrained.continuation.paged-decoder :as paged]
-         '[pretrained.continuation.worker :as worker]
-         '[raster.gpu.core :as gpu])
-
-(def model (loader/from-pretrained "/models/gemma-3-270m-it"))
-(def dstate (decoder/bind-decode! model :maxpos 64 :cache-mode :paged))
-(def engine (paged/open! dstate :page-size 16 :physical-pages 128))
-(def tokenizer (:tokenizer model))
-(def prompt (vec ((:encode tokenizer) (:tok tokenizer)
-                  "The capital of France is")))
-
-(try
-  (let [tokens (paged/generate! engine :request-a prompt 4)]
-    ;; => [9079 236764 532 506], decoded as " Paris, and the"
-    (pages/fork-route! (:pool engine) :request-a :request-b)
-    tokens)
-  (finally
-    (paged/close! engine)
-    (gpu/close-session! (:sess dstate))))
-```
-
-The contiguous decoder is likewise one validated LinkPlan containing every
-layer plus the head and greedy tail. Both modes import the same pretrained-owned
-resident allocations without copying them or transferring ownership. Routed
-graph temporaries stay private to their descriptor steps; query, K/V, attention
-output, page slabs, and route descriptors are stable linked nodes.
-
-The Gemma anchor verifies token-exact parity with the contiguous decoder, the
-absence of `kc*`, `vc*`, and `sc` allocations, shared-page fork semantics, and
-copy-on-write resume parity. Partial pages copy directly between resident
-Raster views (Level Zero unified allocation copy or OpenCL device-buffer copy),
-without JVM tensor staging.
-
-The generated projections, per-row RoPE, routed attention, post-attention
-layers, head, deterministic argmax, and embedding gather now share one fixed
-decode batch dimension. Independent routes can therefore execute together
-without copying K/V or activations through the host:
-
-```clojure
-(def batched-state
-  (decoder/bind-decode! model :maxpos 64 :cache-mode :paged :batch-size 2))
-(def batched-engine
-  (paged/open! batched-state :page-size 16 :physical-pages 128))
-
-(worker/generate-continuously!
- batched-engine [:request-a :request-b]
- [(vec ((:encode tokenizer) (:tok tokenizer) "Paris is the capital of"))
-  (vec ((:encode tokenizer) (:tok tokenizer) "Berlin is the capital of"))]
- 4)
-;; => [[token-a0 token-a1 token-a2 token-a3]
-;;     [token-b0 token-b1 token-b2 token-b3]]
-```
-
-The graph capacity is fixed when it is compiled, but occupancy is dynamic.
-`plan-decode-lanes` retains runnable requests in their existing rows so the
-next-token embedding produced by the device tail stays resident. It fills only
-vacancies, and `prime-lanes!` uploads embeddings only for those new occupants.
-Inactive rows carry append slot `-1` and an empty attention route: they allocate
-no page, write no K/V, and their head result is ignored.
-
-```clojure
-(def iteration
-  (worker/run-decode-iteration!
-   engine previous-lanes runnable-requests :eos-ids eos-ids))
-
-;; Protect these routes while restore/admission policy considers GPU victims.
-(:protected-continuation-ids iteration)
-
-;; Feed (:lanes iteration) back as previous-lanes and add queued requests.
-;; (:completed iteration) is now eligible for async checkpoint/retention policy.
-(def next-ready (worker/next-ready-requests iteration new-arrivals))
-```
-
-The fixed-batch prompt convenience API still requires equal missing suffix
-lengths; mixed prefill/decode packing remains separate scheduler work. Durable
-chunks restore through `restore-paged-prefix!`. Newly generated
-paged routes enter the same Hasch-chain/Konserve/Datahike pipeline through
-`checkpoint-paged-chunks-async!`: capture leases an immutable route snapshot,
-gathers arbitrary physical page spans on the bounded worker, and publishes only
-after tiered-store durability. Scheduling when to request that optional capture
-remains a serving-policy decision.
-
-## Validation methodology
-
-Every port is validated against its reference implementation before it ships:
-layer-by-layer activation comparison vs HF transformers golds (typical agreement
-~1e-6 relative in f32), then end-to-end anchors — token-exact decode, character-exact
-transcripts, cos ≥ 0.999 embeddings vs torch f32. The anchors are repeatable tests:
-
-```
-clojure -M:test        # fast, model-free unit tests
-# with local weights (see test/pretrained/anchors_test.clj):
-clojure -A:dev:test:valhalla -M -e "(require 'clojure.test 'pretrained.anchors-test) \
-  (clojure.test/run-tests 'pretrained.anchors-test)"
-```
-
-## Requirements
-
-- JDK 21+ (Panama FFI); the raster Valhalla toolchain for full performance
-  (see raster's README for the JVM flags)
-- OpenBLAS for the f32 GEMM paths
-- ffmpeg (optional, for non-WAV audio)
-- GPU (optional): Level Zero for Intel, or a compatible OpenCL ICD for Intel/NVIDIA/AMD
+pretrained-rstr is an inference and numerical-memory component, not the whole
+[Simmis](https://simm.is/) product. It demonstrates how replaceable model
+execution can participate in a longer-lived system of immutable state, parallel
+attempts, provenance, and controlled adoption. The scientific-simulation
+direction uses the same idea for scenario and ensemble branches while keeping
+equations, calibration, validation, and external actions explicit.
 
 ## License
 
 Copyright © 2026 Christian Weilbach
 
-pretrained-rstr is [MIT licensed](LICENSE). Model **weights** carry their own licenses
-(all registry models are Apache-2.0/MIT) — you are responsible for complying with each
-model's terms.
+pretrained-rstr is [MIT licensed](LICENSE). Model weights retain their own
+licenses; users are responsible for complying with each model's terms.
