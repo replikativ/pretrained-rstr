@@ -294,9 +294,13 @@
 
   `pool`, `worker-opts`, and the handler contract match
   `local/open-controller`. Options require `:handlers` and `:measurements` (a
-  map or zero-argument function). Heartbeats default to one second. The
-  endpoint owns and closes its local controller."
+  map or zero-argument function). Optional `:submit!`, `:cancel!`, and
+  `:close-submit!` callbacks are forwarded as a complete trio for batched
+  handlers; optional `:cancel-operation!` fences work owned by their runtime.
+  Heartbeats default to one second. The endpoint owns and closes its local
+  controller."
   [pool worker-opts {:keys [handlers measurements heartbeat-ms on-error!]
+                     :as opts
                      :or {heartbeat-ms 1000
                           on-error!
                           (fn [error] (.printStackTrace ^Throwable error))}}]
@@ -310,8 +314,11 @@
   (let [holder (atom nil)
         controller (local/open-controller
                     pool worker-opts
-                    {:handlers handlers
-                     :send! #(send-worker-effect! @holder %)})
+                    (merge
+                     (select-keys opts [:submit! :cancel! :close-submit!
+                                        :cancel-operation!])
+                     {:handlers handlers
+                      :send! #(send-worker-effect! @holder %)}))
         executor (scheduler)
         endpoint (->WorkerEndpoint
                   controller measurements (atom -1) (long heartbeat-ms)

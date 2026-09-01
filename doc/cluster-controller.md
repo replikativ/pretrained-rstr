@@ -40,8 +40,33 @@ real page pool. Before sending an accepted reply it:
 2. computes incremental prompt-plus-maximum-generation page demand;
 3. protects the active route and plans eligible durable evictions;
 4. reserves the pages atomically;
-5. invokes injected restore, prefill, and decode handlers on one serialized
-   execution queue.
+5. invokes injected restore, prefill, and decode handlers.
+
+The serialized handlers remain useful for batch size one. A multi-request
+worker instead uses `pretrained.continuation.paged-runtime`: bounded concurrent
+controller tasks enqueue work into one device-owning loop. That loop runs the
+pure iteration policy, retains stable physical lanes, primes only refills and
+prompt-token rows, and submits sparse active subsets to the fixed Raster graph.
+Decode receives priority while a multi-lane worker reserves one lane-token for
+waiting prefill work. A single-lane worker finishes active decode before
+admitting another prompt, avoiding implicit time-slicing overhead.
+
+Worker assembly keeps ownership explicit:
+
+```clojure
+(def runtime (paged-runtime/open-runtime decoder))
+(def endpoint
+  (controller-kabel/open-worker-endpoint
+   (:pool decoder) worker-options
+   (merge (paged-runtime/controller-submission runtime 64)
+          {:handlers (paged/batched-handlers runtime cache decoder)
+           :measurements measured-worker-state})))
+```
+
+The assignment-aware cancellation callback marks runtime jobs immediately but
+wakes handler tasks only after the current append or restore boundary. This
+keeps reservation release from racing in-flight GPU work. Close `endpoint`
+before `runtime` so controller tasks quiesce first.
 
 Cancellation fences the assignment immediately but retains unused reserved
 pages until any accepted local operation quiesces; terminal completion then
@@ -112,17 +137,19 @@ an OpenAI server is advertised as complete.
 
 The remaining Gemma path is concrete:
 
-1. feed accepted work into the existing multi-request paged scheduler/lane
-   refill instead of the current serialized single-request handler;
-2. checkpoint completed immutable ranges asynchronously through the tiered
+1. checkpoint completed immutable ranges asynchronously through the tiered
    Konserve store and publish catalog facts only after durability receipts;
-3. run cold, local-SSD, resident-prefix, partial-prefix, cancellation, and
+2. run cold, local-SSD, resident-prefix, partial-prefix, cancellation, and
    worker-restart cases with one small Gemma model;
-4. report TTFT, inter-token latency, page occupancy, bytes by tier, recomputed
+3. report TTFT, inter-token latency, page occupancy, bytes by tier, recomputed
    tokens, eviction reasons, and inference/checkpoint overlap.
 
 The live model-free demo now executes the complete observation, selection,
 offer, acknowledgement, and result path across two local Kabel WebSocket
 connections. The implementation does not yet claim a production deployment,
 token streaming, multi-process Gemma execution, or LMCache-beating throughput.
-Those claims require the scheduler/handler integration and measurements above.
+Restore currently executes synchronously between graph iterations; it is safe
+but can delay active lanes during a slow SSD/object fetch. Async transfer events
+and overlap policy remain required before making throughput claims. The live
+batch runtime is model-free tested; multi-process Gemma measurements are still
+required.

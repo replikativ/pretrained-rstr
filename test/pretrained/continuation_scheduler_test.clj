@@ -93,6 +93,22 @@
     (is (= [:first :middle] (mapv :request/id (:lanes plan))))
     (is (= [:later] (mapv :request/id (:deferred plan))))))
 
+(deftest mixed-work-lanes-follow-iteration-order-with-stable-refill
+  (let [decode #:request{:id :decode :continuation-id :decode-kv
+                         :phase :decode :remaining-tokens 4}
+        old-prefill #:request{:id :old-prefill :continuation-id :old-kv
+                              :phase :prefill :remaining-tokens 8}
+        prefill #:request{:id :prefill :continuation-id :prefill-kv
+                          :phase :prefill :remaining-tokens 7}
+        plan (scheduler/plan-work-lanes
+              3 [decode old-prefill nil] [prefill decode])]
+    (is (= [:decode :prefill nil] (mapv :request/id (:lanes plan))))
+    (is (= [:decode] (mapv :request/id (:retained plan))))
+    (is (= [:prefill] (mapv :request/id (:refill plan))))
+    (is (= [:old-prefill] (mapv :request/id (:retired plan))))
+    (is (= #{:decode-kv :prefill-kv}
+           (:protected-continuation-ids plan)))))
+
 (deftest decode-results-retire-eos-and-preserve-next-token-state
   (let [requests [#:request{:id :keep :continuation-id :keep-kv :phase :decode
                             :remaining-tokens 3 :position 7 :pending-token 10}

@@ -3,7 +3,8 @@
   (:require [pretrained.continuation.chunk :as chunk]
             [pretrained.continuation.manager :as manager]
             [pretrained.continuation.page-pool :as page-pool]
-            [pretrained.continuation.paged-decoder :as paged-decoder]))
+            [pretrained.continuation.paged-decoder :as paged-decoder]
+            [pretrained.continuation.paged-runtime :as paged-runtime]))
 
 (defn- continuation-id
   [effect]
@@ -30,6 +31,16 @@
     (paged-decoder/prime-prompt!
      decoder (continuation-id effect) (:request/tokens request))
     {:ok? true}))
+
+(defn- ensure-route!
+  [decoder policy effect]
+  (let [id (continuation-id effect)
+        pool (:pool decoder)]
+    (or (page-pool/route pool id)
+        (page-pool/allocate-route!
+         pool id 0
+         {:policy policy
+          :capacity-reservation (:worker/capacity-reservation effect)}))))
 
 (defn- mark-exact-prefix!
   [decoder id request output chunk-size policy]
@@ -89,3 +100,41 @@
      {:worker/restore-prefix #(restore-prefix! cache decoder policy %)
       :worker/prefill-suffix #(prefill-suffix! decoder %)
       :worker/decode #(decode! decoder eos-ids chunk-size policy %)})))
+
+(defn batched-handlers
+  "Return controller handlers backed by a shared paged batch runtime.
+
+  Restore operations execute between graph iterations. Missing prompt suffixes
+  and generation run incrementally in sparse fixed lanes, allowing unrelated
+  decode lanes to continue while new requests prefill. The local controller
+  must use concurrent submission callbacks such as
+  `paged-runtime/controller-submission`; its single-thread default cannot place
+  multiple blocking handler jobs into one batch. The caller owns `runtime`."
+  ([runtime cache decoder] (batched-handlers runtime cache decoder {}))
+  ([runtime cache decoder {:keys [policy chunk-size]
+                           :or {policy {:durable? false}}}]
+   (when-not (identical? decoder (:decoder runtime))
+     (throw (ex-info "Paged runtime belongs to a different decoder" {})))
+   (let [chunk-size (or chunk-size (:chunk-size cache)
+                        chunk/default-chunk-size)]
+     {:worker/restore-prefix
+      #(paged-runtime/run-operation!
+        runtime (:assignment/id %)
+        (fn [] (restore-prefix! cache decoder policy %)))
+      :worker/prefill-suffix
+      (fn [effect]
+        (paged-runtime/run-operation!
+         runtime (:assignment/id effect)
+         #(ensure-route! decoder policy effect))
+        (paged-runtime/prefill! runtime effect))
+      :worker/decode
+      (fn [effect]
+        (paged-runtime/run-operation!
+         runtime (:assignment/id effect)
+         #(ensure-route! decoder policy effect))
+        (let [result (paged-runtime/decode! runtime effect)
+              request (:assignment/request effect)
+              id (continuation-id effect)]
+          (mark-exact-prefix! decoder id request (:tokens result)
+                              chunk-size policy)
+          result))})))

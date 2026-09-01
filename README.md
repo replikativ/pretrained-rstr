@@ -165,6 +165,21 @@ It is model-free and does not send tensors through Kabel. The optional
 controller middleware can be composed onto the same peers used by the
 Datahike/Konserve distributed demo.
 
+The worker-side continuous-batching loop can also be inspected without model
+weights. It runs variable-length prefill and decode jobs in sparse fixed Raster
+lanes, retaining active lanes and priming only refills or prompt-token rows:
+
+```clojure
+;; clojure -M:examples
+(require '[pretrained.continuation-batch-demo :as batch-demo])
+(batch-demo/run-simulation)
+```
+
+Real workers construct `paged-runtime/open-runtime`, pass
+`paged/batched-handlers` to their local/Kabel controller, and merge
+`paged-runtime/controller-submission` into the worker endpoint options. The
+runtime owns decoder calls; close the controller first, then the runtime.
+
 For an already loaded model, the benchmark helper separates prefill, checkpoint
 submission and durability, prefix restore, uncached suffix work, first-token
 latency, and context-indexed steady decode:

@@ -185,7 +185,12 @@
   (let [pool (fixture-pool 4)
         pending (atom [])
         sent (atom [])
-        controller (test-controller pool pending sent {})]
+        cancelled (atom [])
+        cancelled-operations (atom [])
+        controller (assoc (test-controller pool pending sent {})
+                          :cancel! #(swap! cancelled conj %)
+                          :cancel-operation!
+                          #(swap! cancelled-operations conj %))]
     (try
       (local/handle-event! controller (offer 4))
       (is (= 1 (count @pending)))
@@ -194,6 +199,10 @@
        {:event/type :assignment/cancelled
         :assignment/id [:request-a 1]
         :request/id :request-a})
+      (is (= 1 (count @cancelled))
+          "cancellation reaches the active handler task")
+      (is (= [[:request-a 1]]
+             (mapv :assignment/id @cancelled-operations)))
       (is (= 3 (:reserved-pages (page-pool/stats pool)))
           "capacity remains fenced while accepted I/O may still be running")
       (run-next! pending)
