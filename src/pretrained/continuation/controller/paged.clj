@@ -1,6 +1,7 @@
 (ns pretrained.continuation.controller.paged
   "Paged-decoder operation handlers for a worker-local controller."
-  (:require [pretrained.continuation.manager :as manager]
+  (:require [pretrained.continuation.chunk :as chunk]
+            [pretrained.continuation.manager :as manager]
             [pretrained.continuation.page-pool :as page-pool]
             [pretrained.continuation.paged-decoder :as paged-decoder]))
 
@@ -17,6 +18,8 @@
          cache (:pool decoder) (continuation-id effect)
          (:request/model-fingerprint request) (:request/tokens request)
          {:capacity-reservation (:worker/capacity-reservation effect)
+          :maximum-cached-token-count
+          (get-in effect [:assignment/candidate :estimate/cached-token-count])
           :policy policy})]
     {:ok? true
      :cached-token-count (:cached-token-count result)}))
@@ -28,8 +31,23 @@
      decoder (continuation-id effect) (:request/tokens request))
     {:ok? true}))
 
+(defn- mark-exact-prefix!
+  [decoder id request output chunk-size policy]
+  (let [pool (:pool decoder)
+        resident-route (page-pool/route pool id)
+        processed (:token-count resident-route)
+        history (into (vec (:request/tokens request)) output)
+        tail (peek (chunk/plan history processed chunk-size))]
+    (when tail
+      (page-pool/touch-route!
+       pool id
+       (merge policy
+              {:model-fingerprint (:request/model-fingerprint request)
+               :prefix-hash (:chunk/prefix-hash tail)
+               :bytes (page-pool/route-bytes pool id)})))))
+
 (defn- decode!
-  [decoder eos-ids effect]
+  [decoder eos-ids chunk-size policy effect]
   (let [request (:assignment/request effect)
         id (continuation-id effect)
         prompt (:request/tokens request)
@@ -39,28 +57,35 @@
     ;; repairs a stale lower-tier observation that restored fewer exact tokens
     ;; than the candidate advertised, while never recomputing resident rows.
     (paged-decoder/prime-prompt! decoder id prompt)
-    (loop [position start-position
-           output []]
-      (if (and (< (count output) max-new)
-               (< (:token-count (page-pool/route (:pool decoder) id))
-                  (long (get-in decoder [:decode-state :maxpos]))))
-        (let [token (paged-decoder/step! decoder id position)
-              output (conj output token)]
-          (if (contains? eos-ids token)
-            {:ok? true :tokens output}
-            (recur (inc position) output)))
-        {:ok? true :tokens output}))))
+    (let [output
+          (loop [position start-position
+                 output []]
+            (if (and (< (count output) max-new)
+                     (< (:token-count (page-pool/route (:pool decoder) id))
+                        (long (get-in decoder [:decode-state :maxpos]))))
+              (let [token (paged-decoder/step! decoder id position)
+                    output (conj output token)]
+                (if (contains? eos-ids token)
+                  output
+                  (recur (inc position) output)))
+              output))]
+      (mark-exact-prefix! decoder id request output chunk-size policy)
+      {:ok? true :tokens output})))
 
 (defn handlers
   "Return local-controller handlers for `cache` and a paged `decoder`.
 
-  Options accept `:eos-ids` and resident `:policy`. The restore handler consumes
-  the capacity reservation created before offer acceptance. Prefill commits
-  only the exact uncached suffix; decode uses the existing Raster linked paged
-  executable and leaves the completed route resident for reuse or checkpoint."
+  Options accept `:eos-ids`, resident `:policy`, and `:chunk-size` (defaulting to
+  the manager's chunk size). The restore handler consumes the capacity
+  reservation created before offer acceptance. Prefill commits only the exact
+  uncached suffix; decode uses the existing Raster linked paged executable and
+  annotates the completed route with its exact prefix identity for worker
+  observations, reuse, or checkpoint."
   ([cache decoder] (handlers cache decoder {}))
-  ([cache decoder {:keys [eos-ids policy]
+  ([cache decoder {:keys [eos-ids policy chunk-size]
                    :or {eos-ids #{} policy {:durable? false}}}]
-   {:worker/restore-prefix #(restore-prefix! cache decoder policy %)
-    :worker/prefill-suffix #(prefill-suffix! decoder %)
-    :worker/decode #(decode! decoder eos-ids %)}))
+   (let [chunk-size (or chunk-size (:chunk-size cache)
+                        chunk/default-chunk-size)]
+     {:worker/restore-prefix #(restore-prefix! cache decoder policy %)
+      :worker/prefill-suffix #(prefill-suffix! decoder %)
+      :worker/decode #(decode! decoder eos-ids chunk-size policy %)})))

@@ -278,6 +278,9 @@
                       cache pool :source "fixture-paged-v1" [1 2 3 4 5])
               _ (.get ^java.util.concurrent.CompletableFuture
                       (:published ticket) 5 TimeUnit/SECONDS)
+              limited (manager/lookup-chunk-prefix
+                       cache "fixture-paged-v1" [1 2 3 4 5 6 7]
+                       {:maximum-cached-token-count 2})
               _ (page-pool/release-route! pool :source)
               capacity (page-pool/reserve-capacity! pool :request-a 7)
               result (manager/restore-paged-prefix!
@@ -285,6 +288,8 @@
                       [1 2 3 4 5 6 7]
                       {:capacity-reservation capacity
                        :policy {}})]
+          (is (= 2 (:cached-token-count limited)))
+          (is (= 1 (count (:matched limited))))
           (is (= 4 (:cached-token-count result)))
           (is (= {:continuation-id :request-a
                   :pages [0 1]

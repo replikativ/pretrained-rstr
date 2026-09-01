@@ -54,6 +54,11 @@
        connection {:model-fingerprint model :prefix-hash prefix
                    :node "worker-b" :tier :ssd :state :kv.replica/ready
                    :store-key (random-uuid) :path "/worker-b/chunk" :bytes 128})
+      (testing "replicas for a planned chain are fetched in one stable map"
+        (let [replicas (placement/replicas-for-prefixes
+                        @connection model [prefix (random-uuid)])]
+          (is (= ["worker-a" "worker-b"]
+                 (mapv :kv/replica-node (get replicas prefix))))))
       (testing "the desired local tier satisfies the demand"
         (let [plan (placement/reconciliation-plan @connection "worker-b")]
           (is (empty? (:actions plan)))

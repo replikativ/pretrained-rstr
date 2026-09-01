@@ -114,3 +114,18 @@
     (is (nil? (page-pool/route pool :cold)))
     (is (page-pool/release-capacity!
          pool (:capacity-reservation result)))))
+
+(deftest evictable-capacity-observes-protection-and-shared-refcounts
+  (let [snapshot {:physical-pages 1 :page-size 4 :free-pages #{}
+                  :refcounts {0 2} :leases {}
+                  :routes
+                  {:fork-a {:continuation-id :fork-a :pages [0]
+                            :token-count 4
+                            :cache/policy {:durable? true}}
+                   :fork-b {:continuation-id :fork-b :pages [0]
+                            :token-count 4
+                            :cache/policy {:durable? true}}}}]
+    (is (= 1 (residency/evictable-page-count snapshot)))
+    (is (zero?
+         (residency/evictable-page-count
+          snapshot {:protected-continuation-ids #{:fork-a}})))))

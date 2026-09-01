@@ -54,6 +54,9 @@ but fail halfway through its declared decode budget.
 only offers, cancellations, offer results, and terminal results as ordinary EDN
 maps with a `:type` field. Timers, GPU operations, reservation handles, and
 tensor bytes are rejected as local-only. The same maps can be routed by Netz.
+Worker observations use a separate versioned heartbeat message. The pure
+`discovery` registry rejects delayed epochs/sequences without writing high-rate
+heartbeats into Datahike.
 
 ## Routing policy
 
@@ -65,10 +68,14 @@ max(queue delay, lower-tier load) + GPU restore
   + uncached prompt tokens * measured prefill/token + first decode token
 ```
 
-The lowest score wins, not necessarily the longest prefix. Capacity, context
-limit, model availability, worker epoch, and exactness are hard constraints.
-The worker repeats capacity admission against current page state because a
-candidate can be stale by the time its offer arrives.
+`controller.candidates` plans the request's exact chunk chain, fetches catalog
+entries and all relevant replica facts in batch, and combines them with current
+worker observations. It scores GPU, every usable RAM/SSD/object prefix boundary,
+and recomputation. The lowest score wins, not necessarily the longest prefix.
+Lower-tier alternatives remain available after a stale GPU decline. Capacity,
+context limit, model availability, worker epoch, and exactness are hard
+constraints. The worker repeats capacity admission against current page state
+because a candidate can be stale by the time its offer arrives.
 
 This policy is intentionally deterministic and inspectable. Datahike should
 eventually record the candidate snapshot, selected alternative, predicted cost,
@@ -96,16 +103,15 @@ an OpenAI server is advertised as complete.
 
 The remaining Gemma path is concrete:
 
-1. derive request-specific candidates from the local Datahike replica and
-   worker observations;
-2. connect the local restore handler to `restore-paged-prefix!`, passing the
-   accepted capacity reservation;
-3. connect suffix work and decode to the existing paged scheduler/lane refill;
-4. checkpoint completed immutable ranges asynchronously through the tiered
+1. carry observation and assignment messages over the live two-worker Kabel
+   topology and establish heartbeat expiry;
+2. feed accepted work into the existing multi-request paged scheduler/lane
+   refill instead of the current serialized single-request handler;
+3. checkpoint completed immutable ranges asynchronously through the tiered
    Konserve store and publish catalog facts only after durability receipts;
-5. run cold, local-SSD, resident-prefix, partial-prefix, cancellation, and
+4. run cold, local-SSD, resident-prefix, partial-prefix, cancellation, and
    worker-restart cases with one small Gemma model;
-6. report TTFT, inter-token latency, page occupancy, bytes by tier, recomputed
+5. report TTFT, inter-token latency, page occupancy, bytes by tier, recomputed
    tokens, eviction reasons, and inference/checkpoint overlap.
 
 The implementation does not yet claim a production Kabel deployment, token

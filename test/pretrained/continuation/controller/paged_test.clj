@@ -17,6 +17,7 @@
   {:effect/op op
    :assignment/id [:request-a 1]
    :assignment/request request
+   :assignment/candidate {:estimate/cached-token-count 2}
    :worker/capacity-reservation ::capacity})
 
 (deftest restore-passes-the-authoritative-capacity-reservation
@@ -32,6 +33,7 @@
               (effect :worker/restore-prefix))))
       (is (= [::cache ::pool :continuation-a "fixture-v1" [1 2 3]
               {:capacity-reservation ::capacity
+               :maximum-cached-token-count 2
                :policy {:durable? true}}]
              @captured)))))
 
@@ -39,6 +41,7 @@
   (let [token-count (atom 2)
         primed (atom [])
         stepped (atom [])
+        touched (atom nil)
         decoder {:pool ::pool :decode-state {:maxpos 8}}
         handlers (paged/handlers ::cache decoder {:eos-ids #{8}})]
     (with-redefs [paged-decoder/prime-prompt!
@@ -46,6 +49,10 @@
                     (swap! primed conj [id prompt]))
                   page-pool/route
                   (fn [_ _] {:token-count @token-count})
+                  page-pool/route-bytes (fn [_ _] 128)
+                  page-pool/touch-route!
+                  (fn [_ id policy]
+                    (reset! touched [id policy]))
                   paged-decoder/step!
                   (fn [_ id position]
                     (swap! token-count inc)
@@ -54,4 +61,8 @@
       (is (= {:ok? true :tokens [7 8]}
              ((:worker/decode handlers) (effect :worker/decode))))
       (is (= [[:continuation-a [1 2 3]]] @primed))
-      (is (= [[:continuation-a 2] [:continuation-a 3]] @stepped)))))
+      (is (= [[:continuation-a 2] [:continuation-a 3]] @stepped))
+      (is (= :continuation-a (first @touched)))
+      (is (= "fixture-v1" (:model-fingerprint (second @touched))))
+      (is (uuid? (:prefix-hash (second @touched))))
+      (is (= 128 (:bytes (second @touched)))))))

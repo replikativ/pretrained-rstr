@@ -138,6 +138,24 @@
      snapshot continuation-id token-capacity)
     (conj protected-continuation-ids continuation-id))))
 
+(defn evictable-page-count
+  "Return unique physical pages recoverable by evicting every eligible route.
+
+  `opts` accepts `:protected-continuation-ids`. Shared refcounts are simulated,
+  so two eligible forks can jointly contribute a page while evicting only one
+  of them may contribute none."
+  ([snapshot] (evictable-page-count snapshot {}))
+  ([snapshot {:keys [protected-continuation-ids]
+              :or {protected-continuation-ids #{}}}]
+   (let [leased (leased-continuations snapshot)
+         eligible (filter #(eligible-route? leased protected-continuation-ids %)
+                          (vals (:routes snapshot)))
+         simulation (reduce release-simulated-route
+                            (select-keys snapshot [:refcounts :free-pages])
+                            eligible)]
+     (- (count (:free-pages simulation))
+        (count (:free-pages snapshot))))))
+
 (defn reserve-admission!
   "Evict eligible routes and reserve projected capacity atomically.
 

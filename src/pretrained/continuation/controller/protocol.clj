@@ -8,7 +8,7 @@
 
 (def cache-tiers
   "Exact-prefix locations understood by the initial routing policy."
-  #{:gpu :ssd :peer :object :none})
+  #{:gpu :ram :ssd :peer :object :none})
 
 (defn generation-request
   "Validate and normalize a consumer generation request.

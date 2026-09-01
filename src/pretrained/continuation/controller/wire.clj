@@ -10,6 +10,7 @@
     :continuation/cancel
     :continuation/offer-result
     :continuation/result
+    :continuation/worker-observation
     :continuation/worker-unavailable})
 
 (defn effect->message
@@ -94,6 +95,20 @@
 
       (throw (ex-info "Continuation message is not router-addressed"
                       {:type (:type message)})))))
+
+(defn observation->message
+  "Encode one worker observation for the router's discovery registry."
+  [observation]
+  {:type :continuation/worker-observation
+   :message/to :router
+   :message/observation observation})
+
+(defn message->observation
+  "Return a router-addressed worker observation, or nil for another message."
+  [message]
+  (when (and (= :continuation/worker-observation (:type message))
+             (= :router (:message/to message)))
+    (:message/observation message)))
 
 (defn control-message?
   "Return true when `value` has a recognized continuation wire type."

@@ -272,6 +272,24 @@
   [pool continuation-id]
   (get-in @(:state pool) [:routes continuation-id]))
 
+(defn route-bytes
+  "Return the logical tensor bytes retained by a resident route, or nil.
+
+  Shared physical pages are intentionally counted per logical route because the
+  value is used for request-specific transfer/recompute estimates, not allocator
+  accounting."
+  [pool continuation-id]
+  (when-let [resident-route (route pool continuation-id)]
+    (let [element-bytes (case (:dtype pool) :half 2 :float 4)
+          elements-per-token
+          (reduce + 0
+                  (map #(* (long (:count %))
+                           (long (:elements-per-token %)))
+                       (:slabs (:layout pool))))]
+      (* (long (:token-count resident-route))
+         elements-per-token
+         element-bytes))))
+
 (defn residency-snapshot
   "Return immutable route, reference, lease, and capacity data for policy decisions.
 
