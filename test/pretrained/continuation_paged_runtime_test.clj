@@ -171,3 +171,95 @@
       (is (zero? (:iterations (paged-runtime/state runtime))))
       (finally
         (.close runtime)))))
+
+(deftest single-lane-prefill-uses-exact-bulk-tiles-and-a-scalar-tail
+  (let [route-counts (atom {:prefill 0})
+        bulk-calls (atom [])
+        scalar-calls (atom [])
+        runtime
+        (paged-runtime/open-runtime
+         {:decode-state {:batch-size 1 :maxpos 64}}
+         {:prefill-tile-size 3
+          :prefill-range!
+          (fn [_ continuation-id tokens position]
+            (swap! bulk-calls conj [continuation-id tokens position])
+            (swap! route-counts update continuation-id + (count tokens)))
+          :prime-lanes! (fn [& _] nil)
+          :step-lanes!
+          (fn [_ work]
+            (mapv (fn [{:keys [continuation-id position] :as item}]
+                    (swap! scalar-calls conj [continuation-id position])
+                    (swap! route-counts update continuation-id inc)
+                    (assoc item :token (+ 100 position)))
+                  work))
+          :route-token-count (fn [_ id] (get @route-counts id))})]
+    (try
+      (is (= {:ok? true}
+             (paged-runtime/prefill!
+              runtime (effect :prefill-assignment :prefill
+                              [10 11 12 13 14 15 16 17] 1))))
+      (is (= [[:prefill [10 11 12] 0]
+              [:prefill [13 14 15] 3]]
+             @bulk-calls))
+      (is (= [[:prefill 6]] @scalar-calls))
+      (is (= 7 (:prefill @route-counts)))
+      (let [state (paged-runtime/state runtime)]
+        (is (= 2 (:bulk-prefill-tiles state)))
+        (is (= 6 (:bulk-prefill-tokens state)))
+        (is (= 3 (:prefill-tile-size state)))
+        (is (number? (:bulk-prefill-ms-per-token state)))
+        (is (= 7 (:scheduled-tokens state))))
+      (finally
+        (.close runtime)))))
+
+(deftest decode-preempts-prefill-at-the-next-bulk-tile-boundary
+  (let [route-counts (atom {:prefill 0 :decode 2})
+        calls (atom [])
+        entered-first-tile (promise)
+        release-first-tile (promise)
+        runtime
+        (paged-runtime/open-runtime
+         {:decode-state {:batch-size 1 :maxpos 64}}
+         {:prefill-tile-size 3
+          :prefill-range!
+          (fn [_ continuation-id tokens position]
+            (swap! calls conj [:bulk continuation-id position])
+            (when (zero? position)
+              (deliver entered-first-tile true)
+              @release-first-tile)
+            (swap! route-counts update continuation-id + (count tokens)))
+          :prime-lanes! (fn [& _] nil)
+          :step-lanes!
+          (fn [_ work]
+            (mapv (fn [{:keys [continuation-id position] :as item}]
+                    (swap! calls conj [:step continuation-id position])
+                    (swap! route-counts update continuation-id inc)
+                    (assoc item :token (+ 100 position)))
+                  work))
+          :route-token-count (fn [_ id] (get @route-counts id))})
+        prefill-result
+        (future
+          (paged-runtime/prefill!
+           runtime (effect :prefill-assignment :prefill
+                           [10 11 12 13 14 15 16 17] 1)))]
+    (try
+      (is (true? (deref entered-first-tile 1000 false)))
+      (let [decode-result
+            (future
+              (paged-runtime/decode!
+               runtime (effect :decode-assignment :decode [7 8 9] 1)))]
+        (await-value
+         1000
+         #(when (= 2 (:active-job-count (paged-runtime/state runtime))) true))
+        (deliver release-first-tile true)
+        (is (= {:ok? true :tokens [102] :stop-reason :length}
+               (deref decode-result 1000 ::timeout)))
+        (is (= {:ok? true} (deref prefill-result 1000 ::timeout)))
+        (is (= [[:bulk :prefill 0]
+                [:step :decode 2]
+                [:bulk :prefill 3]
+                [:step :prefill 6]]
+               @calls)))
+      (finally
+        (deliver release-first-tile true)
+        (.close runtime)))))

@@ -72,6 +72,63 @@
   [lanes deferred]
   (into (filterv some? lanes) deferred))
 
+(defn- lane-summary
+  [lanes]
+  (mapv #(some-> %
+                 (select-keys
+                  [:request/id :request/phase :request/continuation-id
+                   :request/remaining-tokens]))
+        lanes))
+
+(defn- bulk-prefill-job
+  [runtime lane-plan]
+  (let [item (first (:lanes lane-plan))
+        tile-size (:prefill-tile-size runtime)]
+    (when (and (= 1 (:capacity runtime))
+               (:prefill-range! runtime)
+               item
+               (= :prefill (:request/phase item))
+               (<= tile-size (:request/remaining-tokens item)))
+      item)))
+
+(defn- execute-bulk-prefill!
+  [runtime lane-plan deferred job]
+  (let [tile-size (:prefill-tile-size runtime)
+        position (long (:request/position job))
+        tokens (subvec (:job/prompt job) position (+ position tile-size))
+        started (System/nanoTime)]
+    ((:prefill-range! runtime) (:decoder runtime)
+     (:request/continuation-id job) tokens position)
+    (let [elapsed-nanos (- (System/nanoTime) started)
+          cancelled (cancelled? job)
+          remaining (- (long (:request/remaining-tokens job)) tile-size)
+          next-job (when (and (not cancelled) (pos? remaining))
+                     (-> job
+                         (dissoc :scheduled/tokens)
+                         (assoc :request/position (+ position tile-size)
+                                :request/remaining-tokens remaining)))
+          next-lanes [next-job]]
+      (swap! (:state runtime)
+             (fn [state]
+               (-> state
+                   (update :iterations inc)
+                   (update :scheduled-tokens + tile-size)
+                   (update :bulk-prefill-tiles (fnil inc 0))
+                   (update :bulk-prefill-tokens (fnil + 0) tile-size)
+                   (update :bulk-prefill-nanos (fnil + 0) elapsed-nanos)
+                   (assoc :lanes (lane-summary next-lanes)
+                          :deferred-count (count deferred)))))
+      (cond
+        cancelled
+        (fail! runtime job
+               (CancellationException. "Paged lane was cancelled"))
+
+        (zero? remaining)
+        (complete! runtime job {:ok? true})
+
+        :else nil)
+      {:lanes next-lanes :deferred deferred})))
+
 (defn- prime-values
   [lane-plan]
   (let [refill-ids (into #{} (map :request/id) (:refill lane-plan))]
@@ -161,43 +218,37 @@
              jobs)
             lane-plan (scheduler/plan-work-lanes
                        (:capacity runtime) lanes (:scheduled iteration))
-            primes (prime-values lane-plan)
-            work (lane-work (:lanes lane-plan))]
-        (when (seq primes)
-          ((:prime-lanes! runtime) (:decoder runtime) primes))
-        (let [results ((:step-lanes! runtime) (:decoder runtime) work)
-              by-lane (into {} (map (juxt :lane identity)) results)
-              advanced
-              (mapv (fn [{:keys [lane/index] :as job}]
-                      (when job
-                        (assoc (advance-lane runtime (get by-lane index) job)
-                               :job job)))
-                    (:lanes lane-plan))
-              next-lanes (mapv :next-lane advanced)]
-          (swap! (:state runtime)
-                 (fn [state]
-                   (-> state
-                       (update :iterations inc)
-                       (update :scheduled-tokens + (count work))
-                       (assoc :lanes
-                              (mapv #(some-> %
-                                             (select-keys
-                                              [:request/id :request/phase
-                                               :request/continuation-id
-                                               :request/remaining-tokens]))
-                                    next-lanes)
-                              :deferred-count
-                              (+ (count (:deferred iteration))
-                                 (count (:deferred lane-plan)))))))
-          (doseq [{:keys [job completion]} advanced
-                  :when completion]
-            (let [[action value] completion]
-              (case action
-                :complete (complete! runtime job value)
-                :fail (fail! runtime job value))))
-          {:lanes next-lanes
-           :deferred (into (vec (:deferred iteration))
-                           (:deferred lane-plan))})))))
+            deferred (into (vec (:deferred iteration))
+                           (:deferred lane-plan))]
+        (if-let [bulk-job (bulk-prefill-job runtime lane-plan)]
+          (execute-bulk-prefill! runtime lane-plan deferred bulk-job)
+          (let [primes (prime-values lane-plan)
+                work (lane-work (:lanes lane-plan))]
+            (when (seq primes)
+              ((:prime-lanes! runtime) (:decoder runtime) primes))
+            (let [results ((:step-lanes! runtime) (:decoder runtime) work)
+                  by-lane (into {} (map (juxt :lane identity)) results)
+                  advanced
+                  (mapv (fn [{:keys [lane/index] :as job}]
+                          (when job
+                            (assoc (advance-lane runtime (get by-lane index) job)
+                                   :job job)))
+                        (:lanes lane-plan))
+                  next-lanes (mapv :next-lane advanced)]
+              (swap! (:state runtime)
+                     (fn [state]
+                       (-> state
+                           (update :iterations inc)
+                           (update :scheduled-tokens + (count work))
+                           (assoc :lanes (lane-summary next-lanes)
+                                  :deferred-count (count deferred)))))
+              (doseq [{:keys [job completion]} advanced
+                      :when completion]
+                (let [[action value] completion]
+                  (case action
+                    :complete (complete! runtime job value)
+                    :fail (fail! runtime job value))))
+              {:lanes next-lanes :deferred deferred})))))))
 
 (defn- fail-runtime!
   [runtime error]
@@ -240,8 +291,8 @@
 
 (defrecord PagedRuntime
     [decoder capacity minimum-prefill-tokens eos-ids max-position prime-lanes!
-     step-lanes! route-token-count inbound registry arrival state thread
-     on-error! closed?]
+     step-lanes! prefill-range! prefill-tile-size route-token-count inbound
+     registry arrival state thread on-error! closed?]
   Closeable
   (close [this]
     (locking this
@@ -257,12 +308,16 @@
 
   Options may override `:capacity`, `:minimum-prefill-tokens`, `:eos-ids`, and
   the decoder operations for simulation. Capacity defaults to the decoder's
-  bound batch size. A multi-lane runtime reserves one lane-token for waiting
-  prefill work by default; a single lane finishes active decode before admitting
-  another prompt. Close the runtime after its worker controller has quiesced."
+  bound batch size. A decoder bound with `:prefill-T` uses one exact multi-row
+  tile per single-lane scheduler turn; decode work can run before the next tile.
+  Short prefill tails retain the ordinary lane path. A multi-lane runtime
+  reserves one lane-token for waiting prefill work by default; a single lane
+  finishes active decode before admitting another prompt. Close the runtime
+  after its worker controller has quiesced."
   ([decoder] (open-runtime decoder {}))
   ([decoder {:keys [capacity minimum-prefill-tokens eos-ids max-position
-                    prime-lanes! step-lanes! route-token-count on-error!]
+                    prime-lanes! step-lanes! prefill-range! prefill-tile-size
+                    route-token-count on-error!]
              :or {eos-ids #{}
                   on-error! (fn [error] (.printStackTrace ^Throwable error))}}]
    (let [capacity (or capacity (get-in decoder [:decode-state :batch-size]) 1)
@@ -271,7 +326,12 @@
          (if (nil? minimum-prefill-tokens)
            (if (> (long capacity) 1) 1 0)
            minimum-prefill-tokens)
-         max-position (or max-position (get-in decoder [:decode-state :maxpos]))]
+         max-position (or max-position (get-in decoder [:decode-state :maxpos]))
+         prefill-tile-size (or prefill-tile-size (:prefill-T decoder))
+         prefill-range! (or prefill-range!
+                            (when (and prefill-tile-size
+                                       (:prefill-executable decoder))
+                              paged-decoder/prefill-range!))]
      (when-not (and (integer? capacity) (pos? capacity))
        (throw (ex-info "Paged runtime capacity must be a positive integer"
                        {:capacity capacity})))
@@ -287,6 +347,21 @@
      (when-not (and (integer? max-position) (pos? max-position))
        (throw (ex-info "Paged runtime requires a positive maximum position"
                        {:max-position max-position})))
+     (when (and prefill-range!
+                (not (and (= 1 (long capacity))
+                          (integer? prefill-tile-size)
+                          (pos? prefill-tile-size))))
+       (throw (ex-info "Bulk prefill requires a positive tile and one runtime lane"
+                       {:capacity capacity
+                        :prefill-tile-size prefill-tile-size})))
+     (when (and prefill-range! (:prefill-T decoder)
+                (not= (long prefill-tile-size) (long (:prefill-T decoder))))
+       (throw (ex-info "Runtime tile must match the decoder's compiled prefill rows"
+                       {:runtime-prefill-tile-size prefill-tile-size
+                        :decoder-prefill-T (:prefill-T decoder)})))
+     (when-not (or (nil? prefill-range!) (ifn? prefill-range!))
+       (throw (ex-info "Paged runtime bulk-prefill callback must be callable"
+                       {:prefill-range! prefill-range!})))
      (when-not (every? ifn?
                        [(or prime-lanes! paged-decoder/prime-lanes!)
                         (or step-lanes! paged-decoder/step-lanes!)
@@ -305,6 +380,8 @@
                      :max-position (long max-position)
                      :prime-lanes! (or prime-lanes! paged-decoder/prime-lanes!)
                      :step-lanes! (or step-lanes! paged-decoder/step-lanes!)
+                     :prefill-range! prefill-range!
+                     :prefill-tile-size (some-> prefill-tile-size long)
                      :route-token-count
                      (or route-token-count
                          (fn [decoder continuation-id]
@@ -314,6 +391,9 @@
                      :registry (atom {})
                      :arrival (atom -1)
                      :state (atom {:iterations 0 :scheduled-tokens 0
+                                   :bulk-prefill-tiles 0
+                                   :bulk-prefill-tokens 0
+                                   :bulk-prefill-nanos 0
                                    :lanes (vec (repeat capacity nil))
                                    :deferred-count 0})
                      :on-error! on-error!
@@ -329,11 +409,19 @@
        runtime))))
 
 (defn state
-  "Return immutable counters, lane summaries, and current queue depth."
+  "Return immutable counters, tile timing, lane summaries, and queue depth."
   [runtime]
-  (assoc @(:state runtime)
-         :active-job-count (count @(:registry runtime))
-         :inbound-queue-depth (.size ^LinkedBlockingQueue (:inbound runtime))))
+  (let [snapshot @(:state runtime)
+        tokens (long (:bulk-prefill-tokens snapshot 0))
+        milliseconds (/ (long (:bulk-prefill-nanos snapshot 0)) 1.0e6)]
+    (cond->
+     (assoc snapshot
+            :prefill-tile-size (when (:prefill-range! runtime)
+                                 (:prefill-tile-size runtime))
+            :bulk-prefill-milliseconds milliseconds
+            :active-job-count (count @(:registry runtime))
+            :inbound-queue-depth (.size ^LinkedBlockingQueue (:inbound runtime)))
+      (pos? tokens) (assoc :bulk-prefill-ms-per-token (/ milliseconds tokens)))))
 
 (defn- await-job!
   [runtime job]

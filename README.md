@@ -175,6 +175,13 @@ lanes, retaining active lanes and priming only refills or prompt-token rows:
 (batch-demo/run-simulation)
 ```
 
+A single-lane decoder bound with `:prefill-T` executes one complete multi-row
+prompt tile per scheduler turn. Decode remains higher priority and may run before
+the next tile; an incomplete tail uses the ordinary one-row lane graph. This
+bounds preemption latency by the selected tile rather than by the whole prompt.
+Multi-lane prefill continues to share the decode graph one row per lane until a
+fixed-shape multi-sequence prefill graph is available.
+
 Restore overlap has a separate deterministic REPL simulation. Its pending
 restore cannot complete until the demo releases a boundary, while an unrelated
 decode finishes first:
