@@ -15,6 +15,8 @@
 
 (defrecord PageLease [pool id routes])
 
+(defrecord CapacityReservation [pool id continuation-id])
+
 (defn page-pool?
   "Return true when `value` is a device page pool."
   [value]
@@ -24,6 +26,11 @@
   "Return true when `value` is a resident page lease."
   [value]
   (instance? PageLease value))
+
+(defn capacity-reservation?
+  "Return true when `value` is a page-pool capacity reservation."
+  [value]
+  (instance? CapacityReservation value))
 
 (defn- canonical-dtype
   [dtype]
@@ -250,6 +257,7 @@
        (atom {:free (apply sorted-set (range physical-pages))
               :refcounts {}
               :leases {}
+              :capacity-reservations {}
               :routes {}
               :block-transfer-engines {}
               :transfers {:counters {} :last nil}})))))
@@ -272,13 +280,41 @@
   applying it because GPU work may acquire a lease concurrently."
   [pool]
   (locking pool
-    (let [{:keys [free refcounts routes leases]} @(:state pool)]
+    (let [{:keys [free refcounts routes leases capacity-reservations]} @(:state pool)]
       {:physical-pages (:physical-pages pool)
        :page-size (:page-size pool)
        :free-pages (set free)
        :refcounts refcounts
        :routes routes
-       :leases (or leases {})})))
+       :leases (or leases {})
+       :capacity-reservations (or capacity-reservations {})})))
+
+(defn capacity-page-requirement
+  "Return additional pages needed for a continuation to reach `token-capacity`.
+
+  `snapshot` is the immutable value returned by `residency-snapshot`. Existing
+  route pages are credited. Growing a shared partial tail requires one extra
+  copy-on-write page even when the target remains within that logical page."
+  [snapshot continuation-id token-capacity]
+  (when-not (and (map? snapshot)
+                 (some? continuation-id)
+                 (integer? token-capacity)
+                 (not (neg? token-capacity)))
+    (throw (ex-info "Capacity requirement arguments are invalid"
+                    {:continuation-id continuation-id
+                     :token-capacity token-capacity})))
+  (let [resident-route (get-in snapshot [:routes continuation-id])
+        target-pages (page-count (long token-capacity) (:page-size snapshot))
+        current-pages (count (:pages resident-route))
+        shared-partial?
+        (and resident-route
+             (< (:token-count resident-route) token-capacity)
+             (pos? (rem (:token-count resident-route) (:page-size snapshot)))
+             (> (get-in snapshot
+                        [:refcounts (peek (:pages resident-route))] 0)
+                1))]
+    (+ (max 0 (- target-pages current-pages))
+       (if shared-partial? 1 0))))
 
 (defn touch-route!
   "Record worker-local policy observations for a resident continuation.
@@ -310,13 +346,16 @@
 (defn stats
   "Return instantaneous worker-local page ownership and capacity counters."
   [pool]
-  (let [{:keys [free refcounts routes leases]} @(:state pool)]
+  (let [{:keys [free refcounts routes leases capacity-reservations]} @(:state pool)]
     {:physical-pages (:physical-pages pool)
      :free-pages (count free)
      :resident-pages (count refcounts)
      :shared-pages (count (filter #(> % 1) (vals refcounts)))
      :resident-routes (count routes)
-     :active-leases (count leases)}))
+     :active-leases (count leases)
+     :capacity-reservations (count capacity-reservations)
+     :reserved-pages (reduce + 0 (map (comp count :pages)
+                                      (vals capacity-reservations)))}))
 
 (defn transfer-stats
   "Return cumulative measured cache-transfer counters and the last measurement.
@@ -394,6 +433,115 @@
                        #(reduce (fn [references page] (assoc references page 1))
                                 % pages)))]))
 
+(defn- reservation-entry
+  [state reservation continuation-id]
+  (when-not (and (capacity-reservation? reservation)
+                 (= continuation-id (:continuation-id reservation)))
+    (throw (ex-info "Capacity reservation belongs to another continuation"
+                    {:continuation-id continuation-id
+                     :reservation reservation})))
+  (or (get-in state [:capacity-reservations (:id reservation)])
+      (throw (ex-info "Capacity reservation is stale or released"
+                      {:continuation-id continuation-id
+                       :reservation-id (:id reservation)}))))
+
+(defn- claim-reserved-pages
+  [state reservation continuation-id n]
+  (let [entry (reservation-entry state reservation continuation-id)
+        pages (vec (take n (:pages entry)))]
+    (when-not (= n (count pages))
+      (throw (ex-info "Capacity reservation has insufficient remaining pages"
+                      {:continuation-id continuation-id
+                       :reservation-id (:id reservation)
+                       :required n :available (count (:pages entry))})))
+    [pages (-> state
+               (assoc-in [:capacity-reservations (:id reservation) :pages]
+                         (vec (drop n (:pages entry))))
+               (update :refcounts
+                       #(reduce (fn [references page] (assoc references page 1))
+                                % pages)))]))
+
+(defn- route-reservation
+  [pool state continuation-id]
+  (let [matches (into []
+                      (keep (fn [[id entry]]
+                              (when (= continuation-id (:continuation-id entry))
+                                (->CapacityReservation pool id continuation-id))))
+                      (:capacity-reservations state))]
+    (when (> (count matches) 1)
+      (throw (ex-info "Continuation has multiple capacity reservations"
+                      {:continuation-id continuation-id
+                       :reservation-ids (mapv :id matches)})))
+    (first matches)))
+
+(defn reserve-capacity!
+  "Reserve physical pages for a continuation's projected token capacity.
+
+  Reserved pages are removed from the free set immediately but are not visible
+  to kernels until `allocate-route!` or a later append claims them. Existing
+  route pages count toward `token-capacity`; a shared partial tail additionally
+  reserves its possible copy-on-write page. Only one live reservation may name
+  a continuation. Returns a `CapacityReservation` released explicitly with
+  `release-capacity!` after completion or cancellation."
+  [pool continuation-id token-capacity]
+  (when-not (and (some? continuation-id)
+                 (integer? token-capacity)
+                 (not (neg? token-capacity)))
+    (throw (ex-info "Capacity reservation identity and extent are invalid"
+                    {:continuation-id continuation-id
+                     :token-capacity token-capacity})))
+  (locking pool
+    (let [state @(:state pool)
+          resident-route (get-in state [:routes continuation-id])
+          _ (when (:pending resident-route)
+              (throw (ex-info "Cannot reserve capacity during a pending append"
+                              {:continuation-id continuation-id})))
+          _ (when (route-reservation pool state continuation-id)
+              (throw (ex-info "Continuation already has a capacity reservation"
+                              {:continuation-id continuation-id})))
+          required (capacity-page-requirement
+                    (assoc state :page-size (:page-size pool))
+                    continuation-id token-capacity)
+          pages (vec (take required (:free state)))]
+      (when-not (= required (count pages))
+        (throw (ex-info "Device page pool cannot reserve projected capacity"
+                        {:continuation-id continuation-id
+                         :token-capacity token-capacity
+                         :required-pages required
+                         :available-pages (count (:free state))})))
+      (let [id (UUID/randomUUID)
+            reservation (->CapacityReservation pool id continuation-id)]
+        (reset! (:state pool)
+                (-> state
+                    (update :free #(apply disj % pages))
+                    (assoc-in [:capacity-reservations id]
+                              {:continuation-id continuation-id
+                               :token-capacity (long token-capacity)
+                               :pages pages})))
+        reservation))))
+
+(defn release-capacity!
+  "Release the unclaimed pages of `reservation` and return true.
+
+  Returns false when the reservation was already released. Pages already
+  claimed by a resident route remain resident and are released with that route."
+  [pool reservation]
+  (when-not (and (capacity-reservation? reservation)
+                 (identical? pool (:pool reservation)))
+    (throw (ex-info "Capacity reservation belongs to a different pool"
+                    {:reservation reservation})))
+  (locking pool
+    (let [state @(:state pool)
+          entry (get-in state [:capacity-reservations (:id reservation)])]
+      (if-not entry
+        false
+        (do
+          (reset! (:state pool)
+                  (-> state
+                      (update :free #(apply conj % (:pages entry)))
+                      (update :capacity-reservations dissoc (:id reservation))))
+          true)))))
+
 (defn allocate-route!
   "Allocate a resident page route for `token-count` logical tokens.
 
@@ -402,7 +550,7 @@
   records the absolute position of routed token zero."
   ([pool continuation-id token-count]
    (allocate-route! pool continuation-id token-count {}))
-  ([pool continuation-id token-count {:keys [start-position policy]
+  ([pool continuation-id token-count {:keys [start-position policy capacity-reservation]
                                       :or {start-position 0 policy {}}}]
    (let [token-count (long token-count)
          start-position (long start-position)]
@@ -420,7 +568,15 @@
            (throw (ex-info "Continuation already has a resident route"
                            {:continuation-id continuation-id})))
          (let [required (page-count token-count (:page-size pool))
-               [pages next-state] (take-free-pages state required continuation-id)
+               _ (when (and capacity-reservation
+                            (not (identical? pool (:pool capacity-reservation))))
+                   (throw (ex-info "Capacity reservation belongs to a different pool"
+                                   {:continuation-id continuation-id})))
+               [pages next-state]
+               (if capacity-reservation
+                 (claim-reserved-pages state capacity-reservation
+                                       continuation-id required)
+                 (take-free-pages state required continuation-id))
                resident-route (cond-> {:continuation-id continuation-id
                                        :pages pages
                                        :token-count token-count
@@ -656,9 +812,12 @@
             existing (get (:pages resident-route) logical-page)
             shared? (and existing (> (get-in state [:refcounts existing]) 1))
             needs-page? (or (nil? existing) shared?)
+            capacity-reservation (route-reservation pool state continuation-id)
             [new-pages reserved-state]
             (if needs-page?
-              (take-free-pages state 1 continuation-id)
+              (if capacity-reservation
+                (claim-reserved-pages state capacity-reservation continuation-id 1)
+                (take-free-pages state 1 continuation-id))
               [[] state])
             physical-page (or (first new-pages) existing)]
         (when shared?

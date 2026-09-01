@@ -87,6 +87,14 @@ then bounded repair and prefill chunks consume the remaining token and sequence
 budgets. Cache-source selection is also explicit; modular repair is ineligible
 unless the caller supplies both an opt-in and a minimum quality threshold.
 
+The cluster lifecycle is implemented separately in
+`pretrained.continuation.controller.*`. A pure router ranks request-specific
+exact-prefix candidates by predicted TTFT and fences retries by assignment
+attempt. A worker-local interpreter repeats admission against current device
+state before accepting, then invokes the manager and paged decoder through
+injected handlers. The same pure machines run in a deterministic failure
+simulator; see [cluster-controller.md](cluster-controller.md).
+
 ### GPU cache manager
 
 One manager per device owns physical pages and never delegates allocation to
@@ -105,6 +113,11 @@ admission evaluator over page-pool snapshots. It ranks durable routes by expecte
 saved compute, lower-tier reload cost, sharing/SLO bonuses, and recency. Planning
 simulates shared-page refcounts; application revalidates under the pool lock and
 cannot evict dirty, pinned, protected, or actively leased routes.
+
+Admission now reserves the full projected prompt-plus-generation page demand.
+Existing resident pages are credited and shared partial tails include a possible
+copy-on-write page. Cancellation fences logical work immediately but does not
+release physical capacity until an accepted local operation has quiesced.
 
 ### Raster execution contract
 

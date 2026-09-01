@@ -22,6 +22,60 @@
     [:value 1] :pool-v1}
    state))
 
+(deftest projected-capacity-is-held-through-restore-and-growth
+  (let [pool (fixture-pool
+              (atom {:free (apply sorted-set (range 8))
+                     :refcounts {}
+                     :routes {}}))
+        capacity (page-pool/reserve-capacity! pool :request 10)]
+    (is (page-pool/capacity-reservation? capacity))
+    (is (= 5 (page-pool/free-page-count pool)))
+    (is (= {:capacity-reservations 1 :reserved-pages 3}
+           (select-keys (page-pool/stats pool)
+                        [:capacity-reservations :reserved-pages])))
+    (page-pool/allocate-route! pool :request 4
+                               {:capacity-reservation capacity})
+    (is (= 2 (:reserved-pages (page-pool/stats pool))))
+    (dotimes [_ 6]
+      (let [append (page-pool/reserve-append! pool :request)]
+        (page-pool/commit-append! pool :request append)))
+    (is (= 10 (:token-count (page-pool/route pool :request))))
+    (is (zero? (:reserved-pages (page-pool/stats pool))))
+    (is (page-pool/release-capacity! pool capacity))
+    (is (false? (page-pool/release-capacity! pool capacity)))
+    (is (= 5 (page-pool/free-page-count pool)))
+    (is (page-pool/release-route! pool :request))
+    (is (= 8 (page-pool/free-page-count pool)))))
+
+(deftest unused-capacity-is-recoverable-and-unavailable-to-other-routes
+  (let [pool (fixture-pool
+              (atom {:free (apply sorted-set (range 8))
+                     :refcounts {}
+                     :routes {}}))
+        capacity (page-pool/reserve-capacity! pool :reserved 32)]
+    (is (zero? (page-pool/free-page-count pool)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"insufficient"
+                          (page-pool/allocate-route! pool :other 1)))
+    (is (page-pool/release-capacity! pool capacity))
+    (is (= 8 (page-pool/free-page-count pool)))))
+
+(deftest projected-capacity-includes-shared-tail-copy-on-write
+  (let [pool (fixture-pool
+              (atom {:free (apply sorted-set (range 8))
+                     :refcounts {}
+                     :routes {}}))]
+    (with-redefs [gpu/buffer-view (fn [_ key opts] {:key key :opts opts})
+                  gpu/copy-range! (fn [_ _ destination _] destination)]
+      (page-pool/allocate-route! pool :root 3)
+      (page-pool/fork-route! pool :root :fork)
+      (let [capacity (page-pool/reserve-capacity! pool :fork 4)]
+        (is (= 1 (:reserved-pages (page-pool/stats pool))))
+        (let [append (page-pool/reserve-append! pool :fork)]
+          (is (= 0 (:replaced-page append)))
+          (page-pool/commit-append! pool :fork append)
+          (is (zero? (:reserved-pages (page-pool/stats pool))))
+          (is (page-pool/release-capacity! pool capacity)))))))
+
 (deftest routes-share-full-pages-and-copy-on-write-the-tail
   (let [copies (atom [])
         views (atom [])

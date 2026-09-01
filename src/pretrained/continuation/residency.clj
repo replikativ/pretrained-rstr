@@ -68,6 +68,41 @@
           simulation
           (:pages resident-route)))
 
+(defn- plan-pages
+  [snapshot required protected-continuation-ids]
+  (let [available (count (:free-pages snapshot))
+        leased (leased-continuations snapshot)
+        candidates
+        (sort-by (juxt value-density
+                       #(long (or (get-in % [:cache/policy :last-access]) 0))
+                       (comp str :continuation-id))
+                 (filter #(eligible-route? leased protected-continuation-ids %)
+                         (vals (:routes snapshot))))]
+    (loop [remaining candidates
+           simulation (select-keys snapshot [:refcounts :free-pages])
+           evictions []]
+      (let [free (count (:free-pages simulation))]
+        (cond
+          (>= free required)
+          {:admissible? true
+           :required-pages required
+           :available-pages available
+           :evictions evictions
+           :free-pages-after-eviction free}
+
+          (empty? remaining)
+          {:admissible? false
+           :required-pages required
+           :available-pages available
+           :evictions []
+           :shortfall-pages (- required free)}
+
+          :else
+          (let [victim (first remaining)]
+            (recur (next remaining)
+                   (release-simulated-route simulation victim)
+                   (conj evictions (:continuation-id victim)))))))))
+
 (defn plan-admission
   "Plan durable route evictions needed to admit `token-count` tokens.
 
@@ -82,39 +117,48 @@
    (when-not (and (integer? token-count) (not (neg? token-count)))
      (throw (ex-info "Admission token count must be a non-negative integer"
                      {:token-count token-count})))
-   (let [required (page-count token-count (:page-size snapshot))
-         available (count (:free-pages snapshot))
-         leased (leased-continuations snapshot)
-         candidates
-         (sort-by (juxt value-density
-                        #(long (or (get-in % [:cache/policy :last-access]) 0))
-                        (comp str :continuation-id))
-                  (filter #(eligible-route? leased protected-continuation-ids %)
-                          (vals (:routes snapshot))))]
-     (loop [remaining candidates
-            simulation (select-keys snapshot [:refcounts :free-pages])
-            evictions []]
-       (let [free (count (:free-pages simulation))]
-         (cond
-           (>= free required)
-           {:admissible? true
-            :required-pages required
-            :available-pages available
-            :evictions evictions
-            :free-pages-after-eviction free}
+   (plan-pages snapshot
+               (page-count token-count (:page-size snapshot))
+               protected-continuation-ids)))
 
-           (empty? remaining)
-           {:admissible? false
-            :required-pages required
-            :available-pages available
-            :evictions []
-            :shortfall-pages (- required free)}
+(defn plan-capacity-admission
+  "Plan evictions for a continuation's incremental projected capacity.
 
-           :else
-           (let [victim (first remaining)]
-             (recur (next remaining)
-                    (release-simulated-route simulation victim)
-                    (conj evictions (:continuation-id victim))))))))))
+  Existing resident pages are credited and a shared partial tail's possible
+  copy-on-write page is included. The target continuation is always protected
+  from eviction. `opts` accepts `:protected-continuation-ids`."
+  ([snapshot continuation-id token-capacity]
+   (plan-capacity-admission snapshot continuation-id token-capacity {}))
+  ([snapshot continuation-id token-capacity
+    {:keys [protected-continuation-ids]
+     :or {protected-continuation-ids #{}}}]
+   (plan-pages
+    snapshot
+    (page-pool/capacity-page-requirement
+     snapshot continuation-id token-capacity)
+    (conj protected-continuation-ids continuation-id))))
+
+(defn reserve-admission!
+  "Evict eligible routes and reserve projected capacity atomically.
+
+  Returns an admission plan with `:capacity-reservation` when admissible, or an
+  unchanged non-admissible plan. The reservation must be released explicitly
+  after completion, cancellation, or failed restore."
+  ([pool continuation-id token-capacity]
+   (reserve-admission! pool continuation-id token-capacity {}))
+  ([pool continuation-id token-capacity opts]
+   (locking pool
+     (let [plan (plan-capacity-admission
+                 (page-pool/residency-snapshot pool)
+                 continuation-id token-capacity opts)]
+       (if-not (:admissible? plan)
+         plan
+         (do
+           (doseq [victim (:evictions plan)]
+             (page-pool/release-route! pool victim))
+           (assoc plan :capacity-reservation
+                  (page-pool/reserve-capacity!
+                   pool continuation-id token-capacity))))))))
 
 (defn admit-route!
   "Safely evict durable routes and allocate a new resident continuation route.

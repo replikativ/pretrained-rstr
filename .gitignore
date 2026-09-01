@@ -2,5 +2,6 @@
 /.clj-kondo/
 /target/
 /.lsp/
+/.nrepl-port
 *.gguf
 .internal/

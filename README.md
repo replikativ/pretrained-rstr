@@ -136,6 +136,16 @@ There is no automatic semantic merge for divergent KV caches. Read the
 [continuation model](doc/continuation-model.md) for the invariants and stack
 ownership.
 
+The model-free cluster simulator runs the same router and worker state machines
+used by the runtime adapter. It makes locality/load decisions and failure traces
+inspectable without a GPU or service:
+
+```clojure
+;; clojure -M:examples
+(require '[pretrained.continuation-controller-demo :as controller-demo])
+(controller-demo/run-simulation)
+```
+
 For an already loaded model, the benchmark helper separates prefill, checkpoint
 submission and durability, prefix restore, uncached suffix work, first-token
 latency, and context-indexed steady decode:
@@ -194,6 +204,7 @@ Further reading:
 
 - [Git-like continuation model](doc/continuation-model.md)
 - [Distributed paged inference architecture](doc/serving-architecture.md)
+- [Cluster continuation controller](doc/cluster-controller.md)
 - [Numerical memory and simulation direction](doc/numerical-memory.md)
 - [Contributing and validation](CONTRIBUTING.md)
 
