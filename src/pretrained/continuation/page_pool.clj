@@ -7,7 +7,8 @@
   (:require [pretrained.attention-state :as attention-state]
             [pretrained.continuation.block-transfer :as block-transfer]
             [raster.gpu.core :as gpu])
-  (:import [java.lang.foreign MemorySegment]
+  (:import [java.lang AutoCloseable]
+           [java.lang.foreign MemorySegment]
            [java.util UUID]))
 
 (defrecord DevicePagePool
@@ -18,6 +19,9 @@
 (defrecord CapacityReservation [pool id continuation-id])
 
 (defrecord ChunkTransfer [pool event resident-route])
+
+(defrecord ChunkExport [pool event resident-route descriptor model-fingerprint
+                        plan payload])
 
 (defn page-pool?
   "Return true when `value` is a device page pool."
@@ -38,6 +42,11 @@
   "Return true when `value` is a submitted page-pool chunk transfer."
   [value]
   (instance? ChunkTransfer value))
+
+(defn chunk-export?
+  "Return true when `value` is a submitted page-pool chunk export."
+  [value]
+  (instance? ChunkExport value))
 
 (defn- canonical-dtype
   [dtype]
@@ -1104,6 +1113,129 @@
        pool :upload (direct-restore-entries pool transfer)))
     resident-route))
 
+(defn- export-chunk-plan
+  [pool lease continuation-id descriptor]
+  (let [resident-route (first (:routes lease))
+        start (long (:chunk/start descriptor))
+        token-count (long (:chunk/token-count descriptor))
+        end (+ start token-count)]
+    (when-not (zero? (long (:start-position resident-route)))
+      (throw (ex-info "Durable prefix export requires a zero absolute start position"
+                      {:continuation-id continuation-id
+                       :start-position (:start-position resident-route)})))
+    (when (or (neg? start) (not (pos? token-count))
+              (> end (:token-count resident-route)))
+      (throw (ex-info "Chunk range is outside the resident continuation"
+                      {:start start :token-count token-count
+                       :resident-tokens (:token-count resident-route)})))
+    (let [plan (attention-state/payload-plan (:layout pool) token-count)
+          payload-elements (reduce + 0 (map :elements plan))]
+      {:resident-route resident-route
+       :start start
+       :token-count token-count
+       :plan plan
+       :payload (short-array payload-elements)
+       :runs (transfer-runs resident-route start token-count (:page-size pool))})))
+
+(defn- direct-export-entries
+  [pool {:keys [plan payload runs]}]
+  (let [slab-by-name (into {} (map (juxt :name identity))
+                           (:slabs (:layout pool)))]
+    (vec
+     (mapcat
+      (fn [{:keys [slab layer element-offset]}]
+        (let [slab-layout (get slab-by-name slab)
+              per-token (:elements-per-token slab-layout)]
+          (mapv
+           (fn [{:keys [relative-token physical-token token-count]}]
+             [(token-range-view pool slab-layout layer
+                                physical-token token-count)
+              payload
+              {:src-element 0
+               :dst-element (+ element-offset (* relative-token per-token))
+               :elements (* token-count per-token)}])
+           runs)))
+      plan))))
+
+(defn- exported-chunk
+  [pool model-fingerprint descriptor plan payload]
+  (let [durable-layout (assoc (:layout pool)
+                              :dtype :float16
+                              :byte-order :little-endian)]
+    (cond->
+     (merge descriptor
+            {:chunk/version 3
+             :chunk/model-fingerprint model-fingerprint
+             :chunk/layout {:dtype :float16
+                            :byte-order :little-endian
+                            :attention-state durable-layout}
+             :chunk/slabs plan
+             :chunk/payload payload})
+      (apply = (map :elements plan))
+      (assoc :chunk/elements-per-slab (:elements (first plan))))))
+
+(defn submit-export-chunk!
+  "Submit an immutable route range download without waiting for completion.
+
+  The returned `ChunkExport` owns a route lease through its Raster event, so
+  eviction and copy-on-write cannot recycle source pages while the device writes
+  the host payload. Direct ranged downloads avoid holding the Raster session
+  lock while the transfer is in flight. Finalize it with
+  `complete-export-chunk!`; failed submission releases the lease immediately."
+  [pool continuation-id model-fingerprint descriptor]
+  (when-not (= :half (:dtype pool))
+    (throw (ex-info "Paged chunk export currently requires an FP16 page pool"
+                    {:pool-dtype (:dtype pool)})))
+  (let [lease (acquire-lease! pool [continuation-id])
+        released? (atom false)
+        lease-resource
+        (reify AutoCloseable
+          (close [_]
+            (when (compare-and-set! released? false true)
+              (release-lease! pool lease))))]
+    (try
+      (let [{:keys [resident-route plan payload] :as export-plan}
+            (export-chunk-plan pool lease continuation-id descriptor)
+            event (gpu/submit-download-ranges-retained!
+                   (:session pool)
+                   (direct-export-entries pool export-plan)
+                   [lease-resource])]
+        (->ChunkExport pool event resident-route descriptor model-fingerprint
+                       plan payload))
+      (catch Throwable error
+        (.close ^AutoCloseable lease-resource)
+        (throw error)))))
+
+(defn chunk-export-complete?
+  "Poll an exported chunk without consuming its event or route lease."
+  [pool export]
+  (when-not (and (chunk-export? export)
+                 (identical? pool (:pool export)))
+    (throw (ex-info "Chunk export belongs to a different page pool"
+                    {:export export})))
+  (gpu/event-complete? (:session pool) (:event export)))
+
+(defn complete-export-chunk!
+  "Establish download completion and return the portable durable chunk.
+
+  Completion records transfer measurements and releases both the Raster event
+  and its retained route lease. Callers should poll `chunk-export-complete?`
+  before finalizing so this method does not wait while holding the session lock."
+  [pool export]
+  (when-not (and (chunk-export? export)
+                 (identical? pool (:pool export)))
+    (throw (ex-info "Chunk export belongs to a different page pool"
+                    {:export export})))
+  (let [session (:session pool)
+        event (:event export)]
+    (try
+      (gpu/await-event! session event)
+      (record-transfer! pool (gpu/event-measurement session event))
+      (exported-chunk pool (:model-fingerprint export) (:descriptor export)
+                      (:plan export) (:payload export))
+      (finally
+        (gpu/release-event! session event)))))
+
 (defn export-chunk
   "Gather one immutable route range into the durable FP16 chunk format.
 
@@ -1120,59 +1252,13 @@
                     {:pool-dtype (:dtype pool)})))
   (let [lease (acquire-lease! pool [continuation-id])]
     (try
-      (let [resident-route (first (:routes lease))
-            start (long (:chunk/start descriptor))
-            token-count (long (:chunk/token-count descriptor))
-            end (+ start token-count)
-            _ (when-not (zero? (long (:start-position resident-route)))
-                (throw (ex-info "Durable prefix export requires a zero absolute start position"
-                                {:continuation-id continuation-id
-                                 :start-position (:start-position resident-route)})))
-            _ (when (or (neg? start) (not (pos? token-count))
-                        (> end (:token-count resident-route)))
-                (throw (ex-info "Chunk range is outside the resident continuation"
-                                {:start start :token-count token-count
-                                 :resident-tokens (:token-count resident-route)})))
-            plan (attention-state/payload-plan (:layout pool) token-count)
-            payload-elements (reduce + 0 (map :elements plan))
-            halfs (short-array payload-elements)
-            runs (transfer-runs resident-route start token-count (:page-size pool))]
+      (let [{:keys [resident-route start token-count plan payload runs] :as export-plan}
+            (export-chunk-plan pool lease continuation-id descriptor)]
         (if (block-transfer-eligible? pool resident-route start token-count runs)
-          (export-blocks! pool resident-route start token-count plan halfs)
-          (let [slab-by-name (into {} (map (juxt :name identity))
-                                   (:slabs (:layout pool)))
-                entries
-                (vec
-                 (mapcat
-                  (fn [{:keys [slab layer element-offset]}]
-                    (let [slab-layout (get slab-by-name slab)
-                          per-token (:elements-per-token slab-layout)]
-                      (mapv
-                       (fn [{:keys [relative-token physical-token token-count]}]
-                         [(token-range-view pool slab-layout layer
-                                            physical-token token-count)
-                          halfs
-                          {:src-element 0
-                           :dst-element (+ element-offset
-                                           (* relative-token per-token))
-                           :elements (* token-count per-token)}])
-                       runs)))
-                  plan))]
-            (transfer-ranges-measured! pool :download entries)))
-        (let [durable-layout (assoc (:layout pool)
-                                    :dtype :float16
-                                    :byte-order :little-endian)]
-          (cond->
-           (merge descriptor
-                  {:chunk/version 3
-                   :chunk/model-fingerprint model-fingerprint
-                   :chunk/layout {:dtype :float16
-                                  :byte-order :little-endian
-                                  :attention-state durable-layout}
-                   :chunk/slabs plan
-                   :chunk/payload halfs})
-            (apply = (map :elements plan))
-            (assoc :chunk/elements-per-slab (:elements (first plan))))))
+          (export-blocks! pool resident-route start token-count plan payload)
+          (transfer-ranges-measured!
+           pool :download (direct-export-entries pool export-plan)))
+        (exported-chunk pool model-fingerprint descriptor plan payload))
       (finally
         (release-lease! pool lease)))))
 

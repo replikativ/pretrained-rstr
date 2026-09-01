@@ -82,10 +82,21 @@
             "a positive poll does not consume retained ownership")
         (page-pool/complete-restore-chunk! pool transfer)
         (is @resource-closed?)
-        (is (= (vec replacement)
-               (vec (:chunk/payload
-                     (page-pool/export-chunk
-                      pool :fragmented "block-device-fixture" descriptor))))))
+        (let [export (page-pool/submit-export-chunk!
+                      pool :fragmented "block-device-fixture" descriptor)
+              deadline (+ (System/nanoTime) 5000000000)]
+          (loop []
+            (when-not (page-pool/chunk-export-complete? pool export)
+              (when (> (System/nanoTime) deadline)
+                (throw (ex-info "Timed out waiting for retained device download" {})))
+              (Thread/sleep 1)
+              (recur)))
+          (is (= 1 (:active-leases (page-pool/stats pool)))
+              "a positive poll does not consume the retained route lease")
+          (is (= (vec replacement)
+                 (vec (:chunk/payload
+                       (page-pool/complete-export-chunk! pool export)))))
+          (is (zero? (:active-leases (page-pool/stats pool))))))
       (finally
         (page-pool/close-transfer-engines! pool)
         (gpu/close-session! session)))))

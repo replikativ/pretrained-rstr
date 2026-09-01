@@ -190,7 +190,10 @@ Real workers construct `paged-runtime/open-runtime`, pass
 runtime owns decoder calls; close the controller first, then the runtime.
 Raster 0.2.457 retains each Konserve mmap lease through its asynchronous upload
 event. The worker polls completion between decode iterations and exposes the
-restored route only after all required chunks are resident.
+restored route only after all required chunks are resident. Checkpoint capture
+uses the symmetric retained download API: its event pins the source route until
+the host payload is complete, while the capture worker polls outside the decoder
+loop and writes at most one staged chunk at a time.
 
 For an already loaded model, the benchmark helper separates prefill, checkpoint
 submission and durability, prefix restore, uncached suffix work, first-token
@@ -205,6 +208,8 @@ latency, and context-indexed steady decode:
   :chunk-size 256
   :page-size 16
   :decode-tokens 16
+  ;; Requires page capacity for the source and an unrelated decode route.
+  :checkpoint-overlap-decode-tokens 16
   :warmups 1
   :iterations 5})
 ```

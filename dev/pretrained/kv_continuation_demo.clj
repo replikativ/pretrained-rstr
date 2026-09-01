@@ -171,16 +171,18 @@
   Intended for an nREPL with `:dev`. Model loading is deliberately outside the
   measurement. `opts` requires `:max-position` and may contain `:page-size`,
   `:physical-pages`, `:chunk-size`, `:iterations`, `:warmups`,
-  `:decode-tokens`, `:attention-schedule`, `:history-tile-size`, and the
-  fingerprint options accepted by `fingerprint`. `:device-id` defaults to
-  Raster's `:ze:0` and may select an OpenCL device such as `:ocl:0`.
+  `:decode-tokens`, `:checkpoint-overlap-decode-tokens`,
+  `:attention-schedule`, `:history-tile-size`, and the fingerprint options
+  accepted by `fingerprint`. Overlap measurement needs GPU pages for two prompt
+  routes plus generated tokens. `:device-id` defaults to Raster's `:ze:0` and
+  may select an OpenCL device such as `:ocl:0`.
 
   Returns the instrumented benchmark plus the first restored token sequence.
   The function closes the temporary manager, paged decoder, and Raster session."
   [model prompt-ids datahike-config cache-directory opts]
   (let [{:keys [max-position page-size physical-pages chunk-size
                 iterations warmups decode-tokens attention-schedule
-                history-tile-size device-id]
+                checkpoint-overlap-decode-tokens history-tile-size device-id]
          :or {page-size 16 iterations 5 warmups 1 decode-tokens 4
               device-id :ze:0}} opts
         model-fingerprint (fingerprint model opts)
@@ -209,7 +211,9 @@
              cache @decoder model-fingerprint (vec prompt-ids)
              {:iterations iterations
               :warmups warmups
-              :decode-tokens decode-tokens})]
+              :decode-tokens decode-tokens
+              :checkpoint-overlap-decode-tokens
+              (or checkpoint-overlap-decode-tokens 0)})]
         (assoc result
                :first-restored-tokens
                (mapv :token (get-in result [:restored :first-measured :steps]))))

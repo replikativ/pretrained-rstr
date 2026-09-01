@@ -222,12 +222,14 @@ Restore is planned before bytes move:
 6. Prefill the uncached suffix and leave the final token pending.
 
 `checkpoint-paged-chunks-async!` checkpoints immutable completed page ranges.
-The bounded capture worker leases a route snapshot, gathers arbitrary physical
-page spans, and writes the local mmap filestore; Konserve write-behind copies to
-S3 and Datahike publication waits for backend receipts. If either queue is full,
-the optional checkpoint is skipped. The remaining performance step is moving
-device-to-host capture onto a dedicated low-priority transfer stream backed by a
-bounded pinned-memory pool, so copies do not contend with inference kernels.
+The bounded capture worker submits validated direct downloads across arbitrary
+physical page spans. Raster retains the route lease through device completion,
+while the worker polls without holding the decoder session. It writes each host
+payload before allocating the next, bounding staging to one durable chunk.
+Konserve write-behind copies to S3 and Datahike publication waits for backend
+receipts. If either queue is full, the optional checkpoint is skipped. A
+dedicated low-priority transfer stream and bounded pinned-memory pool remain
+needed to control copy-engine and memory-bandwidth contention with inference.
 
 ## Policy
 

@@ -147,13 +147,17 @@
             (benchmark/benchmark-paged-continuation!
              ::cache {:pool ::pool :decode-state {:batch-size 1}}
              "fixture-v1" [1 2 3 4]
-             {:iterations 2 :warmups 1 :decode-tokens 3})
+             {:iterations 2 :warmups 1 :decode-tokens 3
+              :checkpoint-overlap-decode-tokens 2})
             first-restored (get-in result [:restored :first-measured])]
         (is (= 80 (get-in result [:checkpoint :stored-bytes])))
         (is (= 80 (get-in result
                           [:block-transfer-preparation :workspace-bytes])))
         (is (= 4096 (get-in result [:attention-execution :temporary-bytes])))
         (is (= 3 (:cached-token-count first-restored)))
+        (is (= {:maximum-steps 2
+                :steps-started-before-capture-complete 0}
+               (get-in result [:checkpoint :inference-overlap])))
         (is (= [4 5 6]
                (mapv :context-token-count (:steps first-restored))))
         (is (= [103 104 105]
