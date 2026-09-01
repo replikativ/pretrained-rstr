@@ -64,6 +64,21 @@
            (scheduler/choose-cache-source
              candidates {:allow-approximate? true :minimum-quality 0.99}))))))
 
+(deftest checkpoint-admission-requires-positive-measured-value
+  (let [base {:checkpoint-ms 188.0
+              :saved-ms-per-reuse 118.0
+              :interference-ms 1.0}
+        rejected (scheduler/checkpoint-decision
+                  (assoc base :expected-reuses 1.0))
+        admitted (scheduler/checkpoint-decision
+                  (assoc base :expected-reuses 2.0))]
+    (is (false? (:admit? rejected)))
+    (is (= :insufficient-expected-reuse (:reason rejected)))
+    (is (true? (:admit? admitted)))
+    (is (= :positive-expected-value (:reason admitted)))
+    (is (= (/ 189.0 118.0) (:break-even-reuses admitted)))
+    (is (= 47.0 (:net-benefit-ms admitted)))))
+
 (deftest decode-lanes-retain-resident-work-and-refill-only-vacancies
   (let [left #:request{:id :left :continuation-id :left-kv :phase :decode
                        :remaining-tokens 4 :position 8 :pending-token 101 :arrival 0}

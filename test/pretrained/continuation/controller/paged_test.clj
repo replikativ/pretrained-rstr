@@ -4,7 +4,8 @@
             [pretrained.continuation.manager :as manager]
             [pretrained.continuation.page-pool :as page-pool]
             [pretrained.continuation.paged-decoder :as paged-decoder]
-            [pretrained.continuation.paged-runtime :as paged-runtime]))
+            [pretrained.continuation.paged-runtime :as paged-runtime])
+  (:import [java.util.concurrent CompletableFuture]))
 
 (def ^:private request
   {:request/id :request-a
@@ -67,6 +68,47 @@
       (is (= "fixture-v1" (:model-fingerprint (second @touched))))
       (is (uuid? (:prefix-hash (second @touched))))
       (is (= 128 (:bytes (second @touched)))))))
+
+(deftest positive-value-decode-checkpoint-becomes-durable-after-publication
+  (let [token-count (atom 2)
+        route-policy (atom {:durable? false})
+        checkpoint-args (atom nil)
+        decoder {:pool ::pool :decode-state {:maxpos 8}}
+        handlers
+        (paged/handlers
+         ::cache decoder
+         {:eos-ids #{7}
+          :checkpoint-policy {:expected-reuses 2.0
+                              :checkpoint-ms 100.0
+                              :saved-ms-per-reuse 80.0}})]
+    (with-redefs [paged-decoder/prime-prompt! (fn [& _] nil)
+                  paged-decoder/step!
+                  (fn [& _]
+                    (swap! token-count inc)
+                    7)
+                  page-pool/route
+                  (fn [& _]
+                    {:token-count @token-count :cache/policy @route-policy})
+                  page-pool/route-bytes (fn [& _] 128)
+                  page-pool/touch-route!
+                  (fn [_ _ observations]
+                    (swap! route-policy merge observations)
+                    {:token-count @token-count :cache/policy @route-policy})
+                  manager/stats (fn [& _] {:capture-queue-depth 0})
+                  manager/checkpoint-paged-chunks-async!
+                  (fn [& args]
+                    (reset! checkpoint-args args)
+                    {:accepted? true
+                     :captured (CompletableFuture/completedFuture ::captured)
+                     :published (CompletableFuture/completedFuture ::published)})]
+      (let [result ((:worker/decode handlers) (effect :worker/decode))]
+        (is (= [7] (:tokens result)))
+        (is (true? (get-in result [:cache-checkpoint :accepted?])))
+        (is (= [::cache ::pool :continuation-a "fixture-v1" [1 2 3 7]]
+               @checkpoint-args))
+        (is (true? (:durable? @route-policy)))
+        (is (= :positive-expected-value
+               (get-in @route-policy [:checkpoint/decision :reason])))))))
 
 (deftest batched-handlers-delegate-device-work-to-one-runtime
   (let [decoder {:pool ::pool :decode-state {:maxpos 8}}

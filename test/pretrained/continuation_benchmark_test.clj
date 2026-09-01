@@ -47,6 +47,10 @@
                     :worker/tier-throughput-bytes-per-ms :ssd])))
     (is (= 4.0 (get-in calibration
                        [:checkpoint-admission :break-even-reuses])))
+    (is (= 640.0 (get-in calibration
+                         [:checkpoint-admission :checkpoint-ms])))
+    (is (= 160.0 (get-in calibration
+                         [:checkpoint-admission :saved-ms-per-reuse])))
     (is (= 3.0 (get-in calibration
                        [:checkpoint-admission
                         :foreground-interference-ms-per-step])))

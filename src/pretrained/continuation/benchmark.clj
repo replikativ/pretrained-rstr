@@ -303,8 +303,10 @@
       :worker-observation-patch patch
       :checkpoint-admission
       {:capture-total-ms capture-ms
+       :checkpoint-ms capture-ms
        :foreground-interference-ms-per-step interference-ms
        :saved-ready-to-first-token-ms saved-ms
+       :saved-ms-per-reuse saved-ms
        :break-even-reuses
        (when (and (number? capture-ms) saved-ms (pos? saved-ms))
          (/ (double capture-ms) saved-ms))}})))
