@@ -78,7 +78,9 @@
       (cluster/submit! controller request
                        [(candidate :first 1) (candidate :second 2)])
       ((first (vals @timers)))
-      (is (= [:first :second] (mapv :effect/to @sent)))
+      (is (= [:router/send-offer :router/send-cancel :router/send-offer]
+             (mapv :effect/op @sent)))
+      (is (= [:first :first :second] (mapv :effect/to @sent)))
       (is (= [:request-a 2] (:assignment/id (last @sent))))
       (finally
         (.close controller)))))

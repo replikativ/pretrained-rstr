@@ -101,6 +101,13 @@ observations. It retains GPU, RAM/SSD/object prefix boundaries, and recompute as
 explicit alternatives, allowing a stale GPU location to fall back without
 discarding the worker's durable cache.
 
+The optional Kabel adapter now carries these observations and the fenced
+assignment lifecycle over live connections. Heartbeats are connection-scoped
+and expire without Datahike transactions; catalog and placement facts remain
+durable and queryable. The adapter passes unrelated messages through so this
+control plane can share the existing Kabel connection used by a worker's
+Datahike replica.
+
 ### GPU cache manager
 
 One manager per device owns physical pages and never delegates allocation to

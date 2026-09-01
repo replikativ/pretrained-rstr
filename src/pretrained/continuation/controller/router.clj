@@ -104,6 +104,14 @@
    :assignment/request request
    :assignment/candidate candidate})
 
+(defn- cancel-effect
+  [request-id assignment]
+  {:effect/op :router/send-cancel
+   :effect/to (get-in assignment
+                      [:assignment/candidate :candidate/worker-id])
+   :request/id request-id
+   :assignment/id (:assignment/id assignment)})
+
 (defn- offer-next
   [state request-id]
   (let [record (get-in state [:router/requests request-id])
@@ -175,7 +183,8 @@
             record (get-in state [:router/requests request-id])]
         (if (and (= :offered (:assignment/phase record))
                  (= (:assignment/id record) (:assignment/id event)))
-          (offer-next state request-id)
+          (update (offer-next state request-id)
+                  :effects #(into [(cancel-effect request-id record)] %))
           {:state state :effects []}))
 
       :worker/result
@@ -215,11 +224,6 @@
                               :request/id request-id
                               :response/type :cancelled}]
                       (:assignment/id record)
-                      (conj {:effect/op :router/send-cancel
-                             :effect/to (get-in record
-                                                [:assignment/candidate
-                                                 :candidate/worker-id])
-                             :request/id request-id
-                             :assignment/id (:assignment/id record)}))}))
+                      (conj (cancel-effect request-id record)))}))
 
       (throw (ex-info "Router received an unsupported event" {:event event})))))
