@@ -143,6 +143,31 @@
             database model-fingerprint prefix-hash)
        (mapv first)))
 
+(defn replicas-for-prefixes
+  "Return `{prefix-hash [replica ...]}` for `prefix-hashes` in one query.
+
+  Prefixes without an observed replica are omitted. Replica vector order is
+  stable by node, tier, and replica identity so policy replay does not depend on
+  Datalog result ordering."
+  [database model-fingerprint prefix-hashes]
+  (let [prefix-hashes (vec prefix-hashes)
+        rows (if (seq prefix-hashes)
+               (d/q '[:find ?prefix (pull ?e [*])
+                      :in $ ?model [?prefix ...]
+                      :where
+                      [?e :kv/replica-model-fingerprint ?model]
+                      [?e :kv/replica-prefix-hash ?prefix]]
+                    database model-fingerprint prefix-hashes)
+               [])]
+    (into {}
+          (map (fn [[prefix rows]]
+                 [prefix
+                  (vec (sort-by (juxt :kv/replica-node
+                                      :kv/replica-tier
+                                      (comp str :kv/replica-id))
+                                (map second rows)))]))
+          (group-by first rows))))
+
 (defn reconciliation-plan
   "Return satisfied demands and side-effect-free `:ensure-local` actions.
 

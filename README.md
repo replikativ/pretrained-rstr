@@ -138,12 +138,15 @@ ownership.
 
 The model-free cluster simulator runs the same router and worker state machines
 used by the runtime adapter. It makes locality/load decisions and failure traces
-inspectable without a GPU or service:
+inspectable without a GPU or service. The database variant derives its
+candidates from an exact Datahike chunk chain, ready SSD placement facts, and
+ephemeral worker load/residency observations:
 
 ```clojure
 ;; clojure -M:examples
 (require '[pretrained.continuation-controller-demo :as controller-demo])
 (controller-demo/run-simulation)
+(controller-demo/run-database-simulation)
 ```
 
 For an already loaded model, the benchmark helper separates prefill, checkpoint

@@ -39,3 +39,11 @@
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"local"
          (wire/effect->message {:effect/op :router/set-offer-timer})))))
+
+(deftest worker-observations-round-trip-outside-the-effect-protocol
+  (let [observation {:worker/id :worker-a :worker/epoch 2 :worker/sequence 9}
+        message (wire/observation->message observation)]
+    (is (wire/control-message? message))
+    (is (= observation (wire/message->observation message)))
+    (is (nil? (wire/message->observation
+               (assoc message :message/to :another-router))))))

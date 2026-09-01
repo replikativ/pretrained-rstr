@@ -122,6 +122,65 @@
       (finally
         (.close controller)))))
 
+(deftest gpu-prefix-is-forked-before-incremental-capacity-is-reserved
+  (let [pool (fixture-pool 4)
+        _ (page-pool/allocate-route! pool :shared-prefix 2)
+        pending (atom [])
+        sent (atom [])
+        controller (test-controller pool pending sent {})
+        event (-> (offer 3)
+                  (assoc-in [:assignment/request :request/continuation-id]
+                            :request-route)
+                  (assoc-in [:assignment/candidate :candidate/cache-tier] :gpu)
+                  (assoc-in [:assignment/candidate
+                             :candidate/source-continuation-id]
+                            :shared-prefix))]
+    (try
+      (local/handle-event! controller event)
+      (is (true? (:event/accepted? (first @sent))))
+      (is (= (:pages (page-pool/route pool :shared-prefix))
+             (:pages (page-pool/route pool :request-route))))
+      (is (= 2 (:reserved-pages (page-pool/stats pool)))
+          "only growth beyond the shared resident prefix is reserved")
+      (is (= :prefilling
+             (get-in (local/state controller)
+                     [:worker/assignments [:request-a 1] :assignment/phase])))
+      (local/handle-event!
+       controller
+       {:event/type :assignment/cancelled
+        :assignment/id [:request-a 1]
+        :request/id :request-a})
+      (run-next! pending)
+      (is (zero? (:reserved-pages (page-pool/stats pool))))
+      (finally
+        (.close controller)))))
+
+(deftest observation-combines-device-capacity-and-exact-prefix-identity
+  (let [pool (fixture-pool 4)
+        prefix (random-uuid)
+        _ (page-pool/allocate-route!
+           pool :resident 2
+           {:policy {:durable? true
+                     :model-fingerprint model-fingerprint
+                     :prefix-hash prefix}})
+        controller (test-controller pool (atom []) (atom []) {})]
+    (try
+      (let [result (local/observation
+                    controller
+                    {:worker/node "worker-a"
+                     :worker/queue-ms 3})]
+        (is (= :worker-a (:worker/id result)))
+        (is (= #{model-fingerprint} (:worker/models result)))
+        (is (= 3 (:worker/free-pages result)))
+        (is (= 1 (:worker/evictable-pages result)))
+        (is (= {:continuation-id :resident
+                :token-count 2
+                :bytes 16}
+               (get-in result [:worker/gpu-prefixes
+                               [model-fingerprint prefix]]))))
+      (finally
+        (.close controller)))))
+
 (deftest cancellation-releases-unclaimed-projected-capacity
   (let [pool (fixture-pool 4)
         pending (atom [])

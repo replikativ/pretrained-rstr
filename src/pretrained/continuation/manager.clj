@@ -273,29 +273,45 @@
                     pool continuation-id model-fingerprint %)})))))
 
 (defn lookup-chunk-prefix
-  "Return planned chunks, present entries, and the longest reusable KV prefix."
-  [^Manager manager model-fingerprint tokens]
-  (let [tokens (vec tokens)
-        processed (max 0 (dec (count tokens)))
-        descriptors (chunk/plan tokens processed (:chunk-size manager))
-        entries (catalog/lookup-chunks
-                 @(:connection manager) model-fingerprint
-                 (mapv :chunk/prefix-hash descriptors))
-        matched (catalog/longest-prefix descriptors entries)
-        cached-token-count (reduce + 0 (map :kv/token-count matched))]
-    (swap! (:metrics manager)
-           (fn [metrics]
-             (-> metrics
-                 (update :prefix-lookups inc)
-                 (update :requested-tokens + processed)
-                 (update :cached-tokens + cached-token-count)
-                 (update (cond (= cached-token-count processed) :full-hits
-                               (zero? cached-token-count) :misses
-                               :else :partial-hits) inc))))
-    {:descriptors descriptors
-     :entries entries
-     :matched matched
-     :cached-token-count cached-token-count}))
+  "Return planned chunks, present entries, and the longest reusable KV prefix.
+
+  Options accept `:maximum-cached-token-count`. Descriptors ending beyond that
+  exact policy boundary are not queried or restored, even when a longer catalog
+  prefix exists."
+  ([^Manager manager model-fingerprint tokens]
+   (lookup-chunk-prefix manager model-fingerprint tokens {}))
+  ([^Manager manager model-fingerprint tokens
+    {:keys [maximum-cached-token-count]}]
+   (let [tokens (vec tokens)
+         processed (max 0 (dec (count tokens)))
+         maximum (long (or maximum-cached-token-count processed))
+         _ (when-not (<= 0 maximum processed)
+             (throw (ex-info "Maximum cached token count is outside the prompt"
+                             {:maximum-cached-token-count maximum
+                              :processed-token-count processed})))
+         descriptors (->> (chunk/plan tokens processed (:chunk-size manager))
+                          (take-while #(<= (+ (:chunk/start %)
+                                              (:chunk/token-count %))
+                                           maximum))
+                          vec)
+         entries (catalog/lookup-chunks
+                  @(:connection manager) model-fingerprint
+                  (mapv :chunk/prefix-hash descriptors))
+         matched (catalog/longest-prefix descriptors entries)
+         cached-token-count (reduce + 0 (map :kv/token-count matched))]
+     (swap! (:metrics manager)
+            (fn [metrics]
+              (-> metrics
+                  (update :prefix-lookups inc)
+                  (update :requested-tokens + processed)
+                  (update :cached-tokens + cached-token-count)
+                  (update (cond (= cached-token-count processed) :full-hits
+                                (zero? cached-token-count) :misses
+                                :else :partial-hits) inc))))
+     {:descriptors descriptors
+      :entries entries
+      :matched matched
+      :cached-token-count cached-token-count})))
 
 (defn restore-gpu-prefix
   "Restore the longest cached prompt prefix and compute only its missing suffix.
@@ -342,19 +358,24 @@
   route. `:protected-continuation-ids` excludes active working-set routes.
   `:capacity-reservation` claims pages previously held for prompt restoration
   and subsequent generation; it is mutually exclusive with `:admit?` because
-  admission must occur before the reservation is created."
+  admission must occur before the reservation is created.
+  `:maximum-cached-token-count` enforces a shorter prefix selected by routing
+  policy instead of implicitly loading a longer catalog/object-store tail."
   ([^Manager manager pool continuation-id model-fingerprint tokens]
    (restore-paged-prefix! manager pool continuation-id model-fingerprint tokens
                           {:policy {}}))
   ([^Manager manager pool continuation-id model-fingerprint tokens
-    {:keys [admit? policy protected-continuation-ids capacity-reservation]
+    {:keys [admit? policy protected-continuation-ids capacity-reservation
+            maximum-cached-token-count]
      :or {admit? false policy {:durable? true}
           protected-continuation-ids #{}}}]
    (when (and admit? capacity-reservation)
      (throw (ex-info "Paged restore cannot admit an existing reservation"
                      {:continuation-id continuation-id})))
    (let [{:keys [matched cached-token-count] :as lookup-result}
-         (lookup-chunk-prefix manager model-fingerprint tokens)
+         (lookup-chunk-prefix
+          manager model-fingerprint tokens
+          {:maximum-cached-token-count maximum-cached-token-count})
          admission (when admit?
                      (residency/admit-route!
                       pool continuation-id cached-token-count

@@ -95,6 +95,12 @@ state before accepting, then invokes the manager and paged decoder through
 injected handlers. The same pure machines run in a deterministic failure
 simulator; see [cluster-controller.md](cluster-controller.md).
 
+Candidate derivation batches exact chunk and ready-replica queries against the
+local Datahike snapshot, then combines them with versioned ephemeral worker
+observations. It retains GPU, RAM/SSD/object prefix boundaries, and recompute as
+explicit alternatives, allowing a stale GPU location to fall back without
+discarding the worker's durable cache.
+
 ### GPU cache manager
 
 One manager per device owns physical pages and never delegates allocation to

@@ -47,6 +47,15 @@
     (is (page-pool/release-route! pool :request))
     (is (= 8 (page-pool/free-page-count pool)))))
 
+(deftest resident-route-reports-logical-tensor-bytes
+  (let [pool (fixture-pool
+              (atom {:free (apply sorted-set (range 8))
+                     :refcounts {}
+                     :routes {}}))]
+    (is (nil? (page-pool/route-bytes pool :missing)))
+    (page-pool/allocate-route! pool :request 3)
+    (is (= 48 (page-pool/route-bytes pool :request)))))
+
 (deftest unused-capacity-is-recoverable-and-unavailable-to-other-routes
   (let [pool (fixture-pool
               (atom {:free (apply sorted-set (range 8))
