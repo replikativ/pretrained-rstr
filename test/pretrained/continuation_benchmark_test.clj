@@ -16,6 +16,42 @@
     (is (<= (:min-ms result) (:median-ms result)
             (:p95-ms result) (:max-ms result)))))
 
+(deftest continuation-measurements-calibrate-cache-routing
+  (let [result
+        {:prompt {:processed-token-count 100}
+         :uncached {:warm {:prompt-completion {:median-ms 200.0}
+                           :first-token {:median-ms 10.0}
+                           :ready-to-first-token {:median-ms 220.0}
+                           :decode {:median-ms 12.0}}}
+         :restored {:warm {:iterations 2
+                           :prefix-load {:median-ms 40.0}
+                           :ready-to-first-token {:median-ms 60.0}
+                           :prefix-transfer
+                           {:totals
+                            {:counters
+                             {[:upload :inline-host false]
+                              {:bytes 2000000 :host-wall-ns 20000000}}}}}}
+         :checkpoint {:capture-total-ms 640.0
+                      :inference-overlap
+                      {:step-latency {:median-ms 15.0}}}}
+        calibration (benchmark/cache-policy-calibration result :ssd)]
+    (is (= 2.0 (get-in calibration
+                       [:worker-observation-patch
+                        :worker/prefill-ms-per-token])))
+    (is (= 100000.0 (get-in calibration
+                            [:worker-observation-patch
+                             :worker/gpu-restore-bytes-per-ms])))
+    (is (= (/ 1000000.0 30.0)
+           (get-in calibration
+                   [:worker-observation-patch
+                    :worker/tier-throughput-bytes-per-ms :ssd])))
+    (is (= 4.0 (get-in calibration
+                       [:checkpoint-admission :break-even-reuses])))
+    (is (= 3.0 (get-in calibration
+                       [:checkpoint-admission
+                        :foreground-interference-ms-per-step])))
+    (is (false? (get-in calibration [:basis :cold-storage-measured?])))))
+
 (deftest gpu-benchmark-separates-checkpoint-and-restore-phases
   (let [starts (atom 0)
         restores (atom 0)

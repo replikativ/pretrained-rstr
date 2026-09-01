@@ -55,6 +55,11 @@
     {}
     differences)})
 
+(defn- transfer-total
+  [transfer field]
+  (reduce + 0 (map #(long (get % field 0))
+                   (vals (:counters transfer)))))
+
 (declare accepted-ticket!)
 
 (defn- summarize-ms
@@ -95,6 +100,7 @@
       :capture-drain-ms (:milliseconds capture)
       :capture-total-ms capture-total-ms
       :publication-drain-ms (:milliseconds publication)
+      :phase-timings (some-> (:phase-timings ticket) deref)
       :chunks (count (:value capture))
       :stored-bytes (reduce + 0 (map :bytes (:value capture)))}
       foreground!
@@ -204,6 +210,92 @@
       :p95-ms (percentile sorted-samples 0.95)
       :max-ms (peek sorted-samples)})))
 
+(defn cache-policy-calibration
+  "Derive a worker-observation calibration from a continuation benchmark.
+
+  The benchmark must be a result from `benchmark-paged-continuation!`. `tier`
+  names the lower storage tier exercised by the benchmark and defaults to
+  `:ssd`. The returned `:worker-observation-patch` can be merged into the
+  observation consumed by the cluster candidate planner. Throughputs are
+  one-point process-warm estimates, not claims about cold storage: the measured
+  upload wall time is separated from the remaining prefix-load time and both
+  affine intercepts are assumed to be zero.
+
+  The result also reports checkpoint interference and a simple reuse break-even
+  estimate. Missing transfer telemetry is tolerated; fields that cannot be
+  derived are omitted from the observation patch."
+  ([benchmark-result]
+   (cache-policy-calibration benchmark-result :ssd))
+  ([benchmark-result tier]
+   (let [processed (long (get-in benchmark-result
+                                 [:prompt :processed-token-count] 0))
+         iterations (long (get-in benchmark-result
+                                  [:restored :warm :iterations] 0))
+         prefill-ms (get-in benchmark-result
+                            [:uncached :warm :prompt-completion :median-ms])
+         first-token-ms (get-in benchmark-result
+                                [:uncached :warm :first-token :median-ms])
+         prefix-load-ms (get-in benchmark-result
+                                [:restored :warm :prefix-load :median-ms])
+         transfer (get-in benchmark-result
+                          [:restored :warm :prefix-transfer :totals])
+         transferred-bytes (when transfer (transfer-total transfer :bytes))
+         upload-wall-ms (when (and transfer (pos? iterations))
+                          (/ (double (transfer-total transfer :host-wall-ns))
+                             1.0e6
+                             (double iterations)))
+         bytes-per-sample (when (and transferred-bytes (pos? iterations))
+                            (/ (double transferred-bytes) (double iterations)))
+         lower-tier-ms (when (and prefix-load-ms upload-wall-ms)
+                         (max 0.0 (- (double prefix-load-ms) upload-wall-ms)))
+         uncached-ready (get-in benchmark-result
+                                [:uncached :warm :ready-to-first-token :median-ms])
+         restored-ready (get-in benchmark-result
+                                [:restored :warm :ready-to-first-token :median-ms])
+         saved-ms (when (and uncached-ready restored-ready)
+                    (- (double uncached-ready) (double restored-ready)))
+         capture-ms (get-in benchmark-result [:checkpoint :capture-total-ms])
+         baseline-step (get-in benchmark-result
+                               [:uncached :warm :decode :median-ms])
+         overlap-step (get-in benchmark-result
+                              [:checkpoint :inference-overlap
+                               :step-latency :median-ms])
+         interference-ms (when (and baseline-step overlap-step)
+                           (max 0.0 (- (double overlap-step)
+                                       (double baseline-step))))
+         patch
+         (cond-> {}
+           (and (pos? processed) (number? prefill-ms))
+           (assoc :worker/prefill-ms-per-token
+                  (/ (double prefill-ms) (double processed)))
+
+           (number? first-token-ms)
+           (assoc :worker/first-token-ms (double first-token-ms))
+
+           (and bytes-per-sample upload-wall-ms (pos? upload-wall-ms))
+           (assoc :worker/gpu-restore-bytes-per-ms
+                  (/ bytes-per-sample upload-wall-ms))
+
+           (and bytes-per-sample lower-tier-ms (pos? lower-tier-ms))
+           (assoc-in [:worker/tier-throughput-bytes-per-ms tier]
+                     (/ bytes-per-sample lower-tier-ms)))]
+     {:basis {:cache-state :process-and-page-cache-warm
+              :cold-storage-measured? false
+              :tier tier
+              :processed-token-count processed
+              :bytes-per-sample bytes-per-sample
+              :prefix-load-ms prefix-load-ms
+              :gpu-upload-wall-ms upload-wall-ms
+              :lower-tier-and-control-ms lower-tier-ms}
+      :worker-observation-patch patch
+      :checkpoint-admission
+      {:capture-total-ms capture-ms
+       :foreground-interference-ms-per-step interference-ms
+       :saved-ready-to-first-token-ms saved-ms
+       :break-even-reuses
+       (when (and (number? capture-ms) saved-ms (pos? saved-ms))
+         (/ (double capture-ms) saved-ms))}})))
+
 (defn- accepted-ticket!
   [ticket]
   (when-not (:accepted? ticket)
@@ -221,6 +313,7 @@
     {:submission-ms (:milliseconds submission)
      :capture-drain-ms (:milliseconds capture)
      :publication-drain-ms (:milliseconds publication)
+     :phase-timings (some-> (:phase-timings ticket) deref)
      :chunks (count (:value capture))
      :stored-bytes (reduce + 0 (map :bytes (:value capture)))}))
 
@@ -267,8 +360,13 @@
                       :processed-token-count (dec (count prompt-ids))}
              :checkpoint checkpoint
              :prefill prefill
+             :cache-temperature {:first :first-process-use
+                                 :warm :process-and-page-cache-warm
+                                 :cold-storage-measured? false}
              :restore {:first-measured-ms first-ms
-                       :warm warm-restore}
+                       :first-process-use-ms first-ms
+                       :warm warm-restore
+                       :process-warm warm-restore}
              :speedup {:first-measured (/ prefill-median first-ms)
                        :warm (/ prefill-median warm-median)}
              :cache-stats (manager/stats cache)}
@@ -336,7 +434,13 @@
       :transfer-capabilities transfer-capabilities
       :checkpoint checkpoint
       :prefill prefill
-      :restore {:first-measured-ms first-ms :warm warm-restore}
+      :cache-temperature {:first :first-process-use
+                          :warm :process-and-page-cache-warm
+                          :cold-storage-measured? false}
+      :restore {:first-measured-ms first-ms
+                :first-process-use-ms first-ms
+                :warm warm-restore
+                :process-warm warm-restore}
       :speedup {:first-measured (/ prefill-median first-ms)
                 :warm (/ prefill-median warm-median)}
       :cache-stats (manager/stats cache)}
@@ -442,8 +546,13 @@
      :checkpoint checkpoint
      :uncached {:first-measured uncached-first
                 :warm uncached-warm}
+     :cache-temperature {:first :first-process-use
+                         :warm :process-and-page-cache-warm
+                         :cold-storage-measured? false}
      :restored {:first-measured restored-first
-                :warm restored-warm}
+                :first-process-use restored-first
+                :warm restored-warm
+                :process-warm restored-warm}
      :speedup {:first-restored-vs-uncached-warm
                (/ uncached-ready restored-first-ready)
                :warm-restored-vs-uncached-warm

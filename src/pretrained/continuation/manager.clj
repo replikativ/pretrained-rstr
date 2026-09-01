@@ -15,6 +15,7 @@
   (:import [java.io Closeable]
            [java.lang AutoCloseable]
            [java.nio.file Files StandardCopyOption]
+           [java.util UUID]
            [java.util.concurrent ArrayBlockingQueue CancellationException CompletableFuture
             ExecutorService RejectedExecutionException ThreadFactory ThreadPoolExecutor
             ThreadPoolExecutor$AbortPolicy TimeUnit]
@@ -114,7 +115,10 @@
   `opts` controls bounded background work with `:max-pending-captures`,
   `:max-pending-publications`, and `:max-concurrent-localizations` (all default
   to 2), `:chunk-size` (default 256 processed tokens), and
-  `:max-chunk-staging-bytes` (default 256 MiB). Paged checkpoints whose single
+  `:max-chunk-staging-bytes` (default 256 MiB), and `:warm-catalog-query?`
+  (default true). Warming executes one empty-result chunk lookup while opening
+  the manager so Datahike query compilation cannot extend the first accepted
+  checkpoint's route lifetime. Paged checkpoints whose single
   host payload would exceed that byte limit are rejected before queueing.
   `:chunk-backend-store` optionally supplies a
   caller-owned authoritative Konserve store. Chunk writes then return after the
@@ -126,12 +130,14 @@
   ([datahike-config directory] (open-manager datahike-config directory {}))
   ([datahike-config directory {:keys [max-pending-captures max-pending-publications
                                       max-concurrent-localizations chunk-size
-                                      max-chunk-staging-bytes chunk-backend-store connection]
+                                      max-chunk-staging-bytes chunk-backend-store connection
+                                      warm-catalog-query?]
                                :or {max-pending-captures 2
                                     max-pending-publications 2
                                     max-concurrent-localizations 2
                                     chunk-size chunk/default-chunk-size
-                                    max-chunk-staging-bytes (* 256 1024 1024)}}]
+                                    max-chunk-staging-bytes (* 256 1024 1024)
+                                    warm-catalog-query? true}}]
    (when-not (and (pos? max-pending-captures) (pos? max-pending-publications)
                   (pos? max-concurrent-localizations) (pos? chunk-size)
                   (integer? max-chunk-staging-bytes)
@@ -153,26 +159,38 @@
                           :write-policy :write-behind
                           :read-policy :frontend-first
                           :opts {:sync? true})
-                         local-store)]
-       (->Manager (or connection (catalog/ensure-database! datahike-config))
-                  (nil? connection)
-                  path
-                  local-store
-                  write-store
-                  (content-provider/open-provider
-                   local-store write-store
-                   {:max-concurrent-localizations max-concurrent-localizations})
-                  (long chunk-size)
-                  (long max-chunk-staging-bytes)
-                  (bounded-executor "pretrained-kv-capture-" max-pending-captures)
-                  (bounded-executor "pretrained-kv-publish-" max-pending-publications)
-                  (AtomicBoolean. false)
-                  (atom {:capture-accepted 0 :capture-rejected 0
-                         :capture-byte-rejected 0
-                         :chunks-planned 0 :chunks-reused 0 :chunks-stored 0
-                         :prefix-lookups 0 :full-hits 0 :partial-hits 0 :misses 0
-                         :requested-tokens 0 :cached-tokens 0
-                         :restored-chunks 0 :restored-bytes 0}))))))
+                         local-store)
+           catalog-connection (or connection
+                                  (catalog/ensure-database! datahike-config))
+           manager
+           (->Manager catalog-connection
+                      (nil? connection)
+                      path
+                      local-store
+                      write-store
+                      (content-provider/open-provider
+                       local-store write-store
+                       {:max-concurrent-localizations max-concurrent-localizations})
+                      (long chunk-size)
+                      (long max-chunk-staging-bytes)
+                      (bounded-executor "pretrained-kv-capture-" max-pending-captures)
+                      (bounded-executor "pretrained-kv-publish-" max-pending-publications)
+                      (AtomicBoolean. false)
+                      (atom {:capture-accepted 0 :capture-rejected 0
+                             :capture-byte-rejected 0
+                             :chunks-planned 0 :chunks-reused 0 :chunks-stored 0
+                             :prefix-lookups 0 :full-hits 0 :partial-hits 0 :misses 0
+                             :requested-tokens 0 :cached-tokens 0
+                             :restored-chunks 0 :restored-bytes 0}))]
+       (try
+         (when warm-catalog-query?
+           (catalog/lookup-chunks
+            @catalog-connection "pretrained/catalog-query-warmup"
+            [(UUID/fromString "00000000-0000-0000-0000-000000000000")]))
+         manager
+         (catch Throwable error
+           (.close ^Closeable manager)
+           (throw error)))))))
 
 (defn- missing-chunk-descriptors
   [^Manager manager model-fingerprint descriptors]
@@ -225,7 +243,9 @@
                      {:estimated-staging-bytes estimated-staging-bytes})))
    (let [captured (CompletableFuture.)
          published (CompletableFuture.)
-         ticket (cond-> {:accepted? true :captured captured :published published}
+         phase-timings (atom {})
+         ticket (cond-> {:accepted? true :captured captured :published published
+                         :phase-timings phase-timings}
                   estimated-staging-bytes
                   (assoc :estimated-staging-bytes (long estimated-staging-bytes)))
         reject! (fn [error]
@@ -234,18 +254,50 @@
         capture-task
         (fn []
           (try
-            (let [{:keys [model-fingerprint plan export]} (context)
+            (let [capture-started (System/nanoTime)
+                  context-started (System/nanoTime)
+                  {:keys [model-fingerprint plan export]} (context)
+                  context-finished (System/nanoTime)
+                  lookup-started context-finished
                   missing (missing-chunk-descriptors manager model-fingerprint plan)
+                  lookup-finished (System/nanoTime)
                   _ (record-chunk-plan! manager plan missing)
-                  stored (mapv (fn [descriptor]
-                                 (first (persist-chunks!
-                                         manager [(export descriptor)])))
-                               missing)
+                  export-ns (volatile! 0)
+                  persistence-ns (volatile! 0)
+                  stored
+                  (mapv (fn [descriptor]
+                          (let [started (System/nanoTime)
+                                tensor-chunk (export descriptor)
+                                exported (System/nanoTime)
+                                stored (first (persist-chunks!
+                                               manager [tensor-chunk]))
+                                persisted (System/nanoTime)]
+                            (vswap! export-ns + (- exported started))
+                            (vswap! persistence-ns + (- persisted exported))
+                            stored))
+                        missing)
+                  capture-finished (System/nanoTime)
+                  _ (reset! phase-timings
+                            {:context-ms (/ (- context-finished context-started)
+                                            1.0e6)
+                             :catalog-lookup-ms
+                             (/ (- lookup-finished lookup-started) 1.0e6)
+                             :device-export-ms (/ @export-ns 1.0e6)
+                             :local-persistence-ms (/ @persistence-ns 1.0e6)
+                             :capture-total-ms
+                             (/ (- capture-finished capture-started) 1.0e6)
+                             :planned-chunks (count plan)
+                             :stored-chunks (count missing)})
                   publish-task
                   (fn []
                     (try
-                      (.complete published
-                                 (publish-chunks! manager model-fingerprint stored))
+                      (let [started (System/nanoTime)
+                            result (publish-chunks!
+                                    manager model-fingerprint stored)]
+                        (swap! phase-timings assoc
+                               :publication-ms
+                               (/ (- (System/nanoTime) started) 1.0e6))
+                        (.complete published result))
                       (catch Throwable error
                         (.completeExceptionally published error))))]
               (try
@@ -340,7 +392,10 @@
   payload is written through the local/tiered Konserve store before the next chunk
   is allocated, bounding host staging to one chunk. Datahike is published only
   after durability. Queue saturation or a chunk larger than
-  `:max-chunk-staging-bytes` rejects the optional checkpoint immediately."
+  `:max-chunk-staging-bytes` rejects the optional checkpoint immediately. The
+  returned ticket also contains a `:phase-timings` atom populated by the capture
+  and publication workers, so callers can distinguish catalog, transfer,
+  persistence, and publication costs without instrumenting private internals."
   [^Manager manager pool continuation-id model-fingerprint tokens]
   (let [tokens (vec tokens)
         resident-route (page-pool/route pool continuation-id)
