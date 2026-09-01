@@ -28,6 +28,10 @@
   exceeds context capacity, reports a prefix longer than the request, or cannot
   provide enough free plus evictable pages.
 
+  The result also exposes `:estimate/live-transfer-overlap-eligible?` as an
+  execution-policy signal. It does not reduce the TTFT estimate without measured
+  evidence from that worker.
+
   Returns the normalized candidate augmented with feasibility, derived page and
   token counts, `:estimate/ttft-ms`, and a machine-readable decline reason."
   [request candidate]
@@ -73,6 +77,10 @@
            :estimate/resident-pages resident-pages
            :estimate/required-pages required-pages
            :estimate/available-pages available-pages
+           :estimate/live-transfer-overlap-eligible?
+           (true? (get-in candidate
+                          [:candidate/transfer-capabilities
+                           :live-overlap-eligible?]))
            :estimate/ttft-ms ttft-ms)))
 
 (defn rank-candidates

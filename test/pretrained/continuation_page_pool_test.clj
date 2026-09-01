@@ -140,6 +140,29 @@
         (is (= 2 (get-in @(:state pool) [:refcounts 0])))
         (is (= 7 (page-pool/free-page-count pool)))))))
 
+(deftest transfer-capabilities-distinguish-physical-overlap-eligibility
+  (let [pool (fixture-pool (atom {:free (sorted-set 0)
+                                  :refcounts {}
+                                  :routes {}}))]
+    (with-redefs [gpu/transfer-capabilities
+                  (fn [session]
+                    (is (= ::session session))
+                    {:backend :ocl
+                     :submission :device-event
+                     :independent-physical-queue? true})]
+      (is (= {:backend :ocl
+              :submission :device-event
+              :independent-physical-queue? true
+              :live-overlap-eligible? true}
+             (page-pool/transfer-capabilities pool))))
+    (with-redefs [gpu/transfer-capabilities
+                  (fn [_]
+                    {:backend :level-zero
+                     :submission :inline-host-copy
+                     :independent-physical-queue? false})]
+      (is (false? (:live-overlap-eligible?
+                   (page-pool/transfer-capabilities pool)))))))
+
 (deftest durable-chunk-scatters-across-noncontiguous-physical-pages
   (let [uploads (atom nil)
         pool (fixture-pool

@@ -69,7 +69,7 @@
 
 (defn- checkpoint-paged!
   [cache pool continuation-id model-fingerprint prompt-ids
-   foreground! maximum-foreground-steps]
+   foreground! maximum-foreground-steps transfer-capabilities]
   (let [transfers-before (transfer-snapshot pool)
         checkpoint-started (System/nanoTime)
         submission
@@ -100,6 +100,10 @@
       foreground!
       (assoc :inference-overlap
              (cond-> {:maximum-steps (long maximum-foreground-steps)
+                      :classification
+                      (if (:live-overlap-eligible? transfer-capabilities)
+                        :eligible
+                        :interference-only)
                       :steps-started-before-capture-complete
                       (count foreground-samples)}
                (seq foreground-samples)
@@ -298,9 +302,10 @@
         prefill (measure! prefill-operation
                           {:iterations iterations :warmups warmups})
         source-id (random-uuid)
+        transfer-capabilities (page-pool/transfer-capabilities pool)
         _ (paged-decoder/prime-prompt! decoder source-id prompt-ids)
         checkpoint (checkpoint-paged! cache pool source-id model-fingerprint
-                                      prompt-ids nil 0)
+                                      prompt-ids nil 0 transfer-capabilities)
         _ (page-pool/release-route! pool source-id)
         restore-ready
         (fn [tokens]
@@ -328,6 +333,7 @@
      {:prompt {:logical-token-count (count prompt-ids)
                :processed-token-count (dec (count prompt-ids))}
       :attention-execution (paged-decoder/attention-execution decoder)
+      :transfer-capabilities transfer-capabilities
       :checkpoint checkpoint
       :prefill prefill
       :restore {:first-measured-ms first-ms :warm warm-restore}
@@ -351,10 +357,11 @@
   `:checkpoint-overlap-decode-tokens` (default 0). When overlap is requested, a
   second resident prompt decodes while the source route is captured; the result
   records how many steps started before capture completed and their latency. It
-  measures backend interference rather than assuming logical transfer and compute
-  queues execute concurrently. This requires capacity for both routes. The first
-  restored sample is kept
-  separate because it can include first-use storage and mmap costs. No
+  classifies this as `:eligible` only when Raster reports device events on an
+  independent physical transfer queue; otherwise it is an explicit
+  `:interference-only` measurement. This requires capacity for both routes. The
+  first restored sample is kept separate because it can include first-use
+  storage and mmap costs. No
   operating-system caches are dropped, so it is not a cold-SSD result.
 
   Returns serializable raw samples, phase summaries, checkpoint drain costs,
@@ -376,6 +383,7 @@
     (throw (ex-info "Continuation benchmark currently requires a single decode lane"
                     {:batch-size (get-in decoder [:decode-state :batch-size])})))
   (let [pool (:pool decoder)
+        transfer-capabilities (page-pool/transfer-capabilities pool)
         prompt-ids (vec prompt-ids)
         _ (when-not (seq prompt-ids)
             (throw (ex-info "Continuation benchmark requires a nonempty prompt" {})))
@@ -405,7 +413,8 @@
                           (paged-decoder/step!
                            decoder overlap-id
                            (+ (dec (count prompt-ids)) (long index)))))
-                      checkpoint-overlap-decode-tokens)
+                      checkpoint-overlap-decode-tokens
+                      transfer-capabilities)
                      (finally
                        (when (page-pool/route pool source-id)
                          (page-pool/release-route! pool source-id))
@@ -426,6 +435,7 @@
     {:prompt {:logical-token-count (count prompt-ids)
               :processed-token-count (dec (count prompt-ids))}
      :decode-tokens (long decode-tokens)
+     :transfer-capabilities transfer-capabilities
      :attention-execution (paged-decoder/attention-execution decoder)
      :block-transfer-preparation
      (assoc (:value preparation) :milliseconds (:milliseconds preparation))

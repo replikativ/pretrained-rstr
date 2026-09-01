@@ -65,6 +65,11 @@
                   (fn [_ continuation-id]
                     (swap! resident disj continuation-id)
                     true)
+                  page-pool/transfer-capabilities
+                  (fn [_]
+                    {:submission :device-event
+                     :independent-physical-queue? true
+                     :live-overlap-eligible? true})
                   manager/checkpoint-paged-chunks-async!
                   (fn [& _]
                     {:accepted? true
@@ -124,6 +129,12 @@
                       present?))
                   page-pool/page-pool? (constantly true)
                   page-pool/transfer-stats (fn [_] @transfers)
+                  page-pool/transfer-capabilities
+                  (fn [_]
+                    {:backend :ocl
+                     :submission :device-event
+                     :independent-physical-queue? true
+                     :live-overlap-eligible? true})
                   page-pool/prepare-block-transfer!
                   (fn [_ token-count]
                     {:page-blocks 1 :token-capacity token-count
@@ -156,8 +167,12 @@
         (is (= 4096 (get-in result [:attention-execution :temporary-bytes])))
         (is (= 3 (:cached-token-count first-restored)))
         (is (= {:maximum-steps 2
+                :classification :eligible
                 :steps-started-before-capture-complete 0}
                (get-in result [:checkpoint :inference-overlap])))
+        (is (true? (get-in result
+                           [:transfer-capabilities
+                            :live-overlap-eligible?])))
         (is (= [4 5 6]
                (mapv :context-token-count (:steps first-restored))))
         (is (= [103 104 105]

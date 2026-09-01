@@ -22,7 +22,8 @@
   Required fields describe identity, epoch, loaded model fingerprints, queue and
   page capacity, context capacity, measured prefill/first-token costs, device
   upload throughput, and per-tier byte throughput. `:worker/tier-fixed-ms`,
-  `:worker/gpu-prefixes`, and `:worker/object-store?` are optional. GPU prefixes
+  `:worker/transfer-capabilities`, `:worker/gpu-prefixes`, and
+  `:worker/object-store?` are optional. GPU prefixes
   are keyed by `[model-fingerprint prefix-hash]` and name their resident
   continuation, token count, and bytes."
   [{:worker/keys [id node epoch models online? queue-ms page-size free-pages
@@ -36,6 +37,12 @@
   (when-not (set? models)
     (throw (ex-info "Worker observation models must be a set"
                     {:worker/id id :models models})))
+  (when-not (or (nil? (:worker/transfer-capabilities observation))
+                (map? (:worker/transfer-capabilities observation)))
+    (throw (ex-info "Worker transfer capabilities must be a map"
+                    {:worker/id id
+                     :transfer-capabilities
+                     (:worker/transfer-capabilities observation)})))
   (doseq [[field value]
           [[:worker/epoch epoch]
            [:worker/sequence (or sequence 0)]
@@ -83,6 +90,8 @@
          :worker/evictable-pages (long evictable-pages)
          :worker/max-context (long max-context)
          :worker/tier-fixed-ms (or tier-fixed-ms {})
+         :worker/transfer-capabilities
+         (or (:worker/transfer-capabilities observation) {})
          :worker/gpu-prefixes (or gpu-prefixes {})
          :worker/object-store? (true? object-store?)))
 
@@ -98,6 +107,8 @@
    :candidate/evictable-pages (:worker/evictable-pages observation)
    :candidate/max-context (:worker/max-context observation)
    :candidate/online? (:worker/online? observation)
+   :candidate/transfer-capabilities
+   (:worker/transfer-capabilities observation)
    :candidate/model-loaded?
    (contains? (:worker/models observation)
               (:request/model-fingerprint request))})

@@ -40,6 +40,21 @@
     (is (= 20 (:estimate/missing-token-count estimated)))
     (is (= 8 (:estimate/required-pages estimated)))))
 
+(deftest physical-transfer-capability-is-an-execution-policy-signal
+  (let [eligible
+        (router/estimate-candidate
+         request
+         (assoc (candidate :worker :ssd 80 30 20 5 1)
+                :candidate/transfer-capabilities
+                {:live-overlap-eligible? true}))
+        conservative
+        (router/estimate-candidate
+         request (candidate :worker :ssd 80 30 20 5 1))]
+    (is (true? (:estimate/live-transfer-overlap-eligible? eligible)))
+    (is (false? (:estimate/live-transfer-overlap-eligible? conservative)))
+    (is (= (:estimate/ttft-ms eligible) (:estimate/ttft-ms conservative))
+        "capability is visible without inventing an unmeasured speedup")))
+
 (deftest infeasible-capacity-and-context-are-declined
   (testing "generation growth participates in page admission"
     (let [small (assoc (candidate :small :none 0 0 0 0 1)

@@ -35,6 +35,7 @@
    :worker/prefill-ms-per-token prefill-ms
    :worker/first-token-ms 1
    :worker/gpu-restore-bytes-per-ms 1000
+   :worker/transfer-capabilities {}
    :worker/tier-throughput-bytes-per-ms {}
    :worker/object-store? false})
 
