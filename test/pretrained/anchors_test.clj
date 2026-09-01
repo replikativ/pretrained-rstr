@@ -154,7 +154,7 @@
           dstate (volatile! nil)
           decoder (volatile! nil)]
       (try
-        (vreset! dstate (bind g :maxpos 64 :cache-mode :paged))
+        (vreset! dstate (bind g :maxpos 64 :cache-mode :paged :prefill-T 4))
         (vreset! decoder (open-paged @dstate :page-size 16 :physical-pages 8))
         (let [pool (:pool @decoder)
               output (generate @decoder :base prompt 4)]

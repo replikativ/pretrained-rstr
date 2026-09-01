@@ -318,6 +318,21 @@
     "fh" :fh "hqp" :qinp "hqs" :qins "hqb" :qinb
     (keyword pn)))
 
+(defn- paged-prefill-node-id
+  "Stable node identity for one multi-row paged-prefill compiler symbol.
+
+  Model weights and norms stay shared with decode; every mutable row buffer,
+  residual, and compiler allocation has a separate prefill identity."
+  [norm-names layer parameter]
+  (let [parameter (name parameter)]
+    (cond
+      (= parameter "r-in") (keyword (str "pr" layer))
+      (= parameter "r-out") (keyword (str "pr" (inc layer)))
+      (norm-names parameter) (keyword (str "L" layer parameter))
+      (= \w (first parameter)) (keyword (str "L" layer parameter))
+      (re-find #"__rbuf" parameter) (keyword (str "PFL" layer "_" parameter))
+      :else (keyword (str "pf-" parameter)))))
+
 (defn- descriptor-pointer-symbols
   [descriptor]
   (into (sorted-set-by #(compare (pr-str %1) (pr-str %2)))
@@ -389,6 +404,22 @@
 (defn- scratch-specs [m nrows]
   (into {} (map (fn [[k [sz ty]]] [k [ty sz nil :scratch]])
                 (scratch-dims m nrows))))
+
+(defn- paged-prefill-specs
+  [m nrows]
+  (let [nrows (long nrows)]
+    (merge
+     (into {}
+           (map (fn [[key [size dtype]]]
+                  [(keyword (str "pf-" (name key)))
+                   [dtype size nil :scratch]]))
+           (scratch-dims m nrows))
+     {:pf-positions [:int nrows nil :input]}
+     (into {}
+           (for [layer (range (inc (:n-layers m)))]
+             [(keyword (str "pr" layer))
+              [:float (* nrows (long (:d-model m))) nil
+               (if (zero? layer) :input :scratch)]])))))
 
 (defn- weight-specs [m qw l]
   (into {} (mapcat (fn [[pl role]]
@@ -695,6 +726,40 @@
           (try (gpu-link/close! executable) (catch Throwable _)))
         (throw error)))))
 
+(defn- paged-prefill-executables!
+  [sess device-id specs m maxpos norm-names layer-partition]
+  (let [opened (atom [])]
+    (try
+      {:layers
+       (mapv
+        (fn [layer]
+          (let [node-id #(paged-prefill-node-id norm-names layer %)
+                scalars (layer-scalar-values m layer maxpos)
+                input-id (node-id "r-in")
+                output-id (node-id "r-out")
+                pre-instance (descriptor-instance [:prefill-layer layer :pre]
+                                                  (:pre layer-partition) node-id scalars)
+                post-instance (descriptor-instance [:prefill-layer layer :post]
+                                                   (:post layer-partition) node-id scalars)
+                pre-plan (external-plan [:resident-prefill layer :pre]
+                                        device-id specs [pre-instance]
+                                        [(node-id "qr") (node-id "kr") (node-id "v")]
+                                        {input-id :input})
+                post-plan (external-plan [:resident-prefill layer :post]
+                                         device-id specs [post-instance]
+                                         [output-id]
+                                         {input-id :input (node-id "at") :input})
+                pre (instantiate-external-plan! sess pre-plan)
+                _ (swap! opened conj pre)
+                post (instantiate-external-plan! sess post-plan)
+                _ (swap! opened conj post)]
+            {:pre pre :post post}))
+        (range (:n-layers m)))}
+      (catch Throwable error
+        (doseq [executable (reverse @opened)]
+          (try (gpu-link/close! executable) (catch Throwable _)))
+        (throw error)))))
+
 (defn- layer-stack-executable!
   [sess plan-id device-id specs layer-count descriptor node-id scalar-values outputs
    role-overrides]
@@ -927,7 +992,9 @@
   all layers + head into one command graph. `:device-id` defaults to `:ze:0`;
   use an OpenCL device such as `:ocl:0` for NVIDIA or AMD. `:cache-mode :paged`
   prepares only the stages around attention and omits contiguous K/V and score
-  buffers; attach it with `pretrained.continuation.paged-decoder/open!`.
+  buffers; attach it with `pretrained.continuation.paged-decoder/open!`. In
+  paged mode, `:prefill-T` additionally compiles a single-sequence multi-row
+  prompt tile which writes directly into the page pool.
   Returns a decode state."
   [m & {:keys [maxpos layer-var head-var qw rms-style prefill-T steer device-id cache-mode
                batch-size]
@@ -944,9 +1011,16 @@
         _ (when (and (= :contiguous cache-mode) (not= batch-size 1))
             (throw (ex-info "Contiguous decode supports only one sequence"
                             {:cache-mode cache-mode :batch-size batch-size})))
-        _ (when (and (= :paged cache-mode) prefill-T)
-            (throw (ex-info "Paged decode does not yet support the contiguous prefill graph"
-                            {:cache-mode cache-mode :prefill-T prefill-T})))
+        prefill-T (some-> prefill-T long)
+        _ (when (and prefill-T (not (pos? prefill-T)))
+            (throw (ex-info "Prefill row count must be positive"
+                            {:prefill-T prefill-T})))
+        _ (when (and prefill-T (> prefill-T (long maxpos)))
+            (throw (ex-info "Prefill row count must fit in maxpos"
+                            {:prefill-T prefill-T :maxpos maxpos})))
+        _ (when (and (= :paged cache-mode) prefill-T (not= batch-size 1))
+            (throw (ex-info "Paged bulk prefill currently supports one sequence"
+                            {:prefill-T prefill-T :batch-size batch-size})))
         eps (:eps m) scale (:attn-scale m)
         ;; Phase-2b: `steer` = {layer-idx ^floats vec} — a per-layer activation-addition at
         ;; :resid-post (steering / concept injection). When present, generate the steer-variant
@@ -956,6 +1030,9 @@
         _ (when (and steer? (not= batch-size 1))
             (throw (ex-info "Batched steering requires an explicit broadcast policy"
                             {:batch-size batch-size})))
+        _ (when (and steer? (= :paged cache-mode) prefill-T)
+            (throw (ex-info "Paged bulk prefill requires an explicit steering broadcast policy"
+                            {:prefill-T prefill-T})))
         d (long (:d-model m))
         layer-var (or layer-var (gen-layer! m :rms-style rms-style :steer? steer?
                                            :nrows batch-size))
@@ -967,6 +1044,13 @@
         head-prog  (compile-resident-or-throw head-var device-id "head")
         tail-prog  (compile-resident-or-throw #'decode-tail! device-id "decode-tail!")
         layer-partition (layer-step-partition layer-prog)
+        prefill-layer-prog
+        (when (and (= :paged cache-mode) prefill-T)
+          (compile-resident-or-throw
+           (gen-layer! m :rms-style rms-style :nrows prefill-T)
+           device-id (str "paged prefill layer (rows " prefill-T ")") fn-hint))
+        prefill-layer-partition
+        (when prefill-layer-prog (layer-step-partition prefill-layer-prog))
         tail-args  (scalar-args tail-prog {"nrows" batch-size
                                            "vocab" (long (:vocab m))
                                            "d" (long (:d-model m))})
@@ -976,6 +1060,8 @@
                                  [(keyword (str "L" l "steer"))
                                   [:float d (or (get steer l) (float-array d)) :constant]])))
         specs (merge (buffer-specs m qw maxpos cache-mode batch-size)
+                     (when prefill-layer-prog
+                       (paged-prefill-specs m prefill-T))
                      steer-specs
                      {:emb    [:float (* (long (:vocab m)) (long (:d-model m)))
                                (prescaled-embed m) :constant]
@@ -999,7 +1085,19 @@
                             (for [{:keys [sym dtype size-fn]} (:allocs tail-prog)]
                               [(keyword (name sym))
                                [dtype (long (size-fn tail-args)) nil :scratch]])))
-        all-specs (merge specs prog-alloc-specs)
+        prefill-alloc-args
+        (when prefill-layer-prog
+          (scalar-args prefill-layer-prog
+                       {"eps" eps "theta" (:rope-local m) "scale" scale
+                        "maxpos" (long maxpos)}))
+        prefill-prog-alloc-specs
+        (when prefill-layer-prog
+          (into {}
+                (for [layer (range (:n-layers m))
+                      {:keys [sym dtype size-fn]} (:allocs prefill-layer-prog)]
+                  [(paged-prefill-node-id norm-names layer sym)
+                   [dtype (long (size-fn prefill-alloc-args)) nil :scratch]])))
+        all-specs (merge specs prog-alloc-specs prefill-prog-alloc-specs)
         alloc-specs (into {} (map (fn [[k v]] [k (vec (take 3 v))]) all-specs))
         roles (into {} (map (fn [[k v]] [k (nth v 3 :scratch)]) all-specs))
         sess (gpu/make-session device-id)]
@@ -1013,9 +1111,14 @@
                                               layer-prog head-prog tail-prog)}
               {:stage-executables
                (paged-decode-executables! sess device-id all-specs m maxpos batch-size norm-names
-                                          layer-partition head-prog tail-prog)})
+                                          layer-partition head-prog tail-prog)
+               :prefill-stage-executables
+               (when prefill-layer-prog
+                 (paged-prefill-executables!
+                  sess device-id all-specs m maxpos norm-names
+                  prefill-layer-partition))})
             prefill-execution
-            (when prefill-T
+            (when (and prefill-T (= :contiguous cache-mode))
               {:prefill-executable
                (decode-prefill-executable! sess device-id all-specs m maxpos prefill-T
                                             norm-names)})]
@@ -1031,11 +1134,14 @@
   "Batched prompt prefill: upload the [T,d] input rows (token embeddings with
   any multimodal rows already spliced; zero-pad past the real prompt) and
   run the linked prefill program. One pass over all layers fills the decode KV
-  caches for positions 0..T-1. Requires bind-decode! with :prefill-T."
+  caches for positions 0..T-1. This contiguous-cache API requires bind-decode!
+  with `:prefill-T`; paged callers use `paged-decoder/prefill-range!`."
   [dstate ^floats rows]
   (let [{:keys [sess prefill-T model prefill-executable]} dstate]
-    (when-not prefill-T
-      (throw (ex-info "dstate was bound without :prefill-T" {})))
+    (when-not (and prefill-T (= :contiguous (:cache-mode dstate)))
+      (throw (ex-info "prefill-rows! requires contiguous prefill state"
+                      {:cache-mode (:cache-mode dstate)
+                       :prefill-T prefill-T})))
     (assert (= (alength rows) (* (long prefill-T) (long (:d-model model)))))
     (gpu/upload! sess :pr0 rows)
     (if prefill-executable

@@ -13,7 +13,7 @@
             [raster.gpu.link :as gpu-link]))
 
 (def ^:private model
-  {:n-layers 2 :n-q 2 :n-kv 1 :head-dim 4 :maxpos 8})
+  {:n-layers 2 :n-q 2 :n-kv 1 :head-dim 4 :d-model 4 :maxpos 8})
 
 (defn- resident-step
   [phase accesses]
@@ -304,3 +304,84 @@
               [:decode :request 13 3]
               [:prime 14]]
              @calls)))))
+
+(deftest bulk-prefill-publishes-a-complete-range-after-the-linked-run
+  (let [{:keys [pool decoder]} (fixture)
+        decoder (assoc decoder
+                       :prefill-T 3
+                       :prefill-executable :prefill-executable
+                       :prefill-descriptor-keys
+                       {:slots :prefill-slots
+                        :row-offsets :prefill-row-offsets
+                        :positions :prefill-positions
+                        :page-table :prefill-page-table
+                        :lengths :prefill-lengths
+                        :start-positions :prefill-start-positions})
+        uploads (atom nil)
+        calls (atom [])]
+    (paged-decoder/allocate-continuation! decoder :request)
+    (with-redefs [pretrained.decoder-gpu/embed-row
+                  (fn [_ token] (float-array 4 (float token)))
+                  gpu/upload-ranges!
+                  (fn [_ entries]
+                    (reset! uploads entries)
+                    (swap! calls conj :upload))
+                  gpu-link/run!
+                  (fn [executable]
+                    (swap! calls conj [:run executable]))]
+      (is (identical? decoder
+                      (paged-decoder/prefill-range!
+                       decoder :request [10 11 12] 0)))
+      (is (= 3 (:token-count (page-pool/route pool :request))))
+      (is (= [:upload [:run :prefill-executable]] @calls))
+      (is (= [0 1 2] (vec ^ints (second (nth @uploads 1)))))
+      (is (= [0 3] (vec ^ints (second (nth @uploads 2)))))
+      (is (= [0 1 2] (vec ^ints (second (nth @uploads 3))))))))
+
+(deftest prompt-priming-uses-complete-bulk-tiles-and-a-scalar-tail
+  (let [{:keys [pool decoder]} (fixture)
+        decoder (assoc decoder :prefill-T 3 :prefill-executable ::prefill)
+        calls (atom [])]
+    (page-pool/allocate-route! pool :request 1)
+    (with-redefs [paged-decoder/prefill-range!
+                  (fn [engine continuation-id tokens position]
+                    (swap! calls conj [:prefill continuation-id tokens position])
+                    engine)
+                  paged-decoder/decode-token!
+                  (fn [_ continuation-id token position]
+                    (swap! calls conj [:decode continuation-id token position]))
+                  paged-decoder/prime-token!
+                  (fn [engine token]
+                    (swap! calls conj [:prime token])
+                    engine)]
+      (is (identical? decoder
+                      (paged-decoder/prime-prompt!
+                       decoder :request [10 11 12 13 14 15 16])))
+      (is (= [[:prefill :request [11 12 13] 1]
+              [:decode :request 14 4]
+              [:decode :request 15 5]
+              [:prime 16]]
+             @calls)))))
+
+(deftest failed-bulk-prefill-keeps-the-range-unpublished
+  (let [{:keys [pool decoder]} (fixture)
+        decoder (assoc decoder
+                       :prefill-T 3
+                       :prefill-executable ::prefill
+                       :prefill-descriptor-keys
+                       {:slots :slots
+                        :row-offsets :row-offsets
+                        :positions :positions
+                        :page-table :page-table
+                        :lengths :lengths
+                        :start-positions :start-positions})]
+    (paged-decoder/allocate-continuation! decoder :request)
+    (with-redefs [pretrained.decoder-gpu/embed-row
+                  (fn [_ _] (float-array 4))
+                  gpu/upload-ranges! (fn [& _] nil)
+                  gpu-link/run! (fn [_] (throw (ex-info "prefill failed" {})))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"prefill failed"
+                            (paged-decoder/prefill-range!
+                             decoder :request [10 11 12] 0)))
+      (is (= 0 (:token-count (page-pool/route pool :request))))
+      (is (nil? (:pending (page-pool/route pool :request)))))))

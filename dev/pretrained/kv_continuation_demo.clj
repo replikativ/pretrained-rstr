@@ -178,11 +178,14 @@
   may select an OpenCL device such as `:ocl:0`.
 
   Returns the instrumented benchmark plus the first restored token sequence.
-  The function closes the temporary manager, paged decoder, and Raster session."
+  `:prefill-T` optionally compiles fixed-size multi-row prompt tiles; incomplete
+  tails retain the exact scalar path. The function closes the temporary manager,
+  paged decoder, and Raster session."
   [model prompt-ids datahike-config cache-directory opts]
   (let [{:keys [max-position page-size physical-pages chunk-size
                 iterations warmups decode-tokens attention-schedule
-                checkpoint-overlap-decode-tokens history-tile-size device-id]
+                checkpoint-overlap-decode-tokens history-tile-size device-id
+                prefill-T]
          :or {page-size 16 iterations 5 warmups 1 decode-tokens 4
               device-id :ze:0}} opts
         model-fingerprint (fingerprint model opts)
@@ -198,7 +201,7 @@
       (vreset! dstate
                (decoder-gpu/bind-decode!
                 model :maxpos max-position :cache-mode :paged :batch-size 1
-                :device-id device-id))
+                :device-id device-id :prefill-T prefill-T))
       (vreset! decoder
                (paged-decoder/open!
                 @dstate
