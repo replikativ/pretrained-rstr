@@ -21,11 +21,14 @@
 
 (defrecord LocalController
     [pool machine reservations tasks handlers send! submit! cancel! close-submit!
-     closed?]
+     cancel-operation! closed?]
   Closeable
   (close [_]
     (when (compare-and-set! closed? false true)
-      (doseq [[_ task] @tasks]
+      (doseq [[[assignment-id _] task] @tasks]
+        (when cancel-operation!
+          (cancel-operation! {:effect/op :worker/cancel-operation
+                              :assignment/id assignment-id}))
         (cancel! task))
       (close-submit!)
       (reset! tasks {})
@@ -54,8 +57,10 @@
 
   Tests and event-loop integrations may provide the complete trio `:submit!`,
   `:cancel!`, and `:close-submit!`; otherwise a private single-thread executor
-  serializes GPU-facing operations. Close the returned controller when done."
-  [pool worker-opts {:keys [handlers send! submit! cancel! close-submit!]
+  serializes GPU-facing operations. `:cancel-operation!` may additionally fence
+  work owned by an external runtime. Close the returned controller when done."
+  [pool worker-opts {:keys [handlers send! submit! cancel! close-submit!
+                            cancel-operation!]
                      :or {send! (constantly nil)}}]
   (when-not (and (map? handlers)
                  (every? #(ifn? (get handlers %))
@@ -67,6 +72,8 @@
     (when (and custom? (not (every? ifn? [submit! cancel! close-submit!])))
       (throw (ex-info "Custom submission requires submit, cancel, and close functions"
                       {})))
+    (when-not (or (nil? cancel-operation!) (ifn? cancel-operation!))
+      (throw (ex-info "Operation cancellation callback must be callable" {})))
     (let [submission (if custom?
                        {:submit! submit! :cancel! cancel!
                         :close-submit! close-submit!}
@@ -79,6 +86,7 @@
                :tasks (atom {})
                :handlers handlers
                :send! send!
+               :cancel-operation! cancel-operation!
                :closed? (atom false)})))))
 
 (defn state
@@ -279,9 +287,21 @@
                                             [:worker/assignments assignment-id])))
                      (release-assignment! controller assignment-id)))))
         _ (swap! (:tasks controller) assoc task-key nil)
-        handle ((:submit! controller) task)]
+        handle ((:submit! controller) task)
+        installed? (volatile! false)]
     (swap! (:tasks controller)
-           #(if (contains? % task-key) (assoc % task-key handle) %))))
+           #(if (contains? % task-key)
+              (do (vreset! installed? true)
+                  (assoc % task-key handle))
+              %))
+    (when (and @installed?
+               handle
+               (nil? (get-in @(:machine controller)
+                             [:worker/assignments assignment-id])))
+      (when-let [cancel-operation! (:cancel-operation! controller)]
+        (cancel-operation! {:effect/op :worker/cancel-operation
+                            :assignment/id assignment-id}))
+      ((:cancel! controller) handle))))
 
 (defn- interpret-effects!
   [controller effects]
@@ -291,8 +311,16 @@
       (submit-operation! controller effect)
 
       (= :worker/cancel-operation (:effect/op effect))
-      (when-not (assignment-running? controller (:assignment/id effect))
-        (release-assignment! controller (:assignment/id effect)))
+      (let [assignment-id (:assignment/id effect)
+            matching (for [[[task-assignment-id _] task] @(:tasks controller)
+                           :when (= assignment-id task-assignment-id)]
+                       task)]
+        (when-let [cancel-operation! (:cancel-operation! controller)]
+          (cancel-operation! effect))
+        (doseq [task matching :when task]
+          ((:cancel! controller) task))
+        (when-not (assignment-running? controller assignment-id)
+          (release-assignment! controller assignment-id)))
 
       (= :worker/send-result (:effect/op effect))
       (do

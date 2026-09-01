@@ -121,6 +121,15 @@ asynchronous load/evict operations. Transfers use a dedicated CUDA/Level Zero
 stream and events. A request becomes runnable only after its required page events
 complete; unrelated lanes continue decoding.
 
+`pretrained.continuation.paged-runtime` is the device-local execution loop. It
+accepts controller restore, prefill, and decode jobs through cancellable futures,
+uses `scheduler/plan-iteration` for each graph step, and maps selected mixed-phase
+work onto stable physical lanes. Prompt rows are explicitly primed every prefill
+step; retained decode rows reuse the embedding emitted by the decoder tail.
+Inactive fixed lanes receive no route and append no page. Current restores run
+between iterations; transfer/compute overlap is a measured follow-up, not an
+assumed property.
+
 `pretrained.continuation.residency` now implements the first deterministic
 admission evaluator over page-pool snapshots. It ranks durable routes by expected
 saved compute, lower-tier reload cost, sharing/SLO bonuses, and recency. Planning

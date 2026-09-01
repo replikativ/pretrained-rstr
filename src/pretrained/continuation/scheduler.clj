@@ -172,6 +172,61 @@
      :deferred (vec remaining)
      :protected-continuation-ids protected}))
 
+(defn plan-work-lanes
+  "Retain and refill fixed execution lanes for an already ordered work set.
+
+  Unlike `plan-decode-lanes`, this planner accepts decode, prefill, and repair
+  items and preserves the order chosen by `plan-iteration`. Existing selected
+  requests retain their physical lane; vacancies receive scheduled items in
+  input order. The result reports `:lanes`, `:retained`, `:refill`, `:retired`,
+  `:deferred`, and continuation identities that residency must protect."
+  [capacity previous-lanes scheduled]
+  (when-not (and (integer? capacity) (pos? capacity))
+    (throw (ex-info "Work lane capacity must be a positive integer"
+                    {:capacity capacity})))
+  (let [capacity (long capacity)
+        previous-lanes (vec previous-lanes)
+        _ (when (> (count previous-lanes) capacity)
+            (throw (ex-info "Previous lane table exceeds execution capacity"
+                            {:capacity capacity
+                             :lane-count (count previous-lanes)})))
+        previous-lanes (into previous-lanes
+                             (repeat (- capacity (count previous-lanes)) nil))
+        scheduled (mapv request scheduled)
+        ids (mapv :request/id scheduled)
+        _ (when-not (= (count ids) (count (set ids)))
+            (throw (ex-info "Scheduled work identities must be unique"
+                            {:request-ids ids})))
+        by-id (into {} (map (juxt :request/id identity)) scheduled)
+        retained
+        (mapv (fn [lane prior]
+                (when-let [current (and prior (get by-id (:request/id prior)))]
+                  (assoc current :lane/index lane)))
+              (range capacity) previous-lanes)
+        retained-ids (into #{} (keep :request/id) retained)
+        waiting (remove #(contains? retained-ids (:request/id %)) scheduled)
+        [lanes remaining]
+        (reduce (fn [[lanes waiting] lane]
+                  (if (or (get lanes lane) (empty? waiting))
+                    [lanes waiting]
+                    [(assoc lanes lane (assoc (first waiting) :lane/index lane))
+                     (next waiting)]))
+                [retained waiting]
+                (range capacity))
+        refill (filterv #(and % (not (contains? retained-ids (:request/id %))))
+                        lanes)
+        lane-ids (into #{} (keep :request/id) lanes)]
+    {:lanes lanes
+     :retained (filterv some? retained)
+     :refill refill
+     :retired (filterv #(and % (not (contains? lane-ids (:request/id %))))
+                       previous-lanes)
+     :deferred (vec remaining)
+     :protected-continuation-ids
+     (into #{}
+           (keep #(or (:request/continuation-id %) (:request/id %)))
+           lanes)}))
+
 (defn decode-submission
   "Translate a lane plan into paged-decoder work and selective priming rows.
 

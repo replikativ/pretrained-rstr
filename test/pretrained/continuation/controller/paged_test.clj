@@ -3,7 +3,8 @@
             [pretrained.continuation.controller.paged :as paged]
             [pretrained.continuation.manager :as manager]
             [pretrained.continuation.page-pool :as page-pool]
-            [pretrained.continuation.paged-decoder :as paged-decoder]))
+            [pretrained.continuation.paged-decoder :as paged-decoder]
+            [pretrained.continuation.paged-runtime :as paged-runtime]))
 
 (def ^:private request
   {:request/id :request-a
@@ -66,3 +67,63 @@
       (is (= "fixture-v1" (:model-fingerprint (second @touched))))
       (is (uuid? (:prefix-hash (second @touched))))
       (is (= 128 (:bytes (second @touched)))))))
+
+(deftest batched-handlers-delegate-device-work-to-one-runtime
+  (let [decoder {:pool ::pool :decode-state {:maxpos 8}}
+        runtime {:decoder decoder}
+        calls (atom [])
+        handlers (paged/batched-handlers runtime ::cache decoder)]
+    (with-redefs [paged-runtime/run-operation!
+                  (fn [_ _ operation]
+                    (swap! calls conj :operation)
+                    (operation))
+                  manager/restore-paged-prefix!
+                  (fn [& _] {:cached-token-count 2})
+                  paged-runtime/prefill!
+                  (fn [_ value]
+                    (swap! calls conj [:prefill (:assignment/id value)])
+                    {:ok? true})
+                  paged-runtime/decode!
+                  (fn [_ value]
+                    (swap! calls conj [:decode (:assignment/id value)])
+                    {:ok? true :tokens [7 8]})
+                  page-pool/route (fn [& _] {:token-count 4})
+                  page-pool/route-bytes (fn [& _] 128)
+                  page-pool/touch-route! (fn [& _] nil)]
+      (is (= {:ok? true :cached-token-count 2}
+             ((:worker/restore-prefix handlers)
+              (effect :worker/restore-prefix))))
+      (is (= {:ok? true}
+             ((:worker/prefill-suffix handlers)
+              (effect :worker/prefill-suffix))))
+      (is (= {:ok? true :tokens [7 8]}
+             ((:worker/decode handlers) (effect :worker/decode))))
+      (is (= [:operation
+              :operation
+              [:prefill [:request-a 1]]
+              :operation
+              [:decode [:request-a 1]]]
+             @calls)))))
+
+(deftest batched-prefill-attaches-a-cache-miss-route-to-its-reservation
+  (let [decoder {:pool ::pool :decode-state {:maxpos 8}}
+        runtime {:decoder decoder}
+        allocated (atom nil)
+        resident (atom nil)
+        handlers (paged/batched-handlers runtime ::cache decoder)]
+    (with-redefs [paged-runtime/run-operation! (fn [_ _ operation] (operation))
+                  paged-runtime/prefill! (fn [& _] {:ok? true})
+                  page-pool/route (fn [& _] @resident)
+                  page-pool/allocate-route!
+                  (fn [_ id token-count opts]
+                    (let [route {:continuation-id id :token-count token-count}]
+                      (reset! allocated [id token-count opts])
+                      (reset! resident route)
+                      route))]
+      (is (= {:ok? true}
+             ((:worker/prefill-suffix handlers)
+              (effect :worker/prefill-suffix))))
+      (is (= [:continuation-a 0
+              {:policy {:durable? false}
+               :capacity-reservation ::capacity}]
+             @allocated)))))
