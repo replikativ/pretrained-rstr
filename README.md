@@ -227,9 +227,15 @@ latency, and context-indexed steady decode:
   :iterations 5})
 ```
 
-The result reports transfer bytes and commands separately from wall time and
-distinguishes first measured restore from process/page-cache-warm restores. It
-does not label warm filesystem pages as cold SSD performance. The optional
+The result reports transfer bytes and commands separately from wall time,
+attributes checkpoint time to catalog lookup, device export, local persistence,
+and publication, and distinguishes first process use from
+process/page-cache-warm restores. It does not label warm filesystem pages as
+cold SSD performance. Manager startup warms the exact Datahike chunk query so
+query compilation cannot extend the first checkpoint's route lifetime. The
+demo's `:cache-policy-calibration :worker-observation-patch` converts measured
+prefill, lower-tier load, and GPU upload rates into the fields consumed by the
+cluster candidate planner; merge it into that worker's observation. The optional
 checkpoint-overlap decode is classified as `:eligible` when Raster reports an
 independent device-event transfer queue and as `:interference-only` otherwise.
 Both cases retain the raw transfer and decode measurements.

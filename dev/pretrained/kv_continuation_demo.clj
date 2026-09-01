@@ -173,11 +173,14 @@
   `:physical-pages`, `:chunk-size`, `:iterations`, `:warmups`,
   `:decode-tokens`, `:checkpoint-overlap-decode-tokens`,
   `:attention-schedule`, `:history-tile-size`, and the fingerprint options
-  accepted by `fingerprint`. Overlap measurement needs GPU pages for two prompt
-  routes plus generated tokens. `:device-id` defaults to Raster's `:ze:0` and
-  may select an OpenCL device such as `:ocl:0`.
+  accepted by `fingerprint`. `:cache-tier` names the measured lower tier for
+  scheduler calibration and defaults to `:ssd`. Overlap measurement needs GPU
+  pages for two prompt routes plus generated tokens. `:device-id` defaults to
+  Raster's `:ze:0` and may select an OpenCL device such as `:ocl:0`.
 
-  Returns the instrumented benchmark plus the first restored token sequence.
+  Returns the instrumented benchmark, first restored token sequence, and a
+  `:cache-policy-calibration` whose worker-observation patch feeds the cluster
+  candidate planner.
   `:prefill-T` optionally compiles fixed-size multi-row prompt tiles; incomplete
   tails retain the exact scalar path. The function closes the temporary manager,
   paged decoder, and Raster session."
@@ -185,9 +188,9 @@
   (let [{:keys [max-position page-size physical-pages chunk-size
                 iterations warmups decode-tokens attention-schedule
                 checkpoint-overlap-decode-tokens history-tile-size device-id
-                prefill-T]
+                prefill-T cache-tier]
          :or {page-size 16 iterations 5 warmups 1 decode-tokens 4
-              device-id :ze:0}} opts
+              device-id :ze:0 cache-tier :ssd}} opts
         model-fingerprint (fingerprint model opts)
         _ (when-not (and (integer? max-position) (pos? max-position))
             (throw (ex-info "Paged benchmark requires a positive :max-position"
@@ -219,7 +222,9 @@
               (or checkpoint-overlap-decode-tokens 0)})]
         (assoc result
                :first-restored-tokens
-               (mapv :token (get-in result [:restored :first-measured :steps]))))
+               (mapv :token (get-in result [:restored :first-measured :steps]))
+               :cache-policy-calibration
+               (benchmark/cache-policy-calibration result cache-tier)))
       (finally
         (try
           (when @decoder

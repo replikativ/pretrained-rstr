@@ -489,6 +489,12 @@
                       cache "fixture-paged-v1" [1 2 3 4 5])]
           (is (:accepted? ticket))
           (is (= 2 (count stored) (count published) (count @captured)))
+          (is (= 2 (:stored-chunks @(:phase-timings ticket))))
+          (is (every? #(not (neg? (double %)))
+                      (map @(:phase-timings ticket)
+                           [:context-ms :catalog-lookup-ms :device-export-ms
+                            :local-persistence-ms :capture-total-ms
+                            :publication-ms])))
           (is (every? #(not (contains? % :chunk/payload)) stored)
               "completed capture metadata does not retain host staging arrays")
           (is (= [0 2] (mapv (comp :chunk/start second) @captured)))
