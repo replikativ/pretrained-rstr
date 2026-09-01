@@ -6,21 +6,24 @@
             [pretrained.continuation.catalog :as catalog]
             [pretrained.continuation.chunk :as chunk]
             [pretrained.continuation.chunk-store :as chunk-store]
+            [pretrained.continuation.content-provider :as content-provider]
             [pretrained.continuation.gpu :as continuation-gpu]
             [pretrained.continuation.page-pool :as page-pool]
             [pretrained.continuation.residency :as residency]
-            [pretrained.continuation.store :as store])
+            [pretrained.continuation.store :as store]
+            [raster.runtime.numerical-content :as content])
   (:import [java.io Closeable]
+           [java.lang AutoCloseable]
            [java.nio.file Files StandardCopyOption]
-           [java.util.concurrent ArrayBlockingQueue CompletableFuture ExecutorService
-            RejectedExecutionException ThreadFactory ThreadPoolExecutor
+           [java.util.concurrent ArrayBlockingQueue CancellationException CompletableFuture
+            ExecutorService RejectedExecutionException ThreadFactory ThreadPoolExecutor
             ThreadPoolExecutor$AbortPolicy TimeUnit]
            [java.util.concurrent.atomic AtomicBoolean AtomicLong]))
 
 (declare close-manager!)
 
-(defrecord Manager [connection owns-connection? directory chunk-store chunk-write-store chunk-size
-                    capture-executor publish-executor closed? metrics]
+(defrecord Manager [connection owns-connection? directory chunk-store chunk-write-store
+                    content-provider chunk-size capture-executor publish-executor closed? metrics]
   Closeable
   (close [manager] (close-manager! manager)))
 
@@ -55,11 +58,12 @@
   Counters are process-local and monotonic for this manager instance. They make
   cache value and inference-path backpressure visible without querying Datahike."
   [^Manager manager]
-  (assoc @(:metrics manager)
-         :capture-queue-depth (.size (.getQueue ^ThreadPoolExecutor
-                                                (:capture-executor manager)))
-         :publish-queue-depth (.size (.getQueue ^ThreadPoolExecutor
-                                                (:publish-executor manager)))))
+  (merge @(:metrics manager)
+         (content-provider/stats (:content-provider manager))
+         {:capture-queue-depth (.size (.getQueue ^ThreadPoolExecutor
+                                                 (:capture-executor manager)))
+          :publish-queue-depth (.size (.getQueue ^ThreadPoolExecutor
+                                                 (:publish-executor manager)))}))
 
 (defn- stop-executor!
   [^ExecutorService executor]
@@ -77,6 +81,7 @@
   (when (.compareAndSet ^AtomicBoolean (:closed? manager) false true)
     (stop-executor! (:capture-executor manager))
     (stop-executor! (:publish-executor manager))
+    (.close ^Closeable (:content-provider manager))
     (when (:owns-connection? manager)
       (d/release (:connection manager)))))
 
@@ -96,12 +101,18 @@
   [^Manager manager]
   (:chunk-store manager))
 
+(defn numerical-content-provider
+  "Return the Raster provider used for chunk localization and scoped mmap."
+  [^Manager manager]
+  (:content-provider manager))
+
 (defn open-manager
   "Open a continuation manager rooted at `directory` and `datahike-config`.
 
-  `opts` controls bounded background work with `:max-pending-captures` and
-  `:max-pending-publications` (both default to 2), plus `:chunk-size` (default
-  256 processed tokens). `:chunk-backend-store` optionally supplies a
+  `opts` controls bounded background work with `:max-pending-captures`,
+  `:max-pending-publications`, and `:max-concurrent-localizations` (all default
+  to 2), plus `:chunk-size` (default 256 processed tokens).
+  `:chunk-backend-store` optionally supplies a
   caller-owned authoritative Konserve store. Chunk writes then return after the
   local filestore frontend and publish to Datahike only after their write-behind
   receipts succeed. `:connection` optionally supplies an already connected,
@@ -110,15 +121,18 @@
   worker. Queue saturation rejects cache work instead of blocking inference."
   ([datahike-config directory] (open-manager datahike-config directory {}))
   ([datahike-config directory {:keys [max-pending-captures max-pending-publications
-                                      chunk-size chunk-backend-store connection]
+                                      max-concurrent-localizations chunk-size
+                                      chunk-backend-store connection]
                                :or {max-pending-captures 2
                                     max-pending-publications 2
+                                    max-concurrent-localizations 2
                                     chunk-size chunk/default-chunk-size}}]
    (when-not (and (pos? max-pending-captures) (pos? max-pending-publications)
-                  (pos? chunk-size))
+                  (pos? max-concurrent-localizations) (pos? chunk-size))
      (throw (ex-info "Checkpoint queue capacities must be positive"
                      {:max-pending-captures max-pending-captures
                       :max-pending-publications max-pending-publications
+                      :max-concurrent-localizations max-concurrent-localizations
                       :chunk-size chunk-size})))
    (let [path (.toPath (java.io.File. (str directory)))
          chunk-path (.resolve path "chunks")]
@@ -137,6 +151,9 @@
                   path
                   local-store
                   write-store
+                  (content-provider/open-provider
+                   local-store write-store
+                   {:max-concurrent-localizations max-concurrent-localizations})
                   (long chunk-size)
                   (bounded-executor "pretrained-kv-capture-" max-pending-captures)
                   (bounded-executor "pretrained-kv-publish-" max-pending-publications)
@@ -416,6 +433,146 @@
                     (update :restored-bytes + (reduce + 0 (map :kv/bytes matched))))))
        (cond-> (assoc lookup-result :resident-route resident-route)
          admission (assoc :admission (dissoc admission :resident-route)))
+       (catch Throwable error
+         (page-pool/release-route! pool continuation-id)
+         (throw error))))))
+
+(defn- cancellation-error
+  [continuation-id stage]
+  (CancellationException.
+   (str "Paged continuation restore was cancelled at " (name stage)
+        " boundary for " continuation-id)))
+
+(defn- release-storage-after-error!
+  [provider event error]
+  (try
+    (content/release-storage-event! provider event)
+    (catch Throwable release-error
+      (.addSuppressed ^Throwable error release-error)))
+  (throw error))
+
+(defn- complete-transfer-after-error!
+  [pool transfer error]
+  (try
+    (page-pool/complete-restore-chunk! pool transfer)
+    (catch Throwable completion-error
+      (.addSuppressed ^Throwable error completion-error)))
+  (throw error))
+
+(defn- await-storage-boundary!
+  [provider event continuation-id cancelled? poll-ms]
+  (loop [cancel-requested? (boolean (cancelled?))]
+    (if (try
+          (content/storage-event-complete? provider event)
+          (catch Throwable error
+            (release-storage-after-error! provider event error)))
+      (let [value (try
+                    (content/await-storage-event! provider event)
+                    (finally
+                      (content/release-storage-event! provider event)))]
+        (when (or cancel-requested? (cancelled?))
+          (throw (cancellation-error continuation-id :storage)))
+        value)
+      (do
+        (Thread/sleep (long poll-ms))
+        (recur (or cancel-requested? (boolean (cancelled?))))))))
+
+(defn- await-transfer-boundary!
+  [pool transfer continuation-id cancelled? poll-ms]
+  (loop [cancel-requested? (boolean (cancelled?))]
+    (if (try
+          (page-pool/chunk-transfer-complete? pool transfer)
+          (catch Throwable error
+            (complete-transfer-after-error! pool transfer error)))
+      (do
+        (page-pool/complete-restore-chunk! pool transfer)
+        (when (or cancel-requested? (cancelled?))
+          (throw (cancellation-error continuation-id :transfer))))
+      (do
+        (Thread/sleep (long poll-ms))
+        (recur (or cancel-requested? (boolean (cancelled?))))))))
+
+(defn restore-paged-prefix-overlapped!
+  "Restore a cached paged prefix while unrelated decoder lanes keep running.
+
+  Storage localization and GPU transfers expose nonblocking completion polls.
+  Each mmap lease transfers to Raster with its upload event and closes only at
+  device completion. Cancellation admits no new chunk but preserves the active
+  storage/transfer boundary before releasing the partial route.
+
+  Options accept `:policy`, `:capacity-reservation`,
+  `:maximum-cached-token-count`, a zero-argument `:cancelled?` predicate, and a
+  positive `:poll-ms` (default 1). The caller must run this function outside the
+  decoder-owning loop, for example with `paged-runtime/run-background-operation!`."
+  ([^Manager manager pool continuation-id model-fingerprint tokens]
+   (restore-paged-prefix-overlapped!
+    manager pool continuation-id model-fingerprint tokens {}))
+  ([^Manager manager pool continuation-id model-fingerprint tokens
+    {:keys [policy capacity-reservation maximum-cached-token-count
+            cancelled? poll-ms]
+     :or {policy {:durable? true}
+          cancelled? (constantly false)
+          poll-ms 1}}]
+   (when-not (ifn? cancelled?)
+     (throw (ex-info "Paged restore cancellation predicate must be callable" {})))
+   (when-not (and (integer? poll-ms) (pos? poll-ms))
+     (throw (ex-info "Paged restore polling interval must be positive"
+                     {:poll-ms poll-ms})))
+   (when (cancelled?)
+     (throw (cancellation-error continuation-id :admission)))
+   (let [{:keys [matched cached-token-count] :as lookup-result}
+         (lookup-chunk-prefix
+          manager model-fingerprint tokens
+          {:maximum-cached-token-count maximum-cached-token-count})
+         resident-route
+         (page-pool/allocate-route!
+          pool continuation-id cached-token-count
+          {:policy policy :capacity-reservation capacity-reservation})
+         provider (:content-provider manager)]
+     (try
+       (doseq [entry matched]
+         (when (cancelled?)
+           (throw (cancellation-error continuation-id :chunk)))
+         (let [address (content-provider/content-address (:kv/store-key entry))
+               localization (content/submit-localization! provider address)
+               _ (await-storage-boundary!
+                  provider localization continuation-id cancelled? poll-ms)
+               lease (content/open-local-content! provider address)
+               submitted? (volatile! false)]
+           (try
+             (let [placement (:placement lease)
+                   payload (merge (:attributes placement)
+                                  {:segment (content/lease-segment lease)})]
+               (when-not (and (= :int16 (:element-type payload))
+                              (= :little-endian (:byte-order payload)))
+                 (throw (ex-info
+                         "Stored KV chunk is not a little-endian FP16 carrier payload"
+                         {:store-key (:kv/store-key entry)
+                          :element-type (:element-type payload)
+                          :byte-order (:byte-order payload)})))
+               (let [transfer
+                     (page-pool/submit-restore-chunk!
+                      pool continuation-id
+                      {:chunk/start (:kv/start-token entry)
+                       :chunk/token-count (:kv/token-count entry)
+                       :chunk/layout
+                       {:dtype :float16
+                        :attention-state (assoc (:layout pool) :dtype :float16)}}
+                      (:segment payload) [lease])]
+                 (vreset! submitted? true)
+                 (await-transfer-boundary!
+                  pool transfer continuation-id cancelled? poll-ms)
+                 (swap! (:metrics manager)
+                        (fn [metrics]
+                          (-> metrics
+                              (update :restored-chunks inc)
+                              (update :restored-bytes + (:kv/bytes entry)))))))
+             (finally
+               (when-not @submitted?
+                 (.close ^AutoCloseable lease))))))
+       (when (cancelled?)
+         (throw (cancellation-error continuation-id :completion)))
+       (assoc lookup-result :resident-route resident-route)
        (catch Throwable error
          (page-pool/release-route! pool continuation-id)
          (throw error))))))

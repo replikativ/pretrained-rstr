@@ -4,7 +4,8 @@
             [pretrained.continuation :as continuation]
             [pretrained.continuation.block-transfer :as block-transfer]
             [pretrained.continuation.page-pool :as page-pool]
-            [raster.gpu.core :as gpu]))
+            [raster.gpu.core :as gpu])
+  (:import [java.lang AutoCloseable]))
 
 (def ^:private model
   {:n-layers 2 :n-kv 1 :head-dim 2})
@@ -213,6 +214,59 @@
              (mapv #(quot (get-in % [0 :opts :byte-offset]) 2) @uploads)))
       (is (= [0 8 16 24] (mapv #(get-in % [2 :src-element]) @uploads)))
       (is (every? #(= 8 (get-in % [2 :elements])) @uploads)))))
+
+(deftest submitted-restore-retains-its-mmap-resource-through-device-completion
+  (let [closed? (atom false)
+        complete? (atom false)
+        submitted (atom nil)
+        retained
+        (reify AutoCloseable
+          (close [_] (reset! closed? true)))
+        pool (fixture-pool
+              (atom {:free (sorted-set 0 3 4 5 6 7)
+                     :refcounts {1 1, 2 1}
+                     :routes {:continuation
+                              {:continuation-id :continuation
+                               :pages [1 2]
+                               :token-count 8
+                               :start-position 0}}}))
+        descriptor {:chunk/start 2
+                    :chunk/token-count 4
+                    :chunk/layout
+                    (assoc-in (continuation/model-layout model)
+                              [:attention-state :dtype] :float16)}
+        payload (short-array 32)]
+    (with-redefs [gpu/buffer-view (fn [_ key opts] {:key key :opts opts})
+                  gpu/submit-upload-ranges-retained!
+                  (fn [_ entries resources]
+                    (reset! submitted [entries resources])
+                    ::transfer)
+                  gpu/event-complete? (fn [_ event]
+                                        (is (= ::transfer event))
+                                        @complete?)
+                  gpu/await-event! (fn [& _] nil)
+                  gpu/event-measurement
+                  (fn [& _] {:direction :upload :timing-source :device-event
+                             :asynchronous? true :bytes 64 :commands 4
+                             :elapsed-ns 30 :submit-host-ns 3 :host-wall-ns 40})
+                  gpu/release-event! (fn [_ event]
+                                       (is (= ::transfer event))
+                                       (.close ^AutoCloseable retained))]
+      (let [transfer (page-pool/submit-restore-chunk!
+                      pool :continuation descriptor payload [retained])]
+        (is (page-pool/chunk-transfer? transfer))
+        (is (= [retained] (second @submitted)))
+        (is (= 4 (count (first @submitted))))
+        (is (false? (page-pool/chunk-transfer-complete? pool transfer)))
+        (is (false? @closed?))
+        (reset! complete? true)
+        (is (page-pool/chunk-transfer-complete? pool transfer))
+        (is (= :continuation
+               (:continuation-id
+                (page-pool/complete-restore-chunk! pool transfer))))
+        (is @closed?)
+        (is (= 64 (get-in (page-pool/transfer-stats pool)
+                          [:counters [:upload :device-event true] :bytes])))))))
 
 (deftest fragmented-durable-chunk-uses-dense-resident-block-staging
   (let [opened (atom [])

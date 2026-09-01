@@ -175,10 +175,22 @@ lanes, retaining active lanes and priming only refills or prompt-token rows:
 (batch-demo/run-simulation)
 ```
 
+Restore overlap has a separate deterministic REPL simulation. Its pending
+restore cannot complete until the demo releases a boundary, while an unrelated
+decode finishes first:
+
+```clojure
+(require '[pretrained.continuation-transfer-demo :as transfer-demo])
+(transfer-demo/run-simulation)
+```
+
 Real workers construct `paged-runtime/open-runtime`, pass
 `paged/batched-handlers` to their local/Kabel controller, and merge
 `paged-runtime/controller-submission` into the worker endpoint options. The
 runtime owns decoder calls; close the controller first, then the runtime.
+Raster 0.2.457 retains each Konserve mmap lease through its asynchronous upload
+event. The worker polls completion between decode iterations and exposes the
+restored route only after all required chunks are resident.
 
 For an already loaded model, the benchmark helper separates prefill, checkpoint
 submission and durability, prefix restore, uncached suffix work, first-token

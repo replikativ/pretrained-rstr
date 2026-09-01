@@ -203,6 +203,7 @@
   [runtime error]
   (reset! (:closed? runtime) true)
   (doseq [[_ job] @(:registry runtime)]
+    (reset! (:job/cancelled? job) true)
     (fail! runtime job error))
   ((:on-error! runtime) error))
 
@@ -248,6 +249,7 @@
         (.interrupt ^Thread thread)
         (let [error (ex-info "Paged runtime is closed" {})]
           (doseq [[_ job] @registry]
+            (reset! (:job/cancelled? job) true)
             (fail! this job error)))))))
 
 (defn open-runtime
@@ -375,6 +377,37 @@
                     {:job/assignment-id assignment-id
                      :job/operation operation}))))
 
+(defn run-background-operation!
+  "Run storage/transfer work on the calling handler thread with runtime fencing.
+
+  `operation` receives a zero-argument cancellation predicate. The job is
+  registered by assignment so controller cancellation becomes visible without
+  interrupting an active storage or GPU transfer. The operation must stop
+  admitting new work and return or throw only after its current safe boundary."
+  [runtime assignment-id operation]
+  (when-not (ifn? operation)
+    (throw (ex-info "Paged background operation must be callable" {})))
+  (let [job (job runtime :background {:job/assignment-id assignment-id})]
+    (locking runtime
+      (when @(:closed? runtime)
+        (throw (ex-info "Paged runtime is closed" {})))
+      (swap! (:registry runtime) assoc (:job/id job) job))
+    (try
+      (let [result (operation #(cancelled? job))]
+        (locking runtime
+          (if (cancelled? job)
+            (let [error (CancellationException.
+                         "Paged background operation was cancelled")]
+              (fail! runtime job error)
+              (throw error))
+            (do
+              (complete! runtime job result)
+              result))))
+      (catch Throwable error
+        (when (contains? @(:registry runtime) (:job/id job))
+          (fail! runtime job error))
+        (throw error)))))
+
 (defn prefill!
   "Incrementally compute an assignment's uncached prompt suffix in batch lanes."
   [runtime effect]
@@ -445,13 +478,14 @@
   and only then wakes waiting controller tasks, so capacity is not released
   underneath an in-flight append. Returns the number of marked jobs."
   [runtime assignment-id]
-  (let [jobs (filter #(= assignment-id (:job/assignment-id %))
-                     (vals @(:registry runtime)))]
-    (doseq [job jobs]
-      (reset! (:job/cancelled? job) true))
-    (when (seq jobs)
-      (.offer ^LinkedBlockingQueue (:inbound runtime) {:job/type :wake}))
-    (count jobs)))
+  (locking runtime
+    (let [jobs (filter #(= assignment-id (:job/assignment-id %))
+                       (vals @(:registry runtime)))]
+      (doseq [job jobs]
+        (reset! (:job/cancelled? job) true))
+      (when (seq jobs)
+        (.offer ^LinkedBlockingQueue (:inbound runtime) {:job/type :wake}))
+      (count jobs))))
 
 (defn concurrent-submission
   "Return bounded concurrent submission callbacks for a local controller.

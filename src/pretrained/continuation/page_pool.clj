@@ -17,6 +17,8 @@
 
 (defrecord CapacityReservation [pool id continuation-id])
 
+(defrecord ChunkTransfer [pool event resident-route])
+
 (defn page-pool?
   "Return true when `value` is a device page pool."
   [value]
@@ -31,6 +33,11 @@
   "Return true when `value` is a page-pool capacity reservation."
   [value]
   (instance? CapacityReservation value))
+
+(defn chunk-transfer?
+  "Return true when `value` is a submitted page-pool chunk transfer."
+  [value]
+  (instance? ChunkTransfer value))
 
 (defn- canonical-dtype
   [dtype]
@@ -981,13 +988,7 @@
                       {:source-dtype source-dtype :payload-type (type payload)
                        :payload-elements (payload-elements payload)})))))
 
-(defn restore-chunk!
-  "Scatter one durable chunk payload into an allocated resident route.
-
-  The chunk may begin/end inside pages and cross arbitrary physical-page IDs.
-  Contiguous runs upload directly. Highly fragmented page-aligned ranges use
-  dense FP16 staging plus one composed Raster block-scatter graph. FP16 mmap
-  segments require no intermediate JVM array. Returns the resident route."
+(defn- restore-chunk-plan
   [pool continuation-id descriptor payload]
   (let [resident-route (route pool continuation-id)
         start (long (:chunk/start descriptor))
@@ -1016,31 +1017,92 @@
     (when-not (= :half (:dtype pool))
       (throw (ex-info "Chunk restore conversion currently targets FP16 device pools"
                       {:pool-dtype (:dtype pool)})))
-    (let [source (half-payload payload source-dtype expected-elements)
-          runs (transfer-runs resident-route start token-count (:page-size pool))]
-      (if (block-transfer-eligible? pool resident-route start token-count runs)
-        (restore-blocks! pool resident-route start token-count plan source)
-        (let [slab-by-name (into {} (map (juxt :name identity))
-                                 (:slabs (:layout pool)))
-              entries
-              (vec
-               (mapcat
-                (fn [{:keys [slab layer element-offset]}]
-                  (let [slab-layout (get slab-by-name slab)
-                        per-token (:elements-per-token slab-layout)]
-                    (mapv
-                     (fn [{:keys [relative-token physical-token token-count]}]
-                       [(token-range-view pool slab-layout layer
-                                          physical-token token-count)
-                        source
-                        {:src-element (+ element-offset
-                                         (* relative-token per-token))
-                         :dst-element 0
-                         :elements (* token-count per-token)}])
-                     runs)))
-                plan))]
-          (transfer-ranges-measured! pool :upload entries)))
-      resident-route)))
+    {:resident-route resident-route
+     :start start
+     :token-count token-count
+     :plan plan
+     :source (half-payload payload source-dtype expected-elements)
+     :runs (transfer-runs resident-route start token-count (:page-size pool))}))
+
+(defn- direct-restore-entries
+  [pool {:keys [plan source runs]}]
+  (let [slab-by-name (into {} (map (juxt :name identity))
+                           (:slabs (:layout pool)))]
+    (vec
+     (mapcat
+      (fn [{:keys [slab layer element-offset]}]
+        (let [slab-layout (get slab-by-name slab)
+              per-token (:elements-per-token slab-layout)]
+          (mapv
+           (fn [{:keys [relative-token physical-token token-count]}]
+             [(token-range-view pool slab-layout layer
+                                physical-token token-count)
+              source
+              {:src-element (+ element-offset (* relative-token per-token))
+               :dst-element 0
+               :elements (* token-count per-token)}])
+           runs)))
+      plan))))
+
+(defn submit-restore-chunk!
+  "Submit a durable chunk upload without waiting for device completion.
+
+  `retained-resources` is a vector of scoped mmap/LMDB leases whose ownership
+  transfers to Raster only after successful submission. Direct ranged uploads
+  deliberately avoid the synchronous fragmented-route scatter optimization;
+  every range is validated before Raster exposes the event. Returns a
+  `ChunkTransfer` finalized with `complete-restore-chunk!`."
+  [pool continuation-id descriptor payload retained-resources]
+  (let [{:keys [resident-route] :as plan}
+        (restore-chunk-plan pool continuation-id descriptor payload)
+        event (gpu/submit-upload-ranges-retained!
+               (:session pool) (direct-restore-entries pool plan)
+               retained-resources)]
+    (->ChunkTransfer pool event resident-route)))
+
+(defn chunk-transfer-complete?
+  "Poll a chunk transfer without consuming its event or retained resources."
+  [pool transfer]
+  (when-not (and (chunk-transfer? transfer)
+                 (identical? pool (:pool transfer)))
+    (throw (ex-info "Chunk transfer belongs to a different page pool"
+                    {:transfer transfer})))
+  (gpu/event-complete? (:session pool) (:event transfer)))
+
+(defn complete-restore-chunk!
+  "Establish chunk completion, record its measurement and release its event.
+
+  This is a safe completion boundary, not cancellation: an incomplete device
+  transfer is awaited before Raster closes its retained host resources."
+  [pool transfer]
+  (when-not (and (chunk-transfer? transfer)
+                 (identical? pool (:pool transfer)))
+    (throw (ex-info "Chunk transfer belongs to a different page pool"
+                    {:transfer transfer})))
+  (let [session (:session pool)
+        event (:event transfer)]
+    (try
+      (gpu/await-event! session event)
+      (record-transfer! pool (gpu/event-measurement session event))
+      (:resident-route transfer)
+      (finally
+        (gpu/release-event! session event)))))
+
+(defn restore-chunk!
+  "Scatter one durable chunk payload into an allocated resident route.
+
+  The chunk may begin/end inside pages and cross arbitrary physical-page IDs.
+  Contiguous runs upload directly. Highly fragmented page-aligned ranges use
+  dense FP16 staging plus one composed Raster block-scatter graph. FP16 mmap
+  segments require no intermediate JVM array. Returns the resident route."
+  [pool continuation-id descriptor payload]
+  (let [{:keys [resident-route start token-count plan source runs] :as transfer}
+        (restore-chunk-plan pool continuation-id descriptor payload)]
+    (if (block-transfer-eligible? pool resident-route start token-count runs)
+      (restore-blocks! pool resident-route start token-count plan source)
+      (transfer-ranges-measured!
+       pool :upload (direct-restore-entries pool transfer)))
+    resident-route))
 
 (defn export-chunk
   "Gather one immutable route range into the durable FP16 chunk format.

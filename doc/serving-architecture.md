@@ -127,8 +127,11 @@ uses `scheduler/plan-iteration` for each graph step, and maps selected mixed-pha
 work onto stable physical lanes. Prompt rows are explicitly primed every prefill
 step; retained decode rows reuse the embedding emitted by the decoder tail.
 Inactive fixed lanes receive no route and append no page. Current restores run
-between iterations; transfer/compute overlap is a measured follow-up, not an
-assumed property.
+outside that loop: a bounded Konserve `ContentProvider` localizes chunks, scoped
+mmap leases are retained by Raster upload events, and handlers poll completion
+between unrelated graph submissions. A continuation becomes runnable only
+after every chunk event completes. Fragmented restore currently favors direct
+range batches; a staged scatter pipeline remains a measured optimization.
 
 `pretrained.continuation.residency` now implements the first deterministic
 admission evaluator over page-pool snapshots. It ranks durable routes by expected
