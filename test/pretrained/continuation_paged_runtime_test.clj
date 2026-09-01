@@ -116,6 +116,45 @@
         (deliver release-step true)
         (.close runtime)))))
 
+(deftest background-restore-does-not-block-unrelated-decode-lanes
+  (let [route-counts (atom {:decode 2})
+        entered (promise)
+        release-restore (promise)
+        runtime
+        (paged-runtime/open-runtime
+         {:decode-state {:batch-size 1 :maxpos 64}}
+         {:prime-lanes! (fn [& _] nil)
+          :step-lanes!
+          (fn [_ work]
+            (mapv (fn [{:keys [continuation-id position] :as item}]
+                    (swap! route-counts update continuation-id inc)
+                    (assoc item :token (+ 100 position)))
+                  work))
+          :route-token-count (fn [_ id] (get @route-counts id))})
+        restore
+        (future
+          (paged-runtime/run-background-operation!
+           runtime :restore-assignment
+           (fn [_cancelled?]
+             (deliver entered true)
+             @release-restore
+             {:ok? true})))]
+    (try
+      (is (true? (deref entered 1000 false)))
+      (is (= {:ok? true :tokens [102 103] :stop-reason :length}
+             (deref
+              (future
+                (paged-runtime/decode!
+                 runtime (effect :decode-assignment :decode [7 8 9] 2)))
+              1000 ::timeout)))
+      (is (not (realized? restore))
+          "decode completes while the independent restore boundary is pending")
+      (deliver release-restore true)
+      (is (= {:ok? true} (deref restore 1000 ::timeout)))
+      (finally
+        (deliver release-restore true)
+        (.close runtime)))))
+
 (deftest decode-rejects-an-incomplete-prompt-without-poisoning-the-runtime
   (let [runtime
         (paged-runtime/open-runtime

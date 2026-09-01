@@ -68,6 +68,13 @@ wakes handler tasks only after the current append or restore boundary. This
 keeps reservation release from racing in-flight GPU work. Close `endpoint`
 before `runtime` so controller tasks quiesce first.
 
+For batched handlers, restore no longer runs on the decoder-owning loop. A
+bounded Raster `ContentProvider` localizes a Hasch-addressed chunk into the
+worker's Konserve filestore, opens its Boring payload as a scoped segment, and
+transfers that lease to a Raster upload event. The handler polls storage and GPU
+events; short session locks do not prevent unrelated lanes from submitting
+compute. Only event completion activates the route for prefill/decode.
+
 Cancellation fences the assignment immediately but retains unused reserved
 pages until any accepted local operation quiesces; terminal completion then
 releases them. Pages already claimed by the continuation remain resident. A
@@ -148,8 +155,8 @@ The live model-free demo now executes the complete observation, selection,
 offer, acknowledgement, and result path across two local Kabel WebSocket
 connections. The implementation does not yet claim a production deployment,
 token streaming, multi-process Gemma execution, or LMCache-beating throughput.
-Restore currently executes synchronously between graph iterations; it is safe
-but can delay active lanes during a slow SSD/object fetch. Async transfer events
-and overlap policy remain required before making throughput claims. The live
-batch runtime is model-free tested; multi-process Gemma measurements are still
-required.
+Localize/upload now overlaps unrelated decode lanes and cancellation preserves
+the current event boundary before releasing a partial route. Async restoration
+currently uses validated direct range batches; fragmented staging/scatter
+pipelining, byte-aware transfer admission, and real multi-process Gemma
+measurements remain required before making throughput claims.

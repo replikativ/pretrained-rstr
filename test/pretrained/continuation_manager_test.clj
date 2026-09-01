@@ -13,9 +13,10 @@
             [pretrained.continuation.page-pool :as page-pool]
             [pretrained.decoder-gpu :as decoder-gpu]
             [raster.gpu.core :as gpu])
-  (:import [java.lang.foreign MemorySegment]
+  (:import [java.lang AutoCloseable]
+           [java.lang.foreign MemorySegment]
            [java.nio.file Files]
-           [java.util.concurrent CountDownLatch TimeUnit]))
+           [java.util.concurrent CancellationException CountDownLatch TimeUnit]))
 
 (defn- delayed-assoc-store
   [backend-store ^CountDownLatch entered release-write]
@@ -253,22 +254,29 @@
                     gpu/buffer-view
                     (fn [_ key opts] {:key key :opts opts})
                     gpu/submit-upload-ranges! (fn [_ entries] entries)
+                    gpu/submit-upload-ranges-retained!
+                    (fn [_ entries resources]
+                      {:entries entries :resources resources})
+                    gpu/event-complete? (fn [& _] true)
                     gpu/await-event!
-                    (fn [_ entries]
-                      (swap! uploads into
-                             (mapv (fn [[view ^MemorySegment source
-                                        {:keys [src-element elements] :as spec}]]
-                                     (let [values (short-array elements)]
-                                       (MemorySegment/copy
-                                        source (* 2 src-element)
-                                        (MemorySegment/ofArray values) 0
-                                        (* 2 elements))
-                                       [(:key view)
-                                        (quot (get-in view [:opts :byte-offset]) 2)
-                                        (mapv #(Float/float16ToFloat %) values)
-                                        spec]))
-                                   entries))
-                      (mapv second entries))
+                    (fn [_ event]
+                      (let [entries (if (map? event) (:entries event) event)]
+                        (swap! uploads into
+                               (mapv (fn [[view ^MemorySegment source
+                                          {:keys [src-element elements] :as spec}]]
+                                       (let [values (short-array elements)]
+                                         (MemorySegment/copy
+                                          source (* 2 src-element)
+                                          (MemorySegment/ofArray values) 0
+                                          (* 2 elements))
+                                         [(:key view)
+                                          (quot (get-in view [:opts :byte-offset]) 2)
+                                          (mapv #(Float/float16ToFloat %) values)
+                                          spec]))
+                                     entries))
+                        (doseq [resource (:resources event)]
+                          (.close ^AutoCloseable resource))
+                        (mapv second entries)))
                     gpu/event-measurement
                     (fn [& _] {:direction :upload :timing-source :host-monotonic
                                :asynchronous? false :bytes 32 :commands 4
@@ -311,7 +319,36 @@
                  @uploads))
           (is (= 2 (:reserved-pages (page-pool/stats pool))))
           (is (= 2 (:restored-chunks (manager/stats cache))))
-          (is (page-pool/release-capacity! pool capacity))))
+          (is (page-pool/release-capacity! pool capacity))
+          (is (page-pool/release-route! pool :request-a))
+          (reset! uploads [])
+          (let [overlap-capacity (page-pool/reserve-capacity! pool :request-b 7)
+                overlapped
+                (manager/restore-paged-prefix-overlapped!
+                 cache pool :request-b "fixture-paged-v1"
+                 [1 2 3 4 5 6 7]
+                 {:capacity-reservation overlap-capacity :policy {}})]
+            (is (= 4 (:cached-token-count overlapped)))
+            (is (= 4 (count @uploads)))
+            (is (= 4 (:restored-chunks (manager/stats cache))))
+            (is (page-pool/release-capacity! pool overlap-capacity))
+            (is (page-pool/release-route! pool :request-b)))
+          (let [cancelled? (atom false)
+                cancelled-capacity
+                (page-pool/reserve-capacity! pool :request-c 7)]
+            (with-redefs [gpu/event-complete?
+                          (fn [& _]
+                            (reset! cancelled? true)
+                            true)]
+              (is (thrown? CancellationException
+                           (manager/restore-paged-prefix-overlapped!
+                            cache pool :request-c "fixture-paged-v1"
+                            [1 2 3 4 5 6 7]
+                            {:capacity-reservation cancelled-capacity
+                             :policy {}
+                             :cancelled? #(deref cancelled?)}))))
+            (is (nil? (page-pool/route pool :request-c)))
+            (is (page-pool/release-capacity! pool cancelled-capacity)))))
       (finally
         (.close cache)
         (d/delete-database config)

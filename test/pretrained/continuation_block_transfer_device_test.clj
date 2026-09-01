@@ -4,7 +4,8 @@
             [pretrained.attention-state :as attention-state]
             [pretrained.continuation :as continuation]
             [pretrained.continuation.page-pool :as page-pool]
-            [raster.gpu.core :as gpu]))
+            [raster.gpu.core :as gpu])
+  (:import [java.lang AutoCloseable]))
 
 (def ^:private level-zero-available?
   (delay
@@ -64,6 +65,27 @@
           "restore uploads indices plus two slabs; capture uploads indices")
       (is (= 2 (direction-commands pool :download))
           "capture downloads two dense slab buffers")
+      (let [replacement (short-array (reverse (vec payload)))
+            resource-closed? (atom false)
+            resource (reify AutoCloseable
+                       (close [_] (reset! resource-closed? true)))
+            transfer (page-pool/submit-restore-chunk!
+                      pool :fragmented descriptor replacement [resource])
+            deadline (+ (System/nanoTime) 5000000000)]
+        (loop []
+          (when-not (page-pool/chunk-transfer-complete? pool transfer)
+            (when (> (System/nanoTime) deadline)
+              (throw (ex-info "Timed out waiting for retained device upload" {})))
+            (Thread/sleep 1)
+            (recur)))
+        (is (false? @resource-closed?)
+            "a positive poll does not consume retained ownership")
+        (page-pool/complete-restore-chunk! pool transfer)
+        (is @resource-closed?)
+        (is (= (vec replacement)
+               (vec (:chunk/payload
+                     (page-pool/export-chunk
+                      pool :fragmented "block-device-fixture" descriptor))))))
       (finally
         (page-pool/close-transfer-engines! pool)
         (gpu/close-session! session)))))

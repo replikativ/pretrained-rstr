@@ -77,7 +77,11 @@
                   (fn [_ _ operation]
                     (swap! calls conj :operation)
                     (operation))
-                  manager/restore-paged-prefix!
+                  paged-runtime/run-background-operation!
+                  (fn [_ _ operation]
+                    (swap! calls conj :background)
+                    (operation (constantly false)))
+                  manager/restore-paged-prefix-overlapped!
                   (fn [& _] {:cached-token-count 2})
                   paged-runtime/prefill!
                   (fn [_ value]
@@ -98,7 +102,7 @@
               (effect :worker/prefill-suffix))))
       (is (= {:ok? true :tokens [7 8]}
              ((:worker/decode handlers) (effect :worker/decode))))
-      (is (= [:operation
+      (is (= [:background
               :operation
               [:prefill [:request-a 1]]
               :operation

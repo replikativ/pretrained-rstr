@@ -25,6 +25,24 @@
     {:ok? true
      :cached-token-count (:cached-token-count result)}))
 
+(defn- restore-prefix-overlapped!
+  [runtime cache decoder policy effect]
+  (let [request (:assignment/request effect)
+        result
+        (paged-runtime/run-background-operation!
+         runtime (:assignment/id effect)
+         (fn [cancelled?]
+           (manager/restore-paged-prefix-overlapped!
+            cache (:pool decoder) (continuation-id effect)
+            (:request/model-fingerprint request) (:request/tokens request)
+            {:capacity-reservation (:worker/capacity-reservation effect)
+             :maximum-cached-token-count
+             (get-in effect [:assignment/candidate
+                             :estimate/cached-token-count])
+             :policy policy
+             :cancelled? cancelled?})))]
+    {:ok? true :cached-token-count (:cached-token-count result)}))
+
 (defn- prefill-suffix!
   [decoder effect]
   (let [request (:assignment/request effect)]
@@ -104,9 +122,10 @@
 (defn batched-handlers
   "Return controller handlers backed by a shared paged batch runtime.
 
-  Restore operations execute between graph iterations. Missing prompt suffixes
-  and generation run incrementally in sparse fixed lanes, allowing unrelated
-  decode lanes to continue while new requests prefill. The local controller
+  Storage localization and retained GPU uploads poll outside the decoder loop,
+  so unrelated lanes continue while a cached prefix becomes resident. Missing
+  prompt suffixes and generation then run incrementally in sparse fixed lanes.
+  The local controller
   must use concurrent submission callbacks such as
   `paged-runtime/controller-submission`; its single-thread default cannot place
   multiple blocking handler jobs into one batch. The caller owns `runtime`."
@@ -118,9 +137,7 @@
    (let [chunk-size (or chunk-size (:chunk-size cache)
                         chunk/default-chunk-size)]
      {:worker/restore-prefix
-      #(paged-runtime/run-operation!
-        runtime (:assignment/id %)
-        (fn [] (restore-prefix! cache decoder policy %)))
+      #(restore-prefix-overlapped! runtime cache decoder policy %)
       :worker/prefill-suffix
       (fn [effect]
         (paged-runtime/run-operation!
