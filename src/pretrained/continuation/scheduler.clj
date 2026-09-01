@@ -342,3 +342,50 @@
      (first (sort-by (juxt :source/estimated-ms
                            (comp rank :source/kind))
                      eligible)))))
+
+(defn checkpoint-decision
+  "Decide whether asynchronously checkpointing a continuation has positive value.
+
+  `policy` requires non-negative `:expected-reuses`, `:checkpoint-ms`, and
+  `:saved-ms-per-reuse`. Optional `:interference-ms` and
+  `:minimum-net-benefit-ms` default to zero. The latter is a safety margin, not
+  part of the measured cost. Returns the normalized inputs, gross saved latency,
+  total cost, net benefit, reuse break-even, and an explicit admission reason.
+
+  Values from `benchmark/cache-policy-calibration` map directly: use its
+  checkpoint admission `:capture-total-ms` as `:checkpoint-ms` and
+  `:saved-ready-to-first-token-ms` as `:saved-ms-per-reuse`."
+  [{:keys [expected-reuses checkpoint-ms saved-ms-per-reuse interference-ms
+           minimum-net-benefit-ms]
+    :or {interference-ms 0.0 minimum-net-benefit-ms 0.0}
+    :as policy}]
+  (let [values {:expected-reuses expected-reuses
+                :checkpoint-ms checkpoint-ms
+                :saved-ms-per-reuse saved-ms-per-reuse
+                :interference-ms interference-ms
+                :minimum-net-benefit-ms minimum-net-benefit-ms}]
+    (doseq [[field value] values]
+      (when-not (and (number? value) (not (neg? (double value))))
+        (throw (ex-info "Checkpoint policy fields must be non-negative numbers"
+                        {:field field :value value :policy policy}))))
+    (let [expected-reuses (double expected-reuses)
+          checkpoint-ms (double checkpoint-ms)
+          saved-ms-per-reuse (double saved-ms-per-reuse)
+          interference-ms (double interference-ms)
+          minimum-net-benefit-ms (double minimum-net-benefit-ms)
+          gross-saved-ms (* expected-reuses saved-ms-per-reuse)
+          cost-ms (+ checkpoint-ms interference-ms)
+          net-benefit-ms (- gross-saved-ms cost-ms)
+          admit? (>= net-benefit-ms minimum-net-benefit-ms)]
+      {:admit? admit?
+       :reason (if admit? :positive-expected-value :insufficient-expected-reuse)
+       :expected-reuses expected-reuses
+       :checkpoint-ms checkpoint-ms
+       :saved-ms-per-reuse saved-ms-per-reuse
+       :interference-ms interference-ms
+       :minimum-net-benefit-ms minimum-net-benefit-ms
+       :gross-saved-ms gross-saved-ms
+       :cost-ms cost-ms
+       :net-benefit-ms net-benefit-ms
+       :break-even-reuses (when (pos? saved-ms-per-reuse)
+                            (/ cost-ms saved-ms-per-reuse))})))

@@ -240,7 +240,25 @@ without copying or decoding tensor elements; the benchmark charges it to mmap
 preparation in the checkpoint and cache-admission break-even. The
 demo's `:cache-policy-calibration :worker-observation-patch` converts measured
 prefill, lower-tier load, and GPU upload rates into the fields consumed by the
-cluster candidate planner; merge it into that worker's observation. The optional
+cluster candidate planner; merge it into that worker's observation. Its
+`:checkpoint-admission` value is directly usable by paged handlers after adding
+an expected reuse count:
+
+```clojure
+(require '[pretrained.continuation.controller.paged :as paged])
+
+(def checkpoint-policy
+  (assoc (:checkpoint-admission (:cache-policy-calibration result))
+         :expected-reuses 2.0))
+
+(paged/batched-handlers runtime cache decoder
+                        {:checkpoint-policy checkpoint-policy})
+```
+
+The policy may instead be a function of the completed request, output, resident
+route, and manager counters, allowing cluster demand to drive expected reuse.
+Only a positive expected-value decision enters the bounded checkpoint queue, and
+only successful catalog publication marks the resident route durable. The optional
 checkpoint-overlap decode is classified as `:eligible` when Raster reports an
 independent device-event transfer queue and as `:interference-only` otherwise.
 Both cases retain the raw transfer and decode measurements.

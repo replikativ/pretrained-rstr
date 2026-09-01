@@ -4,7 +4,10 @@
             [pretrained.continuation.manager :as manager]
             [pretrained.continuation.page-pool :as page-pool]
             [pretrained.continuation.paged-decoder :as paged-decoder]
-            [pretrained.continuation.paged-runtime :as paged-runtime]))
+            [pretrained.continuation.paged-runtime :as paged-runtime]
+            [pretrained.continuation.scheduler :as scheduler])
+  (:import [java.util.concurrent CompletableFuture]
+           [java.util.function BiConsumer]))
 
 (defn- continuation-id
   [effect]
@@ -75,8 +78,72 @@
                :prefix-hash (:chunk/prefix-hash tail)
                :bytes (page-pool/route-bytes pool id)})))))
 
+(defn- checkpoint-policy-for
+  [checkpoint-policy context]
+  (let [policy
+        (cond
+          (nil? checkpoint-policy) nil
+          (map? checkpoint-policy) checkpoint-policy
+          (ifn? checkpoint-policy) (checkpoint-policy context)
+          :else
+          (throw (ex-info "Paged checkpoint policy must be a map or function"
+                          {:checkpoint-policy checkpoint-policy})))]
+    (when-not (or (nil? policy) (map? policy))
+      (throw (ex-info "Paged checkpoint policy function must return a map or nil"
+                      {:checkpoint-policy checkpoint-policy
+                       :returned policy})))
+    policy))
+
+(defn- mark-durable-after-publication!
+  [pool continuation-id model-fingerprint prefix-hash policy ticket]
+  (when (:accepted? ticket)
+    (.whenComplete
+     ^CompletableFuture (:published ticket)
+     (reify BiConsumer
+       (accept [_ _ error]
+         (when-not error
+           (try
+             (when-let [resident-route (page-pool/route pool continuation-id)]
+               (let [resident-policy (:cache/policy resident-route)]
+                 (when (and (= model-fingerprint
+                               (:model-fingerprint resident-policy))
+                            (= prefix-hash (:prefix-hash resident-policy)))
+                   (page-pool/touch-route!
+                    pool continuation-id
+                    {:durable? true :checkpoint/decision policy}))))
+             (catch Throwable _))))))))
+
+(defn- maybe-checkpoint!
+  [cache decoder checkpoint-policy request id output resident-route]
+  (when checkpoint-policy
+    (when-let [policy
+               (checkpoint-policy-for
+                checkpoint-policy
+                {:cache cache
+                 :decoder decoder
+                 :request request
+                 :continuation-id id
+                 :output output
+                 :resident-route resident-route
+                 :manager-stats (manager/stats cache)})]
+      (let [decision (scheduler/checkpoint-decision policy)]
+        (if-not (:admit? decision)
+          {:decision decision :accepted? false}
+          (let [history (into (vec (:request/tokens request)) output)
+                ticket (manager/checkpoint-paged-chunks-async!
+                        cache (:pool decoder) id
+                        (:request/model-fingerprint request) history)
+                prefix-hash (get-in resident-route [:cache/policy :prefix-hash])]
+            (mark-durable-after-publication!
+             (:pool decoder) id (:request/model-fingerprint request)
+             prefix-hash decision ticket)
+            {:decision decision
+             :accepted? (:accepted? ticket)
+             :rejection (:rejection ticket)
+             :ticket ticket}))))))
+
 (defn- decode!
-  [decoder eos-ids chunk-size policy effect]
+  [cache decoder eos-ids chunk-size policy checkpoint-policy effect]
   (let [request (:assignment/request effect)
         id (continuation-id effect)
         prompt (:request/tokens request)
@@ -98,26 +165,36 @@
                   output
                   (recur (inc position) output)))
               output))]
-      (mark-exact-prefix! decoder id request output chunk-size policy)
-      {:ok? true :tokens output})))
+      (let [resident-route
+            (mark-exact-prefix! decoder id request output chunk-size policy)
+            checkpoint
+            (maybe-checkpoint! cache decoder checkpoint-policy request id output
+                               resident-route)]
+        (cond-> {:ok? true :tokens output}
+          checkpoint (assoc :cache-checkpoint checkpoint))))))
 
 (defn handlers
   "Return local-controller handlers for `cache` and a paged `decoder`.
 
-  Options accept `:eos-ids`, resident `:policy`, and `:chunk-size` (defaulting to
-  the manager's chunk size). The restore handler consumes the capacity
+  Options accept `:eos-ids`, resident `:policy`, `:chunk-size` (defaulting to
+  the manager's chunk size), and optional `:checkpoint-policy`. The latter is a
+  static scheduler checkpoint-policy map or a function of the completed request,
+  output, route, decoder, cache, and manager stats. Positive-value checkpoints
+  enter the manager's bounded background pipeline; catalog publication marks the
+  unchanged resident route durable. The restore handler consumes the capacity
   reservation created before offer acceptance. Prefill commits only the exact
   uncached suffix; decode uses the existing Raster linked paged executable and
   annotates the completed route with its exact prefix identity for worker
   observations, reuse, or checkpoint."
   ([cache decoder] (handlers cache decoder {}))
-  ([cache decoder {:keys [eos-ids policy chunk-size]
+  ([cache decoder {:keys [eos-ids policy chunk-size checkpoint-policy]
                    :or {eos-ids #{} policy {:durable? false}}}]
    (let [chunk-size (or chunk-size (:chunk-size cache)
                         chunk/default-chunk-size)]
      {:worker/restore-prefix #(restore-prefix! cache decoder policy %)
       :worker/prefill-suffix #(prefill-suffix! decoder %)
-      :worker/decode #(decode! decoder eos-ids chunk-size policy %)})))
+      :worker/decode #(decode! cache decoder eos-ids chunk-size policy
+                               checkpoint-policy %)})))
 
 (defn batched-handlers
   "Return controller handlers backed by a shared paged batch runtime.
@@ -130,7 +207,7 @@
   `paged-runtime/controller-submission`; its single-thread default cannot place
   multiple blocking handler jobs into one batch. The caller owns `runtime`."
   ([runtime cache decoder] (batched-handlers runtime cache decoder {}))
-  ([runtime cache decoder {:keys [policy chunk-size]
+  ([runtime cache decoder {:keys [policy chunk-size checkpoint-policy]
                            :or {policy {:durable? false}}}]
    (when-not (identical? decoder (:decoder runtime))
      (throw (ex-info "Paged runtime belongs to a different decoder" {})))
@@ -152,6 +229,11 @@
         (let [result (paged-runtime/decode! runtime effect)
               request (:assignment/request effect)
               id (continuation-id effect)]
-          (mark-exact-prefix! decoder id request (:tokens result)
-                              chunk-size policy)
-          result))})))
+          (let [resident-route
+                (mark-exact-prefix! decoder id request (:tokens result)
+                                    chunk-size policy)
+                checkpoint
+                (maybe-checkpoint! cache decoder checkpoint-policy request id
+                                   (:tokens result) resident-route)]
+            (cond-> result
+              checkpoint (assoc :cache-checkpoint checkpoint)))))})))
