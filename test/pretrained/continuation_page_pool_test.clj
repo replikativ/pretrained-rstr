@@ -54,6 +54,8 @@
                      :refcounts {}
                      :routes {}}))]
     (is (nil? (page-pool/route-bytes pool :missing)))
+    (is (= 64 (page-pool/chunk-payload-bytes pool 4)))
+    (is (zero? (page-pool/chunk-payload-bytes pool 0)))
     (page-pool/allocate-route! pool :request 3)
     (is (= 48 (page-pool/route-bytes pool :request)))))
 

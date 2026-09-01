@@ -155,9 +155,10 @@ The live model-free demo now executes the complete observation, selection,
 offer, acknowledgement, and result path across two local Kabel WebSocket
 connections. The implementation does not yet claim a production deployment,
 token streaming, multi-process Gemma execution, or LMCache-beating throughput.
-Localize/upload and device/host checkpoint capture now overlap unrelated decode
-lanes. Cancellation preserves the current restore event boundary before
-releasing a partial route. Async transfers currently use validated direct range
-batches; fragmented staging pipelines, byte-aware transfer admission, pinned
-host-memory pooling, and real multi-process Gemma measurements remain required
-before making throughput claims.
+Localize/upload and device/host checkpoint capture are now scheduled outside the
+decoder loop, and checkpoint chunks have byte-aware host-staging admission.
+Physical transfer/compute overlap is not yet guaranteed by Raster's current
+OpenCL or Level Zero mappings. Cancellation preserves the current restore event
+boundary before releasing a partial route. Fragmented staging pipelines, an
+independent copy path, pinned host-memory pooling, and real multi-process Gemma
+measurements remain required before making throughput claims.

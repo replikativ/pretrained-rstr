@@ -192,8 +192,11 @@ Raster 0.2.457 retains each Konserve mmap lease through its asynchronous upload
 event. The worker polls completion between decode iterations and exposes the
 restored route only after all required chunks are resident. Checkpoint capture
 uses the symmetric retained download API: its event pins the source route until
-the host payload is complete, while the capture worker polls outside the decoder
-loop and writes at most one staged chunk at a time.
+the host payload is complete, while the capture worker writes at most one staged
+chunk at a time. `:max-chunk-staging-bytes` rejects an oversized optional capture
+before queueing. This currently overlaps storage/control work, not necessarily
+device copying: OpenCL still maps logical compute/transfer work to one physical
+queue, and Level Zero shared-memory capture currently copies inline.
 
 For an already loaded model, the benchmark helper separates prefill, checkpoint
 submission and durability, prefix restore, uncached suffix work, first-token
@@ -216,7 +219,9 @@ latency, and context-indexed steady decode:
 
 The result reports transfer bytes and commands separately from wall time and
 distinguishes first measured restore from process/page-cache-warm restores. It
-does not label warm filesystem pages as cold SSD performance.
+does not label warm filesystem pages as cold SSD performance. The optional
+checkpoint-overlap decode is an interference measurement, not an assumption
+that the backend has independent physical queues.
 
 For the optional two-worker S3/Kabel showcase, start an S3-compatible MinIO
 service on `localhost:9000`, configure its credentials as documented in the demo

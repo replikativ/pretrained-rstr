@@ -23,7 +23,8 @@
 (declare close-manager!)
 
 (defrecord Manager [connection owns-connection? directory chunk-store chunk-write-store
-                    content-provider chunk-size capture-executor publish-executor closed? metrics]
+                    content-provider chunk-size max-chunk-staging-bytes
+                    capture-executor publish-executor closed? metrics]
   Closeable
   (close [manager] (close-manager! manager)))
 
@@ -60,7 +61,8 @@
   [^Manager manager]
   (merge @(:metrics manager)
          (content-provider/stats (:content-provider manager))
-         {:capture-queue-depth (.size (.getQueue ^ThreadPoolExecutor
+         {:max-chunk-staging-bytes (:max-chunk-staging-bytes manager)
+          :capture-queue-depth (.size (.getQueue ^ThreadPoolExecutor
                                                  (:capture-executor manager)))
           :publish-queue-depth (.size (.getQueue ^ThreadPoolExecutor
                                                  (:publish-executor manager)))}))
@@ -111,7 +113,9 @@
 
   `opts` controls bounded background work with `:max-pending-captures`,
   `:max-pending-publications`, and `:max-concurrent-localizations` (all default
-  to 2), plus `:chunk-size` (default 256 processed tokens).
+  to 2), `:chunk-size` (default 256 processed tokens), and
+  `:max-chunk-staging-bytes` (default 256 MiB). Paged checkpoints whose single
+  host payload would exceed that byte limit are rejected before queueing.
   `:chunk-backend-store` optionally supplies a
   caller-owned authoritative Konserve store. Chunk writes then return after the
   local filestore frontend and publish to Datahike only after their write-behind
@@ -122,18 +126,22 @@
   ([datahike-config directory] (open-manager datahike-config directory {}))
   ([datahike-config directory {:keys [max-pending-captures max-pending-publications
                                       max-concurrent-localizations chunk-size
-                                      chunk-backend-store connection]
+                                      max-chunk-staging-bytes chunk-backend-store connection]
                                :or {max-pending-captures 2
                                     max-pending-publications 2
                                     max-concurrent-localizations 2
-                                    chunk-size chunk/default-chunk-size}}]
+                                    chunk-size chunk/default-chunk-size
+                                    max-chunk-staging-bytes (* 256 1024 1024)}}]
    (when-not (and (pos? max-pending-captures) (pos? max-pending-publications)
-                  (pos? max-concurrent-localizations) (pos? chunk-size))
-     (throw (ex-info "Checkpoint queue capacities must be positive"
+                  (pos? max-concurrent-localizations) (pos? chunk-size)
+                  (integer? max-chunk-staging-bytes)
+                  (pos? max-chunk-staging-bytes))
+     (throw (ex-info "Checkpoint capacities must be positive"
                      {:max-pending-captures max-pending-captures
                       :max-pending-publications max-pending-publications
                       :max-concurrent-localizations max-concurrent-localizations
-                      :chunk-size chunk-size})))
+                      :chunk-size chunk-size
+                      :max-chunk-staging-bytes max-chunk-staging-bytes})))
    (let [path (.toPath (java.io.File. (str directory)))
          chunk-path (.resolve path "chunks")]
      (Files/createDirectories path (make-array java.nio.file.attribute.FileAttribute 0))
@@ -155,10 +163,12 @@
                    local-store write-store
                    {:max-concurrent-localizations max-concurrent-localizations})
                   (long chunk-size)
+                  (long max-chunk-staging-bytes)
                   (bounded-executor "pretrained-kv-capture-" max-pending-captures)
                   (bounded-executor "pretrained-kv-publish-" max-pending-publications)
                   (AtomicBoolean. false)
                   (atom {:capture-accepted 0 :capture-rejected 0
+                         :capture-byte-rejected 0
                          :chunks-planned 0 :chunks-reused 0 :chunks-stored 0
                          :prefix-lookups 0 :full-hits 0 :partial-hits 0 :misses 0
                          :requested-tokens 0 :cached-tokens 0
@@ -205,10 +215,19 @@
     (publish-chunks! manager (:continuation/model-fingerprint state) stored)))
 
 (defn- submit-chunk-checkpoint!
-  [^Manager manager context]
-  (let [captured (CompletableFuture.)
-        published (CompletableFuture.)
-        ticket {:accepted? true :captured captured :published published}
+  ([^Manager manager context]
+   (submit-chunk-checkpoint! manager context {}))
+  ([^Manager manager context {:keys [estimated-staging-bytes]}]
+   (when-not (or (nil? estimated-staging-bytes)
+                 (and (integer? estimated-staging-bytes)
+                      (not (neg? estimated-staging-bytes))))
+     (throw (ex-info "Estimated checkpoint staging bytes must be non-negative"
+                     {:estimated-staging-bytes estimated-staging-bytes})))
+   (let [captured (CompletableFuture.)
+         published (CompletableFuture.)
+         ticket (cond-> {:accepted? true :captured captured :published published}
+                  estimated-staging-bytes
+                  (assoc :estimated-staging-bytes (long estimated-staging-bytes)))
         reject! (fn [error]
                   (.completeExceptionally captured error)
                   (.completeExceptionally published error))
@@ -238,11 +257,27 @@
                   (.completeExceptionally published error))))
             (catch Throwable error
               (reject! error))))]
-    (if (.get ^AtomicBoolean (:closed? manager))
+    (cond
+      (and estimated-staging-bytes
+           (> (long estimated-staging-bytes)
+              (long (:max-chunk-staging-bytes manager))))
+      (let [error (ex-info "Checkpoint chunk exceeds the host staging budget"
+                           {:estimated-staging-bytes (long estimated-staging-bytes)
+                            :max-chunk-staging-bytes
+                            (:max-chunk-staging-bytes manager)})]
+        (swap! (:metrics manager)
+               #(-> %
+                    (update :capture-rejected inc)
+                    (update :capture-byte-rejected inc)))
+        (reject! error)
+        (assoc ticket :accepted? false :rejection :staging-byte-budget))
+
+      (.get ^AtomicBoolean (:closed? manager))
       (let [error (RejectedExecutionException. "Continuation manager is closed")]
         (swap! (:metrics manager) update :capture-rejected inc)
         (reject! error)
         (assoc ticket :accepted? false))
+      :else
       (try
         (.execute ^ExecutorService (:capture-executor manager) ^Runnable capture-task)
         (swap! (:metrics manager) update :capture-accepted inc)
@@ -250,7 +285,7 @@
         (catch RejectedExecutionException error
           (swap! (:metrics manager) update :capture-rejected inc)
           (reject! error)
-          (assoc ticket :accepted? false))))))
+          (assoc ticket :accepted? false)))))))
 
 (defn checkpoint-gpu-chunks-async!
   "Capture only missing contiguous GPU chunks on bounded background workers.
@@ -298,13 +333,21 @@
   `tokens` contains the exact token history for the route. The route's current
   logical token count defines the processed prefix; a later pending token may be
   present in `tokens`. The accepted capture worker submits retained device-to-host
-  downloads and polls outside the decoder loop, allowing inference to use the
-  Raster session while capture is in flight. Each payload is written through the
-  local/tiered Konserve store before the next chunk is allocated, bounding host
-  staging to one chunk. Datahike is published only after durability. Queue
-  saturation rejects the optional checkpoint immediately."
+  downloads and never awaits an incomplete event on the decoder thread. Physical
+  copy/compute overlap remains backend-dependent: current OpenCL uses one physical
+  queue and current Level Zero shared-memory downloads complete inline. Each
+  payload is written through the local/tiered Konserve store before the next chunk
+  is allocated, bounding host staging to one chunk. Datahike is published only
+  after durability. Queue saturation or a chunk larger than
+  `:max-chunk-staging-bytes` rejects the optional checkpoint immediately."
   [^Manager manager pool continuation-id model-fingerprint tokens]
-  (let [tokens (vec tokens)]
+  (let [tokens (vec tokens)
+        resident-route (page-pool/route pool continuation-id)
+        estimated-staging-bytes
+        (when resident-route
+          (page-pool/chunk-payload-bytes
+           pool (min (long (:token-count resident-route))
+                     (long (:chunk-size manager)))))]
     (submit-chunk-checkpoint!
      manager
      (fn []
@@ -316,7 +359,8 @@
          {:model-fingerprint model-fingerprint
           :plan (chunk/plan tokens processed (:chunk-size manager))
           :export #(await-paged-export!
-                    pool continuation-id model-fingerprint %)})))))
+                    pool continuation-id model-fingerprint %)}))
+     {:estimated-staging-bytes estimated-staging-bytes})))
 
 (defn lookup-chunk-prefix
   "Return planned chunks, present entries, and the longest reusable KV prefix.

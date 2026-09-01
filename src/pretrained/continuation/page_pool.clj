@@ -306,6 +306,25 @@
          elements-per-token
          element-bytes))))
 
+(defn chunk-payload-bytes
+  "Return host payload bytes needed to capture `token-count` rows from `pool`.
+
+  This accounts for every declared slab and layer using the pool's resident
+  dtype. It performs no allocation and is intended for transfer admission and
+  staging-budget decisions before a checkpoint enters a background queue."
+  [pool token-count]
+  (when-not (and (integer? token-count) (not (neg? token-count)))
+    (throw (ex-info "Chunk token count must be a non-negative integer"
+                    {:token-count token-count})))
+  (let [element-bytes (case (:dtype pool) :half 2 :float 4)
+        elements-per-token
+        (reduce + 0
+                (map #(* (long (:count %))
+                         (long (:elements-per-token %)))
+                     (:slabs (:layout pool))))]
+    (checked-product :chunk-payload
+                     [(long token-count) elements-per-token element-bytes])))
+
 (defn residency-snapshot
   "Return immutable route, reference, lease, and capacity data for policy decisions.
 
