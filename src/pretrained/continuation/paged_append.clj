@@ -99,6 +99,31 @@
             (page-pool/abort-appends! pool entries)
             (throw error)))))))
 
+(defn reserve-range!
+  "Reserve `token-count` consecutive append rows for one continuation.
+
+  The returned `AppendBatch` has one page-pool reservation entry and one ordered
+  physical slot per token. It shares the same single commit/abort boundary as a
+  lane batch, allowing a complete prefill tile to remain unpublished until all
+  layer writes finish."
+  [pool continuation-id token-count]
+  (when-not (page-pool/page-pool? pool)
+    (throw (ex-info "Paged append requires a DevicePagePool" {:pool pool})))
+  (let [reservation (page-pool/reserve-append-range!
+                     pool continuation-id token-count)
+        entries [{:continuation-id continuation-id
+                  :reservation reservation}]]
+    (try
+      (map->AppendBatch
+       {:pool pool
+        :id (UUID/randomUUID)
+        :entries entries
+        :slots (int-array (map #(physical-slot pool %) (:slots reservation)))
+        :state (atom :reserved)})
+      (catch Throwable error
+        (page-pool/abort-appends! pool entries)
+        (throw error)))))
+
 (defn reservation-entries
   "Return the ordered page-pool reservation entries in `batch`."
   [batch]

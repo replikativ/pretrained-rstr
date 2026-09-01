@@ -140,6 +140,48 @@
         (is (= 2 (get-in @(:state pool) [:refcounts 0])))
         (is (= 7 (page-pool/free-page-count pool)))))))
 
+(deftest append-ranges-reserve-consecutive-slots-and-publish-once
+  (let [pool (fixture-pool
+              (atom {:free (apply sorted-set (range 8))
+                     :refcounts {}
+                     :leases {}
+                     :routes {}}))]
+    (page-pool/allocate-route! pool :request 3)
+    (let [reservation (page-pool/reserve-append-range! pool :request 6)
+          entries [{:continuation-id :request :reservation reservation}]
+          lease (page-pool/acquire-prospective-lease! pool entries)]
+      (is (= [[0 3] [1 0] [1 1] [1 2] [1 3] [2 0]]
+             (mapv (juxt :physical-page :page-offset) (:slots reservation))))
+      (is (= [0 1 2] (:pages (first (:routes lease)))))
+      (is (= 9 (:token-count (first (:routes lease)))))
+      (is (= 3 (:token-count (page-pool/route pool :request)))
+          "the prospective range stays invisible before publication")
+      (is (= 9 (:token-count
+                (page-pool/commit-append! pool :request reservation))))
+      (is (page-pool/release-lease! pool lease)))))
+
+(deftest aborted-append-range-restores-copy-on-write-tail-and-all-pages
+  (let [copies (atom 0)
+        pool (fixture-pool
+              (atom {:free (apply sorted-set (range 8))
+                     :refcounts {}
+                     :leases {}
+                     :routes {}}))]
+    (with-redefs [gpu/buffer-view (fn [_ key opts] {:key key :opts opts})
+                  gpu/copy-range! (fn [_ _ destination _]
+                                    (swap! copies inc)
+                                    destination)]
+      (page-pool/allocate-route! pool :root 3)
+      (page-pool/fork-route! pool :root :fork)
+      (let [reservation (page-pool/reserve-append-range! pool :fork 6)]
+        (is (= [1 2 3] (:pages (page-pool/route pool :fork))))
+        (is (= 4 @copies))
+        (is (= [0] (:pages
+                    (page-pool/abort-append! pool :fork reservation))))
+        (is (= 3 (:token-count (page-pool/route pool :fork))))
+        (is (= 2 (get-in @(:state pool) [:refcounts 0])))
+        (is (= 7 (page-pool/free-page-count pool)))))))
+
 (deftest transfer-capabilities-distinguish-physical-overlap-eligibility
   (let [pool (fixture-pool (atom {:free (sorted-set 0)
                                   :refcounts {}

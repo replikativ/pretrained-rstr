@@ -750,9 +750,10 @@
 
   Each entry is `{:continuation-id id :reservation reservation}` and must match
   the route's current pending append exactly. The leased snapshot includes the
-  reserved page and increments its token count, while the live route remains
-  uncommitted. This lets an in-order GPU queue submit append followed by
-  attention without making unfinished state visible to other schedulers."
+  reserved pages and advances by the reservation's token count, while the live
+  route remains uncommitted. This lets an in-order GPU queue submit append
+  followed by attention without making unfinished state visible to other
+  schedulers."
   [pool reservation-entries]
   (let [entries (vec reservation-entries)
         continuation-ids (mapv :continuation-id entries)]
@@ -778,7 +779,7 @@
                                     :actual reservation})))
                  (-> resident-route
                      (dissoc :pending)
-                     (update :token-count inc))))
+                     (update :token-count + (long (:token-count reservation 1))))))
              entries)
             id (UUID/randomUUID)
             pages (vec (mapcat :pages routes))
@@ -856,13 +857,18 @@
                      (page-view pool (:name slab) layer destination-page)
                      {:elements elements})))
 
-(defn reserve-append!
-  "Reserve the physical slot for one append and return its page/offset.
+(defn reserve-append-range!
+  "Reserve consecutive physical slots for `token-count` appends.
 
-  A shared partial tail is copied before the route changes. The reservation must
-  be completed with `commit-append!` or reverted with `abort-append!`. Only one
-  append may be pending per continuation."
-  [pool continuation-id]
+  A shared partial tail is copied before the route changes and every additional
+  page is allocated atomically. The returned reservation contains ordered
+  `:slots`, one per logical token. Complete it with `commit-append!` or revert it
+  with `abort-append!`. Only one append range may be pending per continuation."
+  [pool continuation-id token-count]
+  (when-not (and (integer? token-count) (pos? token-count))
+    (throw (ex-info "Append range token count must be a positive integer"
+                    {:continuation-id continuation-id
+                     :token-count token-count})))
   (locking pool
     (let [state @(:state pool)
           resident-route (get-in state [:routes continuation-id])]
@@ -872,40 +878,64 @@
       (when (:pending resident-route)
         (throw (ex-info "Continuation already has a pending append"
                         {:continuation-id continuation-id})))
-      (let [token-count (:token-count resident-route)
-            logical-page (quot token-count (:page-size pool))
-            page-offset (rem token-count (:page-size pool))
+      (let [expected-token-count (long (:token-count resident-route))
+            append-token-count (long token-count)
+            next-token-count (Math/addExact expected-token-count append-token-count)
+            logical-page (quot expected-token-count (:page-size pool))
+            page-offset (rem expected-token-count (:page-size pool))
             existing (get (:pages resident-route) logical-page)
             shared? (and existing (> (get-in state [:refcounts existing]) 1))
-            needs-page? (or (nil? existing) shared?)
+            target-page-count (page-count next-token-count (:page-size pool))
+            added-page-count (- target-page-count (count (:pages resident-route)))
+            allocation-count (+ added-page-count (if shared? 1 0))
             capacity-reservation (route-reservation pool state continuation-id)
-            [new-pages reserved-state]
-            (if needs-page?
+            [allocated-pages reserved-state]
+            (if (pos? allocation-count)
               (if capacity-reservation
-                (claim-reserved-pages state capacity-reservation continuation-id 1)
-                (take-free-pages state 1 continuation-id))
+                (claim-reserved-pages state capacity-reservation continuation-id
+                                      allocation-count)
+                (take-free-pages state allocation-count continuation-id))
               [[] state])
-            physical-page (or (first new-pages) existing)]
-        (when shared?
-          (copy-page! pool existing physical-page))
-        (let [pages (cond
-                      (nil? existing) (conj (:pages resident-route) physical-page)
-                      shared? (assoc (:pages resident-route) logical-page physical-page)
-                      :else (:pages resident-route))
-              pending {:expected-token-count token-count
+            replacement-page (when shared? (first allocated-pages))
+            added-pages (vec (drop (if shared? 1 0) allocated-pages))]
+        (when replacement-page
+          (copy-page! pool existing replacement-page))
+        (let [base-pages (if replacement-page
+                           (assoc (:pages resident-route) logical-page replacement-page)
+                           (:pages resident-route))
+              pages (into base-pages added-pages)
+              slots (mapv (fn [position]
+                            (let [slot-page (quot position (:page-size pool))]
+                              {:logical-page slot-page
+                               :physical-page (nth pages slot-page)
+                               :page-offset (rem position (:page-size pool))}))
+                          (range expected-token-count next-token-count))
+              first-slot (first slots)
+              pending {:expected-token-count expected-token-count
+                       :token-count append-token-count
                        :logical-page logical-page
-                       :physical-page physical-page
+                       :physical-page (:physical-page first-slot)
                        :page-offset page-offset
-                       :added-page? (nil? existing)
-                       :replaced-page (when shared? existing)}
+                       :slots slots
+                       :allocated-pages allocated-pages
+                       :added-pages added-pages
+                       :added-page? (pos? added-page-count)
+                       :replaced-page (when replacement-page existing)}
               next-state (cond-> reserved-state
-                           shared? (release-page existing)
+                           replacement-page (release-page existing)
                            true (assoc-in [:routes continuation-id]
                                           (assoc resident-route
                                                  :pages pages
                                                  :pending pending)))]
           (reset! (:state pool) next-state)
           pending)))))
+
+(defn reserve-append!
+  "Reserve the physical slot for one append and return its page/offset.
+
+  This is the single-token form of `reserve-append-range!`."
+  [pool continuation-id]
+  (reserve-append-range! pool continuation-id 1))
 
 (defn- validate-reservation-entries!
   [state reservation-entries]
@@ -940,9 +970,12 @@
           entries (validate-reservation-entries! state reservation-entries)
           next-state
           (reduce
-           (fn [current {:keys [continuation-id]}]
+           (fn [current {:keys [continuation-id reservation]}]
              (update-in current [:routes continuation-id]
-                        #(-> % (dissoc :pending) (update :token-count inc))))
+                        #(-> %
+                             (dissoc :pending)
+                             (update :token-count +
+                                     (long (:token-count reservation 1))))))
            state entries)]
       (reset! (:state pool) next-state)
       (mapv #(get-in next-state [:routes (:continuation-id %)]) entries))))
@@ -956,14 +989,18 @@
 (defn- abort-reservation
   [state {:keys [continuation-id]}]
   (let [resident-route (get-in state [:routes continuation-id])
-        {:keys [logical-page physical-page added-page? replaced-page]}
+        {:keys [logical-page allocated-pages added-pages replaced-page]}
         (:pending resident-route)
-        pages (cond
-                added-page? (pop (:pages resident-route))
-                replaced-page (assoc (:pages resident-route) logical-page replaced-page)
-                :else (:pages resident-route))]
-    (cond-> state
-      (or added-page? replaced-page) (release-page physical-page)
+        pages-without-added (if (seq added-pages)
+                              (subvec (:pages resident-route)
+                                      0 (- (count (:pages resident-route))
+                                           (count added-pages)))
+                              (:pages resident-route))
+        pages (if replaced-page
+                (assoc pages-without-added logical-page replaced-page)
+                pages-without-added)
+        released-state (reduce release-page state allocated-pages)]
+    (cond-> released-state
       replaced-page (update-in [:refcounts replaced-page] (fnil inc 0))
       true (assoc-in [:routes continuation-id]
                      (assoc (dissoc resident-route :pending) :pages pages)))))

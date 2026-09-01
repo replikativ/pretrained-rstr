@@ -43,6 +43,16 @@
       (is (= [0] (mapv :token-count (paged-append/abort-batch! batch))))
       (is (= 8 (page-pool/free-page-count page-pool))))))
 
+(deftest range-reservations-expose-one-slot-per-token-and-publish-once
+  (let [page-pool (pool)]
+    (page-pool/allocate-route! page-pool :prompt 3)
+    (let [batch (paged-append/reserve-range! page-pool :prompt 6)]
+      (is (= [3 4 5 6 7 8] (vec (paged-append/slot-values batch))))
+      (is (= [:prompt] (mapv :continuation-id
+                             (paged-append/reservation-entries batch))))
+      (is (= 3 (:token-count (page-pool/route page-pool :prompt))))
+      (is (= 9 (:token-count (first (paged-append/commit-batch! batch))))))))
+
 (deftest partial-batch-reservation-failure-rolls-back-earlier-lanes
   (let [page-pool (page-pool/->DevicePagePool
                    ::session layout 4 1 :half
