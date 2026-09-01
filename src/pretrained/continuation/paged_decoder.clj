@@ -23,7 +23,8 @@
 
 (defrecord PagedDecoder
            [decode-state pool executable descriptor-keys pages-per-sequence
-            attention-execution state]
+            attention-execution prefill-executable prefill-descriptor-keys
+            prefill-T state]
   Closeable
   (close [decoder]
     (close! decoder)))
@@ -45,18 +46,24 @@
   (when (:closed? @(:state decoder))
     (throw (ex-info "Paged decoder is closed" {}))))
 
-(defn- staged-executables!
-  [decode-state]
-  (let [execution (:stage-executables decode-state)
-        layers (:layers execution)]
-    (when-not (and (= (:n-layers (:model decode-state)) (count layers))
+(defn- validate-staged-executables!
+  [model execution include-head-tail?]
+  (let [layers (:layers execution)]
+    (when-not (and (= (:n-layers model) (count layers))
                    (every? #(and (gpu-link/linked-executable? (:pre %))
                                  (gpu-link/linked-executable? (:post %)))
                            layers)
-                   (gpu-link/linked-executable? (:head-tail execution)))
+                   (or (not include-head-tail?)
+                       (gpu-link/linked-executable? (:head-tail execution))))
       (throw (ex-info "Decode state has no complete staged LinkPlan execution"
-                      {:stage-executables execution})))
+                      {:stage-executables execution
+                       :include-head-tail? include-head-tail?})))
     execution))
+
+(defn- staged-executables!
+  [decode-state]
+  (let [execution (:stage-executables decode-state)]
+    (validate-staged-executables! (:model decode-state) execution true)))
 
 (defn- graph-instance
   [id graph graph-bindings]
@@ -170,10 +177,18 @@
     (attention/visibility {:causal? true})))
 
 (defn- linked-paged-executable!
-  [decode-state pool batch-size pages-per-sequence prefix query-view positions-view
-   key-view value-view output-view attention-options]
+  [decode-state pool row-count pages-per-sequence prefix query-view positions-view
+   key-view value-view output-view
+   {:keys [attention-schedule history-tile-size staged sequence-count
+           include-head-tail? input-node input-role output-node plan-id]
+    :or {include-head-tail? true input-node :r0 input-role :state
+         plan-id ::decoder}}]
   (let [{:keys [sess model device-id device-desc]} decode-state
-        staged (staged-executables! decode-state)
+        sequence-count (long (or sequence-count row-count))
+        staged (validate-staged-executables!
+                model (or staged (:stage-executables decode-state))
+                include-head-tail?)
+        output-node (or output-node (when include-head-tail? :tokbuf))
         slot-prefix (str prefix "-append")
         route-prefix (str prefix "-attention")
         append-plans
@@ -182,7 +197,7 @@
                  pool {:id [::append layer]
                        :key-prefix slot-prefix
                        :layer layer
-                       :batch-size batch-size
+                       :batch-size row-count
                        :key-view key-view
                        :value-view value-view}))
               (range (:n-layers model)))
@@ -192,8 +207,8 @@
                  pool {:id [::attention layer]
                        :key-prefix route-prefix
                        :layer layer
-                       :batch-size batch-size
-                       :total-query-tokens batch-size
+                       :batch-size sequence-count
+                       :total-query-tokens row-count
                        :q-heads (:n-q model)
                        :kv-heads (:n-kv model)
                        :qk-head-dim (:head-dim model)
@@ -202,8 +217,8 @@
                        :scale (:attn-scale model)
                        :visibility (layer-visibility model layer)
                        :device-desc device-desc
-                       :attention-schedule (:attention-schedule attention-options)
-                       :history-tile-size (:history-tile-size attention-options)
+                       :attention-schedule attention-schedule
+                       :history-tile-size history-tile-size
                        :query-dtype :float
                        :output-dtype :float
                        :query-view query-view
@@ -227,15 +242,14 @@
                     (graph-instance [::attention layer] (:graph plan) (:bindings plan)))
                   (range) attention-plans)
             stage-plans
-            (vec
-             (concat
-              (mapcat (fn [{:keys [pre post]}] [(:plan pre) (:plan post)])
-                      (:layers staged))
-              [(:plan (:head-tail staged))]))
+            (cond->
+             (vec (mapcat (fn [{:keys [pre post]}] [(:plan pre) (:plan post)])
+                          (:layers staged)))
+              include-head-tail? (conj (:plan (:head-tail staged))))
             stage-nodes (merge-first (map :nodes stage-plans))
             graph-roles (merge (zipmap descriptor-keys (repeat :input))
                                {(:key positions-view) :input
-                                :r0 :state}
+                                input-node input-role}
                                (zipmap page-keys (repeat :state))
                                (zipmap [(:key query-view) (:key key-view)
                                         (:key value-view) (:key output-view)]
@@ -260,14 +274,15 @@
                    (get-in attention-components [layer :instance])]
                   (:instances (:plan (get-in staged [:layers layer :post])))))
                (range (:n-layers model)))
-              (:instances (:plan (:head-tail staged)))))
+              (when include-head-tail?
+                (:instances (:plan (:head-tail staged))))))
             aliases (into #{} (mapcat :aliases) stage-plans)
             plan (link/make
-                  {:id [::decoder prefix]
+                  {:id [plan-id prefix]
                    :target device-id
                    :nodes nodes
                    :instances instances
-                   :outputs [:tokbuf]
+                   :outputs [output-node]
                    :aliases aliases
                    :attributes {:owner ::paged-decoder}})
             allocation-ids
@@ -315,6 +330,9 @@
   - `:history-tile-size` overrides the tiled schedule's default and is rejected
     for other policies.
 
+  When `decode-state` was bound with `:prefill-T`, opening also links a
+  single-sequence, multi-row causal prefill graph over the same page pool.
+
   The decoder owns its linked graph but not the decode state, Raster session, or
   page-pool allocations. Closing it releases the graph and descriptor buffers;
   close the decode state's session to release all resident tensors."
@@ -351,20 +369,55 @@
                                              :id [prefix :value]})
         output-view (gpu/buffer-view sess :at {:shape [q-elements]
                                                :id [prefix :output]})
-        {:keys [executable descriptor-keys owned-buffer-keys attention-execution]}
+        decode-link
         (linked-paged-executable!
          decode-state pool batch-size pages-per-sequence prefix
          query-view positions-view key-view value-view output-view
          {:attention-schedule attention-schedule
-          :history-tile-size history-tile-size})]
+          :history-tile-size history-tile-size})
+        prefill-T (some-> (:prefill-T decode-state) long)
+        prefill-link
+        (when prefill-T
+          (let [prefill-prefix (str prefix "-prefill")
+                prefill-q-elements (* prefill-T (long (:n-q model))
+                                      (long (:head-dim model)))
+                prefill-kv-elements (* prefill-T (long (:n-kv model))
+                                       (long (:head-dim model)))]
+            (linked-paged-executable!
+             decode-state pool prefill-T pages-per-sequence prefill-prefix
+             (gpu/buffer-view sess :pf-qr {:shape [prefill-q-elements]
+                                            :id [prefill-prefix :query]})
+             (gpu/buffer-view sess :pf-positions {:shape [prefill-T]
+                                                   :id [prefill-prefix :positions]})
+             (gpu/buffer-view sess :pf-kr {:shape [prefill-kv-elements]
+                                            :id [prefill-prefix :key]})
+             (gpu/buffer-view sess :pf-v {:shape [prefill-kv-elements]
+                                           :id [prefill-prefix :value]})
+             (gpu/buffer-view sess :pf-at {:shape [prefill-q-elements]
+                                            :id [prefill-prefix :output]})
+             {:attention-schedule attention-schedule
+              :history-tile-size history-tile-size
+              :staged (:prefill-stage-executables decode-state)
+              :sequence-count 1
+              :include-head-tail? false
+              :input-node :pr0
+              :input-role :input
+              :output-node (keyword (str "pr" (:n-layers model)))
+              :plan-id ::prefill})))]
     (map->PagedDecoder
      {:decode-state decode-state
       :pool pool
-      :executable executable
-      :descriptor-keys descriptor-keys
+      :executable (:executable decode-link)
+      :descriptor-keys (:descriptor-keys decode-link)
       :pages-per-sequence pages-per-sequence
-      :attention-execution attention-execution
-      :state (atom {:closed? false :owned-buffer-keys owned-buffer-keys})})))
+      :attention-execution (:attention-execution decode-link)
+      :prefill-executable (:executable prefill-link)
+      :prefill-descriptor-keys (:descriptor-keys prefill-link)
+      :prefill-T prefill-T
+      :state (atom {:closed? false
+                    :owned-buffer-keys
+                    (into (:owned-buffer-keys decode-link)
+                          (:owned-buffer-keys prefill-link))})})))
 
 (defn attention-execution
   "Return selected per-layer attention strategies and temporary workspace.
@@ -582,6 +635,81 @@
   (prime-tokens! decoder tokens)
   (step-batch! decoder continuation-ids positions))
 
+(defn prefill-range!
+  "Process one complete multi-row prompt tile for a resident continuation.
+
+  `tokens` must contain exactly the decoder's configured `:prefill-T` rows and
+  `start-position` must extend the route. All K/V rows remain unpublished until
+  every layer has completed; failures roll the whole range reservation back.
+  Returns `decoder` without changing the resident one-row decode input."
+  [decoder continuation-id tokens start-position]
+  (require-open! decoder)
+  (let [{:keys [sess model maxpos batch-size]} (:decode-state decoder)
+        tile-size (some-> (:prefill-T decoder) long)
+        tokens (vec tokens)
+        start-position (long start-position)
+        route (or (page-pool/route (:pool decoder) continuation-id)
+                  (throw (ex-info "Continuation is not resident"
+                                  {:continuation-id continuation-id})))
+        expected-position (+ (long (:start-position route))
+                             (long (:token-count route)))]
+    (when-not (and tile-size (:prefill-executable decoder))
+      (throw (ex-info "Paged decoder has no resident bulk-prefill executable" {})))
+    (when-not (= 1 (long (or batch-size 1)))
+      (throw (ex-info "Bulk prompt prefill currently supports one sequence"
+                      {:batch-size batch-size})))
+    (when-not (= tile-size (count tokens))
+      (throw (ex-info "Prompt tile does not match the bound prefill row count"
+                      {:prefill-T tile-size :token-count (count tokens)})))
+    (when-not (= expected-position start-position)
+      (throw (ex-info "Paged prefill range does not extend the resident route"
+                      {:continuation-id continuation-id
+                       :expected expected-position :actual start-position})))
+    (when (> (+ (long (:token-count route)) tile-size) (long maxpos))
+      (throw (ex-info "Paged prefill range exceeds route capacity"
+                      {:continuation-id continuation-id
+                       :token-count (:token-count route)
+                       :prefill-T tile-size
+                       :capacity maxpos})))
+    (let [batch (paged-append/reserve-range! (:pool decoder) continuation-id tile-size)]
+      (try
+        (let [entries (paged-append/reservation-entries batch)
+              lease (page-pool/acquire-prospective-lease! (:pool decoder) entries)]
+          (try
+            (let [route-values
+                  (page-pool/leased-dense-route-values
+                   (:pool decoder) lease
+                   {:pages-per-sequence (:pages-per-sequence decoder)})
+                  d (long (:d-model model))
+                  ^floats rows (float-array (* tile-size d))
+                  positions (int-array (map int (range start-position
+                                                        (+ start-position tile-size))))
+                  keys (:prefill-descriptor-keys decoder)]
+              (doseq [[row token] (map-indexed vector tokens)]
+                (System/arraycopy ^floats (decoder-gpu/embed-row model token) 0
+                                  rows (int (* (long row) d)) (int d)))
+              (gpu/upload-ranges!
+               sess
+               [[:pr0 rows {:elements (alength rows)}]
+                [(:slots keys) (paged-append/slot-values batch)
+                 {:elements tile-size}]
+                [(:row-offsets keys) (int-array [0 tile-size]) {:elements 2}]
+                [(:positions keys) positions {:elements tile-size}]
+                [(:page-table keys) (:page-table route-values)
+                 {:elements (alength ^ints (:page-table route-values))}]
+                [(:lengths keys) (:lengths route-values) {:elements 1}]
+                [(:start-positions keys) (:start-positions route-values)
+                 {:elements 1}]])
+              (gpu-link/run! (:prefill-executable decoder)))
+            (finally
+              (page-pool/release-lease! (:pool decoder) lease))))
+        (paged-append/commit-batch! batch)
+        decoder
+        (catch Throwable error
+          (when (= :reserved @(:state batch))
+            (paged-append/abort-batch! batch))
+          (throw error))))))
+
 (defn prime-prompts-batch!
   "Compute an equal-length missing suffix for one prompt per decode lane.
 
@@ -668,8 +796,20 @@
                       {:continuation-id continuation-id
                        :cached-token-count cached-count
                        :processed-token-count processed-count})))
-    (doseq [position (range cached-count processed-count)]
-      (decode-token! decoder continuation-id (nth prompt position) position))
+    (let [prompt (vec prompt)
+          tile-size (some-> (:prefill-T decoder) long)
+          bulk-end (if tile-size
+                     (+ cached-count
+                        (* tile-size (quot (- processed-count cached-count)
+                                           tile-size)))
+                     cached-count)]
+      (when tile-size
+        (doseq [position (range cached-count bulk-end tile-size)]
+          (prefill-range! decoder continuation-id
+                          (subvec prompt position (+ position tile-size))
+                          position)))
+      (doseq [position (range bulk-end processed-count)]
+        (decode-token! decoder continuation-id (nth prompt position) position)))
     (prime-token! decoder (last prompt))))
 
 (defn generate!
@@ -705,6 +845,8 @@
   (locking decoder
     (when-not (:closed? @(:state decoder))
       (gpu-link/close! (:executable decoder))
+      (when-let [prefill-executable (:prefill-executable decoder)]
+        (gpu-link/close! prefill-executable))
       (doseq [key (:owned-buffer-keys @(:state decoder))]
         (when (gpu/buffer (get-in decoder [:decode-state :sess]) key)
           (gpu/free-buffer! (get-in decoder [:decode-state :sess]) key)))

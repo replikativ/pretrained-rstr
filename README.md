@@ -211,6 +211,8 @@ latency, and context-indexed steady decode:
  {:max-position 2048
   :chunk-size 256
   :page-size 16
+  ;; Optional fixed multi-row prompt tile; short tails use scalar decode.
+  :prefill-T 32
   :decode-tokens 16
   ;; Requires page capacity for the source and an unrelated decode route.
   :checkpoint-overlap-decode-tokens 16
