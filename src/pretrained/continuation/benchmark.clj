@@ -350,8 +350,10 @@
   (default 1), positive `:decode-tokens` (default 4), and non-negative
   `:checkpoint-overlap-decode-tokens` (default 0). When overlap is requested, a
   second resident prompt decodes while the source route is captured; the result
-  records how many steps started before capture completed and their latency.
-  This requires capacity for both routes. The first restored sample is kept
+  records how many steps started before capture completed and their latency. It
+  measures backend interference rather than assuming logical transfer and compute
+  queues execute concurrently. This requires capacity for both routes. The first
+  restored sample is kept
   separate because it can include first-use storage and mmap costs. No
   operating-system caches are dropped, so it is not a cold-SSD result.
 

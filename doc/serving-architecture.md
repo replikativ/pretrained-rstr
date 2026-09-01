@@ -224,12 +224,17 @@ Restore is planned before bytes move:
 `checkpoint-paged-chunks-async!` checkpoints immutable completed page ranges.
 The bounded capture worker submits validated direct downloads across arbitrary
 physical page spans. Raster retains the route lease through device completion,
-while the worker polls without holding the decoder session. It writes each host
-payload before allocating the next, bounding staging to one durable chunk.
+and the manager does not await an incomplete event on the decoder thread. It
+writes each host payload before allocating the next, bounding staging to one
+durable chunk; a configured byte ceiling rejects an oversized capture before it
+enters the queue.
 Konserve write-behind copies to S3 and Datahike publication waits for backend
 receipts. If either queue is full, the optional checkpoint is skipped. A
 dedicated low-priority transfer stream and bounded pinned-memory pool remain
 needed to control copy-engine and memory-bandwidth contention with inference.
+Current OpenCL uses one physical in-order queue for logical compute and transfer
+work. Current Level Zero page buffers are shared allocations and D2H submission
+is an inline host copy. Neither path yet proves physical copy/compute overlap.
 
 ## Policy
 

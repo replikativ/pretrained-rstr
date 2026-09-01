@@ -498,6 +498,43 @@
         (d/delete-database config)
         (delete-directory! directory)))))
 
+(deftest paged-checkpoint-rejects-a-chunk-over-its-host-staging-budget
+  (let [directory (Files/createTempDirectory "pretrained-kv-staging-budget-"
+                                              (make-array java.nio.file.attribute.FileAttribute 0))
+        config {:store {:backend :memory :id (random-uuid)}
+                :schema-flexibility :write :keep-history? false :value-caps :default}
+        model {:n-layers 1 :n-kv 1 :head-dim 2}
+        pool (page-pool/->DevicePagePool
+              ::session (attention-state/layout model) 2 4 :half
+              {[:key 0] :k0, [:value 0] :v0}
+              (atom {:free (sorted-set 2 3)
+                     :refcounts {0 1, 1 1}
+                     :leases {}
+                     :routes {:request {:continuation-id :request
+                                        :pages [0 1]
+                                        :token-count 4
+                                        :start-position 0}}}))
+        cache (manager/open-manager
+               config directory {:chunk-size 4 :max-chunk-staging-bytes 31})]
+    (try
+      (let [ticket (manager/checkpoint-paged-chunks-async!
+                    cache pool :request "fixture-budget-v1" [1 2 3 4 5])]
+        (is (false? (:accepted? ticket)))
+        (is (= :staging-byte-budget (:rejection ticket)))
+        (is (= 32 (:estimated-staging-bytes ticket)))
+        (is (.isCompletedExceptionally (:captured ticket)))
+        (is (= {:capture-rejected 1
+                :capture-byte-rejected 1
+                :capture-queue-depth 0
+                :max-chunk-staging-bytes 31}
+               (select-keys (manager/stats cache)
+                            [:capture-rejected :capture-byte-rejected
+                             :capture-queue-depth :max-chunk-staging-bytes]))))
+      (finally
+        (.close cache)
+        (d/delete-database config)
+        (delete-directory! directory)))))
+
 (deftest async-paged-checkpoint-polls-before-awaiting-device-download
   (let [directory (Files/createTempDirectory "pretrained-kv-capture-overlap-"
                                               (make-array java.nio.file.attribute.FileAttribute 0))
