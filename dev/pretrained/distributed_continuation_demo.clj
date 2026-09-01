@@ -89,11 +89,12 @@
   "Start the authoritative Datahike/Kabel catalog writer.
 
   `directory` is a durable Datahike filestore. `opts` may supply stable
-  `:server-id`, `:store-id`, and `:port` values. The database and its files are
-  retained on close so the authority can be restarted."
+  `:server-id`, `:store-id`, and `:port` values. `:control-middleware` composes
+  an optional continuation router onto the same Kabel connections. The database
+  and its files are retained on close so the authority can be restarted."
   ([directory]
    (open-authority! directory {}))
-  ([directory {:keys [server-id store-id port]
+  ([directory {:keys [server-id store-id port control-middleware]
                :or {server-id (random-uuid)
                     store-id (random-uuid)}}]
    (let [port (or port (free-port))
@@ -104,10 +105,13 @@
                  :value-caps :default}
          connection (catalog/ensure-database! config)
          handler (create-http-kit-handler! S url server-id)
+         data-middleware (comp (sync/server-middleware)
+                               distributed-scope/remote-middleware)
+         middleware (if control-middleware
+                      (comp control-middleware data-middleware)
+                      data-middleware)
          server-peer (peer/server-peer
-                      S handler server-id
-                      (comp (sync/server-middleware)
-                            distributed-scope/remote-middleware)
+                      S handler server-id middleware
                       cbor-handlers/datahike-cbor-middleware)]
      (<?? S (peer/start server-peer))
      (distributed-scope/invoke-on-peer server-peer)
@@ -134,14 +138,19 @@
   `chunk-backend-store` is a caller-owned shared Konserve store. A restarted
   worker may reuse both paths; a different cache path exercises a cold worker.
   Set `:reconcile? false` only when an external scheduler directly drives the
-  returned worker's promoter, as the single-JVM smoke does."
+  returned worker's promoter, as the single-JVM smoke does. An optional
+  `:control-middleware` shares this worker's Kabel connection with the
+  continuation control plane."
   [^Authority authority ^String node catalog-directory cache-directory
    chunk-backend-store opts]
   (let [peer-id (or (:peer-id opts) (random-uuid))
+        data-middleware (comp (sync/client-middleware)
+                              distributed-scope/remote-middleware)
+        middleware (if-let [control-middleware (:control-middleware opts)]
+                     (comp control-middleware data-middleware)
+                     data-middleware)
         client-peer (peer/client-peer
-                     S peer-id
-                     (comp (sync/client-middleware)
-                           distributed-scope/remote-middleware)
+                     S peer-id middleware
                      cbor-handlers/datahike-cbor-middleware)
         _ (distributed-scope/invoke-on-peer client-peer)
         _ (<?? S (peer/connect S client-peer (:url authority)))

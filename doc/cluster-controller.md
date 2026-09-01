@@ -14,7 +14,7 @@ cluster router -- offer/timeout --> worker-local controller
         +------ accepted/result -------+
                     Kabel/Netz control messages
 
-Datahike: model, lineage, placement, observations, recorded decisions
+Datahike: model, lineage, placement, and recorded decision-grade facts
 Konserve: immutable tensor chunks over local mmap, peers, or S3
 Raster:   device pages, transfers, continuous batches, model execution
 ```
@@ -57,6 +57,15 @@ tensor bytes are rejected as local-only. The same maps can be routed by Netz.
 Worker observations use a separate versioned heartbeat message. The pure
 `discovery` registry rejects delayed epochs/sequences without writing high-rate
 heartbeats into Datahike.
+
+`pretrained.continuation.controller.kabel` is the live interpreter for that
+seam. Its router middleware associates each accepted heartbeat with the exact
+connection that carried it, expires silent workers, and turns disconnects into
+fenced `:worker/unavailable` events. Its worker middleware publishes page-pool
+and queue observations, consumes directed offers/cancellations, and returns
+acknowledgements/results. Unrelated messages pass through unchanged, so the
+same peer can also carry Datahike/Konserve Sync and distributed-scope traffic.
+Stale connections cannot remove or replace a newer worker route.
 
 ## Routing policy
 
@@ -103,18 +112,17 @@ an OpenAI server is advertised as complete.
 
 The remaining Gemma path is concrete:
 
-1. carry observation and assignment messages over the live two-worker Kabel
-   topology and establish heartbeat expiry;
-2. feed accepted work into the existing multi-request paged scheduler/lane
+1. feed accepted work into the existing multi-request paged scheduler/lane
    refill instead of the current serialized single-request handler;
-3. checkpoint completed immutable ranges asynchronously through the tiered
+2. checkpoint completed immutable ranges asynchronously through the tiered
    Konserve store and publish catalog facts only after durability receipts;
-4. run cold, local-SSD, resident-prefix, partial-prefix, cancellation, and
+3. run cold, local-SSD, resident-prefix, partial-prefix, cancellation, and
    worker-restart cases with one small Gemma model;
-5. report TTFT, inter-token latency, page occupancy, bytes by tier, recomputed
+4. report TTFT, inter-token latency, page occupancy, bytes by tier, recomputed
    tokens, eviction reasons, and inference/checkpoint overlap.
 
-The implementation does not yet claim a production Kabel deployment, token
-streaming, multi-process Gemma execution, or LMCache-beating throughput. Those
-claims require the handler integration and measurements above. The controller
-and simulator now make those experiments bounded and reproducible.
+The live model-free demo now executes the complete observation, selection,
+offer, acknowledgement, and result path across two local Kabel WebSocket
+connections. The implementation does not yet claim a production deployment,
+token streaming, multi-process Gemma execution, or LMCache-beating throughput.
+Those claims require the scheduler/handler integration and measurements above.

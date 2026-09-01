@@ -149,6 +149,22 @@ ephemeral worker load/residency observations:
 (controller-demo/run-database-simulation)
 ```
 
+The live variant runs the same path over two actual local Kabel WebSocket
+connections, including worker heartbeats, expiry, directed offers,
+acknowledgements, and fenced terminal results:
+
+```clojure
+;; clojure -M:distributed-demo
+(require '[pretrained.continuation-kabel-demo :as kabel-demo])
+(kabel-demo/run-live-simulation)
+;; => {:selected-worker :fast-gpu,
+;;     :tokens [101 102], :phase :completed, :observed-workers 2}
+```
+
+It is model-free and does not send tensors through Kabel. The optional
+controller middleware can be composed onto the same peers used by the
+Datahike/Konserve distributed demo.
+
 For an already loaded model, the benchmark helper separates prefill, checkpoint
 submission and durability, prefix restore, uncached suffix work, first-token
 latency, and context-indexed steady decode:
