@@ -268,6 +268,80 @@
         (is (= 64 (get-in (page-pool/transfer-stats pool)
                           [:counters [:upload :device-event true] :bytes])))))))
 
+(deftest submitted-export-retains-its-route-through-device-completion
+  (let [complete? (atom false)
+        submitted (atom nil)
+        pool (fixture-pool
+              (atom {:free (sorted-set 0 3 4 5 6 7)
+                     :refcounts {1 1, 2 1}
+                     :leases {}
+                     :routes {:continuation
+                              {:continuation-id :continuation
+                               :pages [1 2]
+                               :token-count 8
+                               :start-position 0}}}))
+        descriptor {:chunk/start 2 :chunk/token-count 4}]
+    (with-redefs [gpu/buffer-view (fn [_ key opts] {:key key :opts opts})
+                  gpu/submit-download-ranges-retained!
+                  (fn [_ entries resources]
+                    (reset! submitted {:entries entries :resources resources})
+                    ::export)
+                  gpu/event-complete? (fn [_ event]
+                                        (is (= ::export event))
+                                        @complete?)
+                  gpu/await-event!
+                  (fn [_ event]
+                    (is (= ::export event))
+                    (doseq [[_ ^shorts destination
+                             {:keys [dst-element elements]}]
+                            (:entries @submitted)
+                            index (range elements)]
+                      (aset destination (+ dst-element index)
+                            (Float/floatToFloat16
+                             (float (inc (+ dst-element index)))))))
+                  gpu/event-measurement
+                  (fn [& _] {:direction :download :timing-source :device-event
+                             :asynchronous? true :bytes 64 :commands 8
+                             :elapsed-ns 30 :submit-host-ns 3 :host-wall-ns 40})
+                  gpu/release-event!
+                  (fn [_ event]
+                    (is (= ::export event))
+                    (doseq [resource (:resources @submitted)]
+                      (.close ^AutoCloseable resource)))]
+      (let [export (page-pool/submit-export-chunk!
+                    pool :continuation "fixture-paged-v1" descriptor)]
+        (is (page-pool/chunk-export? export))
+        (is (= 4 (count (:entries @submitted))))
+        (is (= 1 (:active-leases (page-pool/stats pool))))
+        (is (false? (page-pool/chunk-export-complete? pool export)))
+        (reset! complete? true)
+        (is (page-pool/chunk-export-complete? pool export))
+        (is (= (mapv #(Float/floatToFloat16 (float %)) (range 1 33))
+               (vec (:chunk/payload
+                     (page-pool/complete-export-chunk! pool export)))))
+        (is (zero? (:active-leases (page-pool/stats pool))))
+        (is (= 64 (get-in (page-pool/transfer-stats pool)
+                          [:counters [:download :device-event true] :bytes])))))))
+
+(deftest rejected-export-submission-releases-its-route-lease
+  (let [pool (fixture-pool
+              (atom {:free (sorted-set 0 3 4 5 6 7)
+                     :refcounts {1 1, 2 1}
+                     :leases {}
+                     :routes {:continuation
+                              {:continuation-id :continuation
+                               :pages [1 2]
+                               :token-count 8
+                               :start-position 0}}}))]
+    (with-redefs [gpu/buffer-view (fn [_ key opts] {:key key :opts opts})
+                  gpu/submit-download-ranges-retained!
+                  (fn [& _] (throw (ex-info "rejected" {})))]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (page-pool/submit-export-chunk!
+                    pool :continuation "fixture-paged-v1"
+                    {:chunk/start 0 :chunk/token-count 4})))
+      (is (zero? (:active-leases (page-pool/stats pool)))))))
+
 (deftest fragmented-durable-chunk-uses-dense-resident-block-staging
   (let [opened (atom [])
         runs (atom [])

@@ -144,8 +144,8 @@ an OpenAI server is advertised as complete.
 
 The remaining Gemma path is concrete:
 
-1. checkpoint completed immutable ranges asynchronously through the tiered
-   Konserve store and publish catalog facts only after durability receipts;
+1. measure retained asynchronous checkpoint downloads under live decode and
+   tune their transfer-stream priority and pinned-memory budget;
 2. run cold, local-SSD, resident-prefix, partial-prefix, cancellation, and
    worker-restart cases with one small Gemma model;
 3. report TTFT, inter-token latency, page occupancy, bytes by tier, recomputed
@@ -155,8 +155,9 @@ The live model-free demo now executes the complete observation, selection,
 offer, acknowledgement, and result path across two local Kabel WebSocket
 connections. The implementation does not yet claim a production deployment,
 token streaming, multi-process Gemma execution, or LMCache-beating throughput.
-Localize/upload now overlaps unrelated decode lanes and cancellation preserves
-the current event boundary before releasing a partial route. Async restoration
-currently uses validated direct range batches; fragmented staging/scatter
-pipelining, byte-aware transfer admission, and real multi-process Gemma
-measurements remain required before making throughput claims.
+Localize/upload and device/host checkpoint capture now overlap unrelated decode
+lanes. Cancellation preserves the current restore event boundary before
+releasing a partial route. Async transfers currently use validated direct range
+batches; fragmented staging pipelines, byte-aware transfer admission, pinned
+host-memory pooling, and real multi-process Gemma measurements remain required
+before making throughput claims.

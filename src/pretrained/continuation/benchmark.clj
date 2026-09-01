@@ -68,22 +68,42 @@
      :max-ms (peek sorted-samples)}))
 
 (defn- checkpoint-paged!
-  [cache pool continuation-id model-fingerprint prompt-ids]
+  [cache pool continuation-id model-fingerprint prompt-ids
+   foreground! maximum-foreground-steps]
   (let [transfers-before (transfer-snapshot pool)
+        checkpoint-started (System/nanoTime)
         submission
         (timed #(accepted-ticket!
                  (manager/checkpoint-paged-chunks-async!
                   cache pool continuation-id model-fingerprint prompt-ids)))
         ticket (:value submission)
+        foreground-samples
+        (loop [index 0
+               samples []]
+          (if (and foreground!
+                   (< index (long maximum-foreground-steps))
+                   (not (.isDone ^CompletableFuture (:captured ticket))))
+            (let [sample (timed #(foreground! index))]
+              (recur (inc index) (conj samples (:milliseconds sample))))
+            samples))
         capture (timed #(.get ^CompletableFuture (:captured ticket)))
+        capture-total-ms (/ (- (System/nanoTime) checkpoint-started) 1.0e6)
         publication (timed #(.get ^CompletableFuture (:published ticket)))
         transfer (transfer-difference transfers-before (transfer-snapshot pool))]
     (cond->
      {:submission-ms (:milliseconds submission)
       :capture-drain-ms (:milliseconds capture)
+      :capture-total-ms capture-total-ms
       :publication-drain-ms (:milliseconds publication)
       :chunks (count (:value capture))
       :stored-bytes (reduce + 0 (map :bytes (:value capture)))}
+      foreground!
+      (assoc :inference-overlap
+             (cond-> {:maximum-steps (long maximum-foreground-steps)
+                      :steps-started-before-capture-complete
+                      (count foreground-samples)}
+               (seq foreground-samples)
+               (assoc :step-latency (summarize-ms foreground-samples))))
       transfer (assoc :transfer transfer))))
 
 (defn- continuation-sample!
@@ -279,7 +299,8 @@
                           {:iterations iterations :warmups warmups})
         source-id (random-uuid)
         _ (paged-decoder/prime-prompt! decoder source-id prompt-ids)
-        checkpoint (checkpoint-paged! cache pool source-id model-fingerprint prompt-ids)
+        checkpoint (checkpoint-paged! cache pool source-id model-fingerprint
+                                      prompt-ids nil 0)
         _ (page-pool/release-route! pool source-id)
         restore-ready
         (fn [tokens]
@@ -326,21 +347,29 @@
   step with its absolute position and visible context size.
 
   `opts` accepts positive `:iterations` (default 5), non-negative `:warmups`
-  (default 1), and positive `:decode-tokens` (default 4). The first restored
-  sample is kept separate because it can include first-use storage and mmap
-  costs. No operating-system caches are dropped, so it is not a cold-SSD result.
+  (default 1), positive `:decode-tokens` (default 4), and non-negative
+  `:checkpoint-overlap-decode-tokens` (default 0). When overlap is requested, a
+  second resident prompt decodes while the source route is captured; the result
+  records how many steps started before capture completed and their latency.
+  This requires capacity for both routes. The first restored sample is kept
+  separate because it can include first-use storage and mmap costs. No
+  operating-system caches are dropped, so it is not a cold-SSD result.
 
   Returns serializable raw samples, phase summaries, checkpoint drain costs,
   continuation speedups, and cache-manager counters. Every temporary resident
   route is released, including when execution fails."
   [cache decoder model-fingerprint prompt-ids
-   {:keys [iterations warmups decode-tokens]
-    :or {iterations 5 warmups 1 decode-tokens 4}}]
-  (when-not (and (pos? iterations) (not (neg? warmups)) (pos? decode-tokens))
+   {:keys [iterations warmups decode-tokens checkpoint-overlap-decode-tokens]
+    :or {iterations 5 warmups 1 decode-tokens 4
+         checkpoint-overlap-decode-tokens 0}}]
+  (when-not (and (pos? iterations) (not (neg? warmups)) (pos? decode-tokens)
+                 (not (neg? checkpoint-overlap-decode-tokens)))
     (throw (ex-info "Continuation benchmark counts are invalid"
                     {:iterations iterations
                      :warmups warmups
-                     :decode-tokens decode-tokens})))
+                     :decode-tokens decode-tokens
+                     :checkpoint-overlap-decode-tokens
+                     checkpoint-overlap-decode-tokens})))
   (when-not (= 1 (long (get-in decoder [:decode-state :batch-size] 1)))
     (throw (ex-info "Continuation benchmark currently requires a single decode lane"
                     {:batch-size (get-in decoder [:decode-state :batch-size])})))
@@ -361,13 +390,25 @@
         uncached-warm (continuation-series!
                        uncached-operation iterations warmups)
         source-id (random-uuid)
+        overlap-id (when (pos? checkpoint-overlap-decode-tokens)
+                     (random-uuid))
         checkpoint (try
                      (paged-decoder/prime-prompt! decoder source-id prompt-ids)
+                     (when overlap-id
+                       (paged-decoder/prime-prompt! decoder overlap-id prompt-ids))
                      (checkpoint-paged!
-                      cache pool source-id model-fingerprint prompt-ids)
+                      cache pool source-id model-fingerprint prompt-ids
+                      (when overlap-id
+                        (fn [index]
+                          (paged-decoder/step!
+                           decoder overlap-id
+                           (+ (dec (count prompt-ids)) (long index)))))
+                      checkpoint-overlap-decode-tokens)
                      (finally
                        (when (page-pool/route pool source-id)
-                         (page-pool/release-route! pool source-id))))
+                         (page-pool/release-route! pool source-id))
+                       (when (and overlap-id (page-pool/route pool overlap-id))
+                         (page-pool/release-route! pool overlap-id))))
         restore! #(manager/restore-paged-prefix!
                    cache pool % model-fingerprint prompt-ids)
         restored-operation #(continuation-sample!

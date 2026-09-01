@@ -233,7 +233,7 @@
         cache (manager/open-manager config directory {:chunk-size 2})]
     (try
       (page-pool/allocate-route! pool :source 4)
-      (with-redefs [page-pool/export-chunk
+      (with-redefs [page-pool/submit-export-chunk!
                     (fn [_ _ model-fingerprint descriptor]
                       (let [values (if (zero? (:chunk/start descriptor))
                                      [10 11 20 21 50 51 60 61]
@@ -251,6 +251,8 @@
                                 :chunk/payload
                                 (short-array
                                  (map #(Float/floatToFloat16 (float %)) values))})))
+                    page-pool/chunk-export-complete? (fn [& _] true)
+                    page-pool/complete-export-chunk! (fn [_ export] export)
                     gpu/buffer-view
                     (fn [_ key opts] {:key key :opts opts})
                     gpu/submit-upload-ranges! (fn [_ entries] entries)
@@ -466,7 +468,7 @@
         captured (atom [])
         cache (manager/open-manager config directory {:chunk-size 2})]
     (try
-      (with-redefs [page-pool/export-chunk
+      (with-redefs [page-pool/submit-export-chunk!
                     (fn [_ continuation-id model-fingerprint descriptor]
                       (swap! captured conj [continuation-id descriptor])
                       (merge descriptor
@@ -474,7 +476,9 @@
                               :chunk/model-fingerprint model-fingerprint
                               :chunk/layout (continuation/model-layout model)
                               :chunk/elements-per-slab 4
-                              :chunk/payload (float-array 8)}))]
+                              :chunk/payload (float-array 8)}))
+                    page-pool/chunk-export-complete? (fn [& _] true)
+                    page-pool/complete-export-chunk! (fn [_ export] export)]
         (let [ticket (manager/checkpoint-paged-chunks-async!
                       cache pool :request "fixture-paged-v1" [1 2 3 4 5])
               stored (.get ^java.util.concurrent.CompletableFuture (:captured ticket)
@@ -485,8 +489,74 @@
                       cache "fixture-paged-v1" [1 2 3 4 5])]
           (is (:accepted? ticket))
           (is (= 2 (count stored) (count published) (count @captured)))
+          (is (every? #(not (contains? % :chunk/payload)) stored)
+              "completed capture metadata does not retain host staging arrays")
           (is (= [0 2] (mapv (comp :chunk/start second) @captured)))
           (is (= 4 (:cached-token-count lookup)))))
+      (finally
+        (.close cache)
+        (d/delete-database config)
+        (delete-directory! directory)))))
+
+(deftest async-paged-checkpoint-polls-before-awaiting-device-download
+  (let [directory (Files/createTempDirectory "pretrained-kv-capture-overlap-"
+                                              (make-array java.nio.file.attribute.FileAttribute 0))
+        config {:store {:backend :memory :id (random-uuid)}
+                :schema-flexibility :write :keep-history? false :value-caps :default}
+        model {:n-layers 1 :n-kv 1 :head-dim 2}
+        pool (page-pool/->DevicePagePool
+              ::session (attention-state/layout model) 2 4 :half
+              {[:key 0] :k0, [:value 0] :v0}
+              (atom {:free (sorted-set 2 3)
+                     :refcounts {0 1, 1 1}
+                     :leases {}
+                     :routes {:request {:continuation-id :request
+                                        :pages [0 1]
+                                        :token-count 4
+                                        :start-position 0}}}))
+        submitted (promise)
+        complete? (atom false)
+        awaits (atom 0)
+        cache (manager/open-manager config directory {:chunk-size 4})]
+    (try
+      (with-redefs [gpu/buffer-view (fn [_ key opts] {:key key :opts opts})
+                    gpu/submit-download-ranges-retained!
+                    (fn [_ entries resources]
+                      (let [event {:entries entries :resources resources}]
+                        (deliver submitted event)
+                        event))
+                    gpu/event-complete? (fn [& _] @complete?)
+                    gpu/await-event!
+                    (fn [_ event]
+                      (swap! awaits inc)
+                      (when-not @complete?
+                        (throw (ex-info "Download was awaited before a positive poll" {})))
+                      (doseq [[_ ^shorts destination
+                               {:keys [dst-element elements]}] (:entries event)
+                              index (range elements)]
+                        (aset destination (+ dst-element index)
+                              (Float/floatToFloat16 (float index)))))
+                    gpu/event-measurement
+                    (fn [& _] {:direction :download :timing-source :device-event
+                               :asynchronous? true :bytes 32 :commands 2
+                               :elapsed-ns 20 :submit-host-ns 2 :host-wall-ns 25})
+                    gpu/release-event!
+                    (fn [_ event]
+                      (doseq [resource (:resources event)]
+                        (.close ^AutoCloseable resource)))]
+        (let [ticket (manager/checkpoint-paged-chunks-async!
+                      cache pool :request "fixture-overlap-v1" [1 2 3 4 5])]
+          (is (:accepted? ticket))
+          (is (not= ::timeout (deref submitted 5000 ::timeout)))
+          (is (false? (.isDone (:captured ticket))))
+          (is (zero? @awaits)
+              "capture polling leaves the decoder-owning session available")
+          (is (= 1 (:active-leases (page-pool/stats pool))))
+          (reset! complete? true)
+          (is (= 1 (count (.get (:captured ticket) 5 TimeUnit/SECONDS))))
+          (is (= 1 (count (.get (:published ticket) 5 TimeUnit/SECONDS))))
+          (is (= 1 @awaits))
+          (is (zero? (:active-leases (page-pool/stats pool))))))
       (finally
         (.close cache)
         (d/delete-database config)

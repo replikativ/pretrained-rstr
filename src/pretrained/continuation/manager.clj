@@ -175,7 +175,7 @@
 (defn- persist-chunks!
   [^Manager manager tensor-chunks]
   (mapv (fn [tensor-chunk]
-          (merge tensor-chunk
+          (merge (dissoc tensor-chunk :chunk/payload)
                  (if (identical? (:chunk-store manager)
                                  (:chunk-write-store manager))
                    (chunk-store/put! (:chunk-store manager) tensor-chunk)
@@ -218,8 +218,10 @@
             (let [{:keys [model-fingerprint plan export]} (context)
                   missing (missing-chunk-descriptors manager model-fingerprint plan)
                   _ (record-chunk-plan! manager plan missing)
-                  stored (persist-chunks!
-                          manager (mapv export missing))
+                  stored (mapv (fn [descriptor]
+                                 (first (persist-chunks!
+                                         manager [(export descriptor)])))
+                               missing)
                   publish-task
                   (fn []
                     (try
@@ -265,15 +267,42 @@
       :plan (:chunks (chunk/continuation-plan state (:chunk-size manager)))
       :export #(continuation-gpu/export-gpu-chunk state %)})))
 
+(defn- complete-export-after-error!
+  [pool export error]
+  (try
+    (page-pool/complete-export-chunk! pool export)
+    (catch Throwable completion-error
+      (.addSuppressed ^Throwable error completion-error)))
+  (throw error))
+
+(defn- await-paged-export!
+  [pool continuation-id model-fingerprint descriptor]
+  (let [export (page-pool/submit-export-chunk!
+                pool continuation-id model-fingerprint descriptor)]
+    (loop []
+      (if (try
+            (page-pool/chunk-export-complete? pool export)
+            (catch Throwable error
+              (complete-export-after-error! pool export error)))
+        (page-pool/complete-export-chunk! pool export)
+        (do
+          (try
+            (Thread/sleep 1)
+            (catch InterruptedException error
+              (complete-export-after-error! pool export error)))
+          (recur))))))
+
 (defn checkpoint-paged-chunks-async!
   "Capture a resident paged route through the bounded durable chunk pipeline.
 
   `tokens` contains the exact token history for the route. The route's current
   logical token count defines the processed prefix; a later pending token may be
-  present in `tokens`. The accepted capture worker leases and gathers physical
-  FP16 pages into their exact signed-16 carrier representation, writes through
-  the local/tiered Konserve store, and publishes Datahike only after durability.
-  Queue saturation rejects the optional checkpoint immediately."
+  present in `tokens`. The accepted capture worker submits retained device-to-host
+  downloads and polls outside the decoder loop, allowing inference to use the
+  Raster session while capture is in flight. Each payload is written through the
+  local/tiered Konserve store before the next chunk is allocated, bounding host
+  staging to one chunk. Datahike is published only after durability. Queue
+  saturation rejects the optional checkpoint immediately."
   [^Manager manager pool continuation-id model-fingerprint tokens]
   (let [tokens (vec tokens)]
     (submit-chunk-checkpoint!
@@ -286,7 +315,7 @@
              processed (long (:token-count resident-route))]
          {:model-fingerprint model-fingerprint
           :plan (chunk/plan tokens processed (:chunk-size manager))
-          :export #(page-pool/export-chunk
+          :export #(await-paged-export!
                     pool continuation-id model-fingerprint %)})))))
 
 (defn lookup-chunk-prefix
