@@ -233,6 +233,11 @@ and publication, and distinguishes first process use from
 process/page-cache-warm restores. It does not label warm filesystem pages as
 cold SSD performance. Manager startup warms the exact Datahike chunk query so
 query compilation cannot extend the first checkpoint's route lifetime. The
+bounded checkpoint and localization workers likewise prepare and validate the
+scoped Konserve/Boring tensor mapping before publishing local readiness. This
+moves one-time FFM/navigation initialization off the first inference request
+without copying or decoding tensor elements; the benchmark charges it to mmap
+preparation in the checkpoint and cache-admission break-even. The
 demo's `:cache-policy-calibration :worker-observation-patch` converts measured
 prefill, lower-tier load, and GPU upload rates into the fields consumed by the
 cluster candidate planner; merge it into that worker's observation. The optional

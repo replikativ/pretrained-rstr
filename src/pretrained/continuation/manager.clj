@@ -264,6 +264,7 @@
                   _ (record-chunk-plan! manager plan missing)
                   export-ns (volatile! 0)
                   persistence-ns (volatile! 0)
+                  mmap-preparation-ns (volatile! 0)
                   stored
                   (mapv (fn [descriptor]
                           (let [started (System/nanoTime)
@@ -271,9 +272,13 @@
                                 exported (System/nanoTime)
                                 stored (first (persist-chunks!
                                                manager [tensor-chunk]))
-                                persisted (System/nanoTime)]
+                                persisted (System/nanoTime)
+                                _ (chunk-store/prepare-mmap-payload!
+                                   (:chunk-store manager) (:store-key stored))
+                                prepared (System/nanoTime)]
                             (vswap! export-ns + (- exported started))
                             (vswap! persistence-ns + (- persisted exported))
+                            (vswap! mmap-preparation-ns + (- prepared persisted))
                             stored))
                         missing)
                   capture-finished (System/nanoTime)
@@ -284,6 +289,7 @@
                              (/ (- lookup-finished lookup-started) 1.0e6)
                              :device-export-ms (/ @export-ns 1.0e6)
                              :local-persistence-ms (/ @persistence-ns 1.0e6)
+                             :mmap-preparation-ms (/ @mmap-preparation-ns 1.0e6)
                              :capture-total-ms
                              (/ (- capture-finished capture-started) 1.0e6)
                              :planned-chunks (count plan)
@@ -395,7 +401,8 @@
   `:max-chunk-staging-bytes` rejects the optional checkpoint immediately. The
   returned ticket also contains a `:phase-timings` atom populated by the capture
   and publication workers, so callers can distinguish catalog, transfer,
-  persistence, and publication costs without instrumenting private internals."
+  persistence, mmap preparation, and publication costs without instrumenting
+  private internals."
   [^Manager manager pool continuation-id model-fingerprint tokens]
   (let [tokens (vec tokens)
         resident-route (page-pool/route pool continuation-id)
@@ -496,8 +503,8 @@
   Each Hasch-addressed Konserve payload is mmaped only for its synchronous
   scatter into arbitrary physical pages. On any failure the partial route and
   all of its page references are released. Returns the ordinary lookup result
-  with `:resident-route`; uncached prompt suffix evaluation remains the caller's
-  model-execution responsibility.
+  with `:resident-route` and `:restore-phase-timings`; uncached prompt suffix
+  evaluation remains the caller's model-execution responsibility.
 
   The optional `opts` arity enables `:admit?`. A cost-aware admission then evicts
   only durable, unpinned, unleased routes and installs `:policy` on the restored
@@ -518,10 +525,14 @@
    (when (and admit? capacity-reservation)
      (throw (ex-info "Paged restore cannot admit an existing reservation"
                      {:continuation-id continuation-id})))
-   (let [{:keys [matched cached-token-count] :as lookup-result}
+   (let [restore-started (System/nanoTime)
+         lookup-started restore-started
+         {:keys [matched cached-token-count] :as lookup-result}
          (lookup-chunk-prefix
           manager model-fingerprint tokens
           {:maximum-cached-token-count maximum-cached-token-count})
+         lookup-finished (System/nanoTime)
+         allocation-started lookup-finished
          admission (when admit?
                      (residency/admit-route!
                       pool continuation-id cached-token-count
@@ -535,32 +546,51 @@
                           (page-pool/allocate-route!
                            pool continuation-id cached-token-count
                            {:policy policy
-                            :capacity-reservation capacity-reservation}))]
+                            :capacity-reservation capacity-reservation}))
+         allocation-finished (System/nanoTime)
+         mapping-lifecycle-ns (volatile! 0)
+         gpu-restore-ns (volatile! 0)]
      (try
        (doseq [entry matched]
-         (chunk-store/with-mmap-payload
-          (:chunk-store manager) (:kv/store-key entry)
-          (fn [payload]
-            (when-not (and (= :int16 (:element-type payload))
-                           (= :little-endian (:byte-order payload)))
-              (throw (ex-info "Stored KV chunk is not a little-endian FP16 carrier payload"
-                              {:store-key (:kv/store-key entry)
-                               :element-type (:element-type payload)
-                               :byte-order (:byte-order payload)})))
-            (page-pool/restore-chunk!
-             pool continuation-id
-             {:chunk/start (:kv/start-token entry)
-              :chunk/token-count (:kv/token-count entry)
-              :chunk/layout {:dtype :float16
-                             :attention-state
-                             (assoc (:layout pool) :dtype :float16)}}
-             (:segment payload)))))
+         (let [mapping-started (System/nanoTime)
+               transfer-ns (volatile! 0)]
+           (chunk-store/with-mmap-payload
+            (:chunk-store manager) (:kv/store-key entry)
+            (fn [payload]
+              (when-not (and (= :int16 (:element-type payload))
+                             (= :little-endian (:byte-order payload)))
+                (throw (ex-info "Stored KV chunk is not a little-endian FP16 carrier payload"
+                                {:store-key (:kv/store-key entry)
+                                 :element-type (:element-type payload)
+                                 :byte-order (:byte-order payload)})))
+              (let [started (System/nanoTime)]
+                (page-pool/restore-chunk!
+                 pool continuation-id
+                 {:chunk/start (:kv/start-token entry)
+                  :chunk/token-count (:kv/token-count entry)
+                  :chunk/layout {:dtype :float16
+                                 :attention-state
+                                 (assoc (:layout pool) :dtype :float16)}}
+                 (:segment payload))
+                (vreset! transfer-ns (- (System/nanoTime) started)))))
+           (let [lifecycle-ns (- (System/nanoTime) mapping-started)]
+             (vswap! gpu-restore-ns + @transfer-ns)
+             (vswap! mapping-lifecycle-ns + (- lifecycle-ns @transfer-ns)))))
        (swap! (:metrics manager)
               (fn [metrics]
                 (-> metrics
                     (update :restored-chunks + (count matched))
                     (update :restored-bytes + (reduce + 0 (map :kv/bytes matched))))))
-       (cond-> (assoc lookup-result :resident-route resident-route)
+       (cond-> (assoc lookup-result
+                      :resident-route resident-route
+                      :restore-phase-timings
+                      {:lookup-ms (/ (- lookup-finished lookup-started) 1.0e6)
+                       :route-allocation-ms
+                       (/ (- allocation-finished allocation-started) 1.0e6)
+                       :mapping-lifecycle-ms (/ @mapping-lifecycle-ns 1.0e6)
+                       :gpu-restore-ms (/ @gpu-restore-ns 1.0e6)
+                       :total-ms (/ (- (System/nanoTime) restore-started) 1.0e6)
+                       :chunks (count matched)})
          admission (assoc :admission (dissoc admission :resident-route)))
        (catch Throwable error
          (page-pool/release-route! pool continuation-id)

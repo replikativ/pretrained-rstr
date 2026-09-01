@@ -301,6 +301,11 @@
           (is (= 2 (:cached-token-count limited)))
           (is (= 1 (count (:matched limited))))
           (is (= 4 (:cached-token-count result)))
+          (is (= 2 (get-in result [:restore-phase-timings :chunks])))
+          (is (every? #(not (neg? (double %)))
+                      (map (:restore-phase-timings result)
+                           [:lookup-ms :route-allocation-ms
+                            :mapping-lifecycle-ms :gpu-restore-ms :total-ms])))
           (is (= {:continuation-id :request-a
                   :pages [0 1]
                   :token-count 4
@@ -493,7 +498,8 @@
           (is (every? #(not (neg? (double %)))
                       (map @(:phase-timings ticket)
                            [:context-ms :catalog-lookup-ms :device-export-ms
-                            :local-persistence-ms :capture-total-ms
+                            :local-persistence-ms :mmap-preparation-ms
+                            :capture-total-ms
                             :publication-ms])))
           (is (every? #(not (contains? % :chunk/payload)) stored)
               "completed capture metadata does not retain host staging arrays")

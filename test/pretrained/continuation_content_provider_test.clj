@@ -49,6 +49,11 @@
             placement (content/await-storage-event! provider event)]
         (is (= :local (:tier-id placement)))
         (is (pos? (get-in placement [:attributes :bytes])))
+        (is (= 16 (get-in placement [:attributes :payload-byte-size])))
+        (is (= :int16
+               (get-in placement [:attributes :payload-element-type])))
+        (is (integer?
+             (get-in placement [:attributes :payload-file-offset])))
         (is (map? (content/storage-event-measurement provider event)))
         (content/release-storage-event! provider event))
       (is (chunk-store/stored? local-store (:store-key stored)))
