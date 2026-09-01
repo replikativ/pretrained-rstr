@@ -74,3 +74,43 @@
     (testing "both low-value sharing routes may be removed before a page is free"
       (is (:admissible? plan))
       (is (= [:fork-a :fork-b] (:evictions plan))))))
+
+(deftest capacity-admission-uses-incremental-route-growth
+  (let [snapshot {:physical-pages 4 :page-size 4 :free-pages #{2 3}
+                  :refcounts {0 1, 1 1} :leases {}
+                  :routes
+                  {:running {:continuation-id :running :pages [0]
+                             :token-count 3
+                             :cache/policy {:durable? false}}
+                   :cold {:continuation-id :cold :pages [1]
+                          :token-count 4
+                          :cache/policy {:durable? true}}}}
+        plan (residency/plan-capacity-admission
+              snapshot :running 16)]
+    (is (:admissible? plan))
+    (is (= 3 (:required-pages plan)))
+    (is (= [:cold] (:evictions plan)))
+    (is (not (some #{:running} (:evictions plan))))))
+
+(deftest capacity-admission-reserves-after-eviction
+  (let [pool (fixture-pool
+              {:free (sorted-set 2 3)
+               :refcounts {0 1, 1 1}
+               :leases {}
+               :routes
+               {:running {:continuation-id :running :pages [0]
+                          :token-count 3
+                          :cache/policy {:durable? false}}
+                :cold {:continuation-id :cold :pages [1]
+                       :token-count 4
+                       :cache/policy {:durable? true}}}})
+        result (residency/reserve-admission! pool :running 16)]
+    (is (:admissible? result))
+    (is (= [:cold] (:evictions result)))
+    (is (page-pool/capacity-reservation?
+         (:capacity-reservation result)))
+    (is (= 3 (:reserved-pages (page-pool/stats pool))))
+    (is (some? (page-pool/route pool :running)))
+    (is (nil? (page-pool/route pool :cold)))
+    (is (page-pool/release-capacity!
+         pool (:capacity-reservation result)))))

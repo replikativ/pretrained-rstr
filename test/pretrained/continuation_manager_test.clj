@@ -279,9 +279,12 @@
               _ (.get ^java.util.concurrent.CompletableFuture
                       (:published ticket) 5 TimeUnit/SECONDS)
               _ (page-pool/release-route! pool :source)
+              capacity (page-pool/reserve-capacity! pool :request-a 7)
               result (manager/restore-paged-prefix!
                       cache pool :request-a "fixture-paged-v1"
-                      [1 2 3 4 5 6 7])]
+                      [1 2 3 4 5 6 7]
+                      {:capacity-reservation capacity
+                       :policy {}})]
           (is (= 4 (:cached-token-count result)))
           (is (= {:continuation-id :request-a
                   :pages [0 1]
@@ -301,7 +304,9 @@
                                                        :dst-element 0
                                                        :elements 4}]]
                  @uploads))
-          (is (= 2 (:restored-chunks (manager/stats cache))))))
+          (is (= 2 (:reserved-pages (page-pool/stats pool))))
+          (is (= 2 (:restored-chunks (manager/stats cache))))
+          (is (page-pool/release-capacity! pool capacity))))
       (finally
         (.close cache)
         (d/delete-database config)

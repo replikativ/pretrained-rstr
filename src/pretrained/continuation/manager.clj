@@ -339,16 +339,20 @@
 
   The optional `opts` arity enables `:admit?`. A cost-aware admission then evicts
   only durable, unpinned, unleased routes and installs `:policy` on the restored
-  route. `:protected-continuation-ids` excludes active working-set routes. When
-  admission is disabled, allocation retains the original fail-on-pressure
-  behavior."
+  route. `:protected-continuation-ids` excludes active working-set routes.
+  `:capacity-reservation` claims pages previously held for prompt restoration
+  and subsequent generation; it is mutually exclusive with `:admit?` because
+  admission must occur before the reservation is created."
   ([^Manager manager pool continuation-id model-fingerprint tokens]
    (restore-paged-prefix! manager pool continuation-id model-fingerprint tokens
                           {:policy {}}))
   ([^Manager manager pool continuation-id model-fingerprint tokens
-    {:keys [admit? policy protected-continuation-ids]
+    {:keys [admit? policy protected-continuation-ids capacity-reservation]
      :or {admit? false policy {:durable? true}
           protected-continuation-ids #{}}}]
+   (when (and admit? capacity-reservation)
+     (throw (ex-info "Paged restore cannot admit an existing reservation"
+                     {:continuation-id continuation-id})))
    (let [{:keys [matched cached-token-count] :as lookup-result}
          (lookup-chunk-prefix manager model-fingerprint tokens)
          admission (when admit?
@@ -363,7 +367,8 @@
                           (:resident-route admission)
                           (page-pool/allocate-route!
                            pool continuation-id cached-token-count
-                           {:policy policy}))]
+                           {:policy policy
+                            :capacity-reservation capacity-reservation}))]
      (try
        (doseq [entry matched]
          (chunk-store/with-mmap-payload
