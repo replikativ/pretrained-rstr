@@ -334,8 +334,9 @@
   logical token count defines the processed prefix; a later pending token may be
   present in `tokens`. The accepted capture worker submits retained device-to-host
   downloads and never awaits an incomplete event on the decoder thread. Physical
-  copy/compute overlap remains backend-dependent: current OpenCL uses one physical
-  queue and current Level Zero shared-memory downloads complete inline. Each
+  copy/compute overlap remains backend-dependent: Raster reports an independent
+  OpenCL transfer queue while current Level Zero shared-memory downloads complete
+  inline. Each
   payload is written through the local/tiered Konserve store before the next chunk
   is allocated, bounding host staging to one chunk. Datahike is published only
   after durability. Queue saturation or a chunk larger than

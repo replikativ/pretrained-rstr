@@ -55,7 +55,8 @@
   `:candidate/worker-epoch`, `:candidate/cache-tier`, and non-negative cost and
   capacity fields. `:candidate/cached-token-count` excludes the pending final
   prompt token. `:candidate/exact?` defaults to true; approximate KV reuse is
-  rejected by this protocol.
+  rejected by this protocol. Optional `:candidate/transfer-capabilities` carries
+  the worker's physical transfer contract into request scheduling.
 
   Returns a normalized candidate or throws `ExceptionInfo`."
   [{:candidate/keys [worker-id worker-epoch cache-tier cached-token-count
@@ -74,6 +75,10 @@
                     {:candidate candidate :supported cache-tiers})))
   (when (false? exact?)
     (throw (ex-info "Approximate KV candidates are not executable"
+                    {:candidate candidate})))
+  (when-not (or (nil? (:candidate/transfer-capabilities candidate))
+                (map? (:candidate/transfer-capabilities candidate)))
+    (throw (ex-info "Worker candidate transfer capabilities must be a map"
                     {:candidate candidate})))
   (doseq [[field value]
           [[:candidate/cached-token-count cached-token-count]
@@ -103,6 +108,8 @@
          :candidate/max-context (long max-context)
          :candidate/online? (not (false? online?))
          :candidate/model-loaded? (not (false? model-loaded?))
+         :candidate/transfer-capabilities
+         (or (:candidate/transfer-capabilities candidate) {})
          :candidate/exact? true))
 
 (defn assignment-id

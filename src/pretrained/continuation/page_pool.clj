@@ -419,6 +419,19 @@
   [pool]
   (or (:transfers @(:state pool)) {:counters {} :last nil}))
 
+(defn transfer-capabilities
+  "Return the page pool's physical transfer execution contract.
+
+  `:live-overlap-eligible?` is true only when Raster reports device events on a
+  physical queue independent from compute. It is an admission signal, not a
+  promise that the device will overlap a particular copy and kernel workload."
+  [pool]
+  (let [capabilities (gpu/transfer-capabilities (:session pool))]
+    (assoc capabilities
+           :live-overlap-eligible?
+           (and (= :device-event (:submission capabilities))
+                (true? (:independent-physical-queue? capabilities))))))
+
 (defn prepare-block-transfer!
   "Prepare shared FP16 gather/scatter staging for `token-count` tokens.
 

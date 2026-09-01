@@ -99,7 +99,9 @@
 
   `measurements` supplies `:worker/node`, queue and model-performance costs,
   context capacity, device upload throughput, lower-tier throughputs/fixed
-  costs, and object-store availability. Identity, epoch, loaded models, online
+  costs, and object-store availability. A deterministic simulator may provide
+  `:worker/transfer-capabilities`; a real worker derives them from its page-pool
+  session. Identity, epoch, loaded models, online
   state, page geometry, current free pages, recoverable eviction capacity, and
   exact GPU prefixes are read authoritatively from the controller and pool.
 
@@ -143,6 +145,9 @@
             :worker/evictable-pages
             (residency/evictable-page-count
              snapshot {:protected-continuation-ids protected})
+            :worker/transfer-capabilities
+            (or (:worker/transfer-capabilities measurements)
+                (page-pool/transfer-capabilities (:pool controller)))
             :worker/gpu-prefixes gpu-prefixes})))
 
 (defn- decline-effect

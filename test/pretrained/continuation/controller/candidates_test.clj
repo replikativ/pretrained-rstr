@@ -65,11 +65,17 @@
           :node "worker-a" :tier :ssd :state :kv.replica/ready
           :store-key (random-uuid) :bytes 200}))
       (let [result (first (candidates/candidates
-                           @connection request [(observation {})]
+                           @connection request
+                           [(observation
+                             {:worker/transfer-capabilities
+                              {:live-overlap-eligible? true}})]
                            {:chunk-size 2}))]
         (is (= :ssd (:candidate/cache-tier result)))
         (is (= 4 (:candidate/cached-token-count result)))
-        (is (= 400 (:candidate/cached-bytes result)))))))
+        (is (= 400 (:candidate/cached-bytes result)))
+        (is (true? (get-in result
+                           [:candidate/transfer-capabilities
+                            :live-overlap-eligible?])))))))
 
 (deftest shorter-local-prefix-can-beat-a-long-object-prefix
   (with-catalog

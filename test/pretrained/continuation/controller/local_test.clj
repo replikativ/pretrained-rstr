@@ -165,14 +165,21 @@
                      :prefix-hash prefix}})
         controller (test-controller pool (atom []) (atom []) {})]
     (try
-      (let [result (local/observation
-                    controller
-                    {:worker/node "worker-a"
-                     :worker/queue-ms 3})]
+      (let [result
+            (local/observation
+             controller
+             {:worker/node "worker-a"
+              :worker/queue-ms 3
+              :worker/transfer-capabilities
+              {:backend :simulated
+               :live-overlap-eligible? true}})]
         (is (= :worker-a (:worker/id result)))
         (is (= #{model-fingerprint} (:worker/models result)))
         (is (= 3 (:worker/free-pages result)))
         (is (= 1 (:worker/evictable-pages result)))
+        (is (true? (get-in result
+                           [:worker/transfer-capabilities
+                            :live-overlap-eligible?])))
         (is (= {:continuation-id :resident
                 :token-count 2
                 :bytes 16}
