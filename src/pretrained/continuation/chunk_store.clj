@@ -124,6 +124,21 @@
   [store store-key]
   (kmm/mmap-payload store store-key [:chunk/payload]))
 
+(defn prepare-mmap-payload!
+  "Validate and initialize no-copy access to an immutable chunk payload.
+
+  Opens and immediately closes the same scoped mapping used by restoration,
+  returning its serializable location and element descriptor without the live
+  segment. This deliberately runs Boring navigation and FFM initialization at
+  checkpoint/localization time, keeping their one-time cost off a later
+  inference request. It does not copy or decode tensor elements."
+  [store store-key]
+  (let [[payload arena] (mmap-payload store store-key)]
+    (try
+      (dissoc payload :segment)
+      (finally
+        (.close ^AutoCloseable arena)))))
+
 (defn with-mmap-payload
   "Call `consume!` with a scoped no-copy payload descriptor.
 

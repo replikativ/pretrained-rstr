@@ -72,6 +72,16 @@
      :p95-ms (percentile sorted-samples 0.95)
      :max-ms (peek sorted-samples)}))
 
+(defn- summarize-phase-timings
+  [samples]
+  (let [phase-maps (vec (keep :restore-phase-timings samples))]
+    (when (seq phase-maps)
+      (into {}
+            (for [phase [:lookup-ms :route-allocation-ms
+                         :mapping-lifecycle-ms :gpu-restore-ms :total-ms]
+                  :when (every? #(number? (get % phase)) phase-maps)]
+              [phase (summarize-ms (mapv phase phase-maps))])))))
+
 (defn- checkpoint-paged!
   [cache pool continuation-id model-fingerprint prompt-ids
    foreground! maximum-foreground-steps transfer-capabilities]
@@ -158,7 +168,9 @@
           restore
           (assoc :prefix-load-ms restore-ms
                  :cached-token-count
-                 (get-in restore [:value :cached-token-count]))
+                 (get-in restore [:value :cached-token-count])
+                 :restore-phase-timings
+                 (get-in restore [:value :restore-phase-timings]))
           transfer
           (assoc :prefix-transfer transfer)))
       (finally
@@ -183,6 +195,7 @@
      :total (summarize-ms (mapv :total-ms samples))
      :prefix-load (when (every? :prefix-load-ms samples)
                     (summarize-ms (mapv :prefix-load-ms samples)))
+     :prefix-load-phases (summarize-phase-timings samples)
      :prefix-transfer (when (seq transfer-samples)
                         {:samples transfer-samples
                          :totals (sum-transfer-differences transfer-samples)})}))

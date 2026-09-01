@@ -39,6 +39,12 @@
                (:store-key first-write)))
         (is (= (:store-key first-write) (:store-key second-write)))
         (is (= (:bytes first-write) (:bytes second-write)))
+        (let [prepared (chunk-store/prepare-mmap-payload!
+                        store (:store-key first-write))]
+          (is (= 16 (:byte-size prepared)))
+          (is (= :int16 (:element-type prepared)))
+          (is (integer? (:file-offset prepared)))
+          (is (not (contains? prepared :segment))))
         (chunk-store/with-mmap-payload
          store (:store-key first-write)
          (fn [payload]

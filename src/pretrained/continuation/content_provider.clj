@@ -135,12 +135,16 @@
         ;; makes localization completion a real local-readiness boundary.
         (when-not (chunk-store/stored? local-store store-key)
           (chunk-store/put! local-store chunk))))
-    (let [{:keys [bytes path]} (chunk-store/describe local-store store-key)]
+    (let [{:keys [bytes path]} (chunk-store/describe local-store store-key)
+          payload (chunk-store/prepare-mmap-payload! local-store store-key)]
       (content/content-placement
        {:provider-id (get-in provider [:descriptor :id])
         :tier-id :local
         :content address
         :attributes {:store-key store-key :bytes bytes :path path
+                     :payload-file-offset (:file-offset payload)
+                     :payload-byte-size (:byte-size payload)
+                     :payload-element-type (:element-type payload)
                      :source-tier (if local? :local :authoritative)
                      :transferred-bytes (if local? 0 bytes)}}))))
 
@@ -217,7 +221,9 @@
 
   `local-store` must support `konserve.mmap`. `read-store` may be a tiered
   frontend-first store and defaults to the local store. The caller owns both
-  stores; the returned provider owns only its localization executor."
+  stores; the returned provider owns only its localization executor.
+  Localization validates and prepares the scoped tensor mapping, so first-use
+  Boring/FFM initialization completes before the placement becomes ready."
   ([local-store] (open-provider local-store local-store {}))
   ([local-store read-store] (open-provider local-store read-store {}))
   ([local-store read-store {:keys [max-concurrent-localizations]
