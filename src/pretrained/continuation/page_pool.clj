@@ -6,6 +6,7 @@
   while Raster owns the stable device allocations and checked buffer views."
   (:require [pretrained.attention-state :as attention-state]
             [pretrained.continuation.block-transfer :as block-transfer]
+            [pretrained.continuation.telemetry :as telemetry]
             [raster.gpu.core :as gpu])
   (:import [java.lang AutoCloseable]
            [java.lang.foreign MemorySegment]
@@ -104,23 +105,37 @@
   [pool measurement]
   (let [counter-key [(:direction measurement)
                      (:timing-source measurement)
-                     (boolean (:asynchronous? measurement))]]
+                     (boolean (:asynchronous? measurement))]
+        bytes (long (:bytes measurement 0))
+        host-wall-ns (long (:host-wall-ns measurement 0))
+        throughput-metric
+        (case (:direction measurement)
+          :upload :gpu-upload-bytes-per-ms
+          :download :gpu-download-bytes-per-ms
+          nil)]
     (swap! (:state pool)
            (fn [state]
-             (-> state
-                 (assoc-in [:transfers :last] measurement)
-                 (update-in [:transfers :counters counter-key :submissions]
-                            (fnil inc 0))
-                 (update-in [:transfers :counters counter-key :bytes]
-                            (fnil + 0) (long (:bytes measurement 0)))
-                 (update-in [:transfers :counters counter-key :commands]
-                            (fnil + 0) (long (:commands measurement 0)))
-                 (update-in [:transfers :counters counter-key :elapsed-ns]
-                            (fnil + 0) (long (:elapsed-ns measurement 0)))
-                 (update-in [:transfers :counters counter-key :submit-host-ns]
-                            (fnil + 0) (long (:submit-host-ns measurement 0)))
-                 (update-in [:transfers :counters counter-key :host-wall-ns]
-                            (fnil + 0) (long (:host-wall-ns measurement 0))))))))
+             (cond-> (-> state
+                         (assoc-in [:transfers :last] measurement)
+                         (update-in [:transfers :counters counter-key :submissions]
+                                    (fnil inc 0))
+                         (update-in [:transfers :counters counter-key :bytes]
+                                    (fnil + 0) bytes)
+                         (update-in [:transfers :counters counter-key :commands]
+                                    (fnil + 0) (long (:commands measurement 0)))
+                         (update-in [:transfers :counters counter-key :elapsed-ns]
+                                    (fnil + 0) (long (:elapsed-ns measurement 0)))
+                         (update-in [:transfers :counters counter-key :submit-host-ns]
+                                    (fnil + 0)
+                                    (long (:submit-host-ns measurement 0)))
+                         (update-in [:transfers :counters counter-key :host-wall-ns]
+                                    (fnil + 0) host-wall-ns))
+               (and throughput-metric (pos? bytes) (pos? host-wall-ns))
+               (update-in [:transfers :calibration]
+                          telemetry/record throughput-metric
+                          (/ (double bytes) (/ host-wall-ns 1.0e6))
+                          (get state :calibration-alpha
+                               telemetry/default-alpha)))))))
 
 (defn- transfer-ranges-measured!
   [pool direction entries]
@@ -222,18 +237,26 @@
 
   `opts` requires positive `:page-size` and `:physical-pages`. `:dtype` defaults
   to FP16, the current Raster routed-attention storage format. `:key-prefix` may
-  be supplied when deterministic session buffer names are useful. Returns a
-  `DevicePagePool`; callers must close the owning Raster session.
+  be supplied when deterministic session buffer names are useful, and
+  `:calibration-alpha` controls transfer-throughput EWMA smoothing (default
+  0.2). Returns a `DevicePagePool`; callers must close the owning Raster session.
 
   Throws when the layout is malformed, the dtype is unsupported, or allocation
   fails. Allocation rollback is owned by Raster's session lifecycle."
-  [session layout {:keys [page-size physical-pages dtype key-prefix]
-                   :or {dtype :half}}]
+  [session layout {:keys [page-size physical-pages dtype key-prefix
+                          calibration-alpha]
+                   :or {dtype :half
+                        calibration-alpha telemetry/default-alpha}}]
   (let [page-size (checked-positive :page-size page-size)
         physical-pages (checked-positive :physical-pages physical-pages)
         dtype (canonical-dtype dtype)
         prefix (or key-prefix (str "paged-" (UUID/randomUUID)))
         slabs (:slabs layout)]
+    (when-not (and (number? calibration-alpha)
+                   (< 0.0 (double calibration-alpha))
+                   (<= (double calibration-alpha) 1.0))
+      (throw (ex-info "Page-pool calibration alpha must be in (0,1]"
+                      {:calibration-alpha calibration-alpha})))
     (when-not (and (map? layout) (seq slabs))
       (throw (ex-info "Page pool requires a resolved attention-state layout"
                       {:layout layout})))
@@ -276,6 +299,7 @@
               :capacity-reservations {}
               :routes {}
               :block-transfer-engines {}
+              :calibration-alpha (double calibration-alpha)
               :transfers {:counters {} :last nil}})))))
 
 (defn buffer-keys

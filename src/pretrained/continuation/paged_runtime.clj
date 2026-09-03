@@ -8,7 +8,8 @@
   or Kabel protocols."
   (:require [pretrained.continuation.page-pool :as page-pool]
             [pretrained.continuation.paged-decoder :as paged-decoder]
-            [pretrained.continuation.scheduler :as scheduler])
+            [pretrained.continuation.scheduler :as scheduler]
+            [pretrained.continuation.telemetry :as telemetry])
   (:import (java.io Closeable)
            (java.util UUID)
            (java.util.concurrent CancellationException CompletableFuture
@@ -116,6 +117,10 @@
                    (update :bulk-prefill-tiles (fnil inc 0))
                    (update :bulk-prefill-tokens (fnil + 0) tile-size)
                    (update :bulk-prefill-nanos (fnil + 0) elapsed-nanos)
+                   (update :calibration telemetry/record
+                           :prefill-ms-per-token
+                           (/ (/ elapsed-nanos 1.0e6) tile-size)
+                           (:calibration-alpha runtime))
                    (assoc :lanes (lane-summary next-lanes)
                           :deferred-count (count deferred)))))
       (cond
@@ -223,10 +228,17 @@
         (if-let [bulk-job (bulk-prefill-job runtime lane-plan)]
           (execute-bulk-prefill! runtime lane-plan deferred bulk-job)
           (let [primes (prime-values lane-plan)
-                work (lane-work (:lanes lane-plan))]
+                work (lane-work (:lanes lane-plan))
+                work-jobs (filterv #(some? (:lane/index %)) (:lanes lane-plan))
+                phases (mapv :request/phase work-jobs)
+                first-token? (some #(and (= :decode (:request/phase %))
+                                         (empty? (:job/output %)))
+                                   work-jobs)
+                started (System/nanoTime)]
             (when (seq primes)
               ((:prime-lanes! runtime) (:decoder runtime) primes))
             (let [results ((:step-lanes! runtime) (:decoder runtime) work)
+                  elapsed-ms (/ (- (System/nanoTime) started) 1.0e6)
                   by-lane (into {} (map (juxt :lane identity)) results)
                   advanced
                   (mapv (fn [{:keys [lane/index] :as job}]
@@ -237,11 +249,29 @@
                   next-lanes (mapv :next-lane advanced)]
               (swap! (:state runtime)
                      (fn [state]
-                       (-> state
-                           (update :iterations inc)
-                           (update :scheduled-tokens + (count work))
-                           (assoc :lanes (lane-summary next-lanes)
-                                  :deferred-count (count deferred)))))
+                       (cond-> (-> state
+                                   (update :iterations inc)
+                                   (update :scheduled-tokens + (count work))
+                                   (update :calibration telemetry/record
+                                           :iteration-ms elapsed-ms
+                                           (:calibration-alpha runtime))
+                                   (assoc :lanes (lane-summary next-lanes)
+                                          :deferred-count (count deferred)))
+                         (and (seq phases) (every? #{:decode} phases))
+                         (update :calibration telemetry/record
+                                 :decode-iteration-ms elapsed-ms
+                                 (:calibration-alpha runtime))
+
+                         (and (seq phases) (every? #{:prefill} phases))
+                         (update :calibration telemetry/record
+                                 :prefill-ms-per-token
+                                 (/ elapsed-ms (count phases))
+                                 (:calibration-alpha runtime))
+
+                         first-token?
+                         (update :calibration telemetry/record
+                                 :first-token-ms elapsed-ms
+                                 (:calibration-alpha runtime)))))
               (doseq [{:keys [job completion]} advanced
                       :when completion]
                 (let [[action value] completion]
@@ -292,7 +322,7 @@
 (defrecord PagedRuntime
     [decoder capacity minimum-prefill-tokens eos-ids max-position prime-lanes!
      step-lanes! prefill-range! prefill-tile-size route-token-count inbound
-     registry arrival state thread on-error! closed?]
+     registry arrival state calibration-alpha thread on-error! closed?]
   Closeable
   (close [this]
     (locking this
@@ -317,8 +347,9 @@
   ([decoder] (open-runtime decoder {}))
   ([decoder {:keys [capacity minimum-prefill-tokens eos-ids max-position
                     prime-lanes! step-lanes! prefill-range! prefill-tile-size
-                    route-token-count on-error!]
+                    route-token-count calibration-alpha on-error!]
              :or {eos-ids #{}
+                  calibration-alpha telemetry/default-alpha
                   on-error! (fn [error] (.printStackTrace ^Throwable error))}}]
    (let [capacity (or capacity (get-in decoder [:decode-state :batch-size]) 1)
          decoder-capacity (get-in decoder [:decode-state :batch-size])
@@ -371,6 +402,11 @@
      (when-not (every? integer? eos-ids)
        (throw (ex-info "Paged runtime EOS ids must be integers"
                        {:eos-ids eos-ids})))
+     (when-not (and (number? calibration-alpha)
+                    (< 0.0 (double calibration-alpha))
+                    (<= (double calibration-alpha) 1.0))
+       (throw (ex-info "Runtime calibration alpha must be in (0,1]"
+                       {:calibration-alpha calibration-alpha})))
      (let [holder (atom nil)
            runtime (map->PagedRuntime
                     {:decoder decoder
@@ -394,8 +430,10 @@
                                    :bulk-prefill-tiles 0
                                    :bulk-prefill-tokens 0
                                    :bulk-prefill-nanos 0
+                                   :calibration {}
                                    :lanes (vec (repeat capacity nil))
                                    :deferred-count 0})
+                     :calibration-alpha (double calibration-alpha)
                      :on-error! on-error!
                      :closed? (atom false)})
            thread (Thread. ^Runnable

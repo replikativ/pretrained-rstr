@@ -208,6 +208,10 @@
         (is (= 6 (:bulk-prefill-tokens state)))
         (is (= 3 (:prefill-tile-size state)))
         (is (number? (:bulk-prefill-ms-per-token state)))
+        (is (= 3 (get-in state
+                         [:calibration :prefill-ms-per-token :count])))
+        (is (number? (get-in state
+                             [:calibration :prefill-ms-per-token :ewma])))
         (is (= 7 (:scheduled-tokens state))))
       (finally
         (.close runtime)))))

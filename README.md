@@ -206,6 +206,41 @@ OpenCL has an independent transfer queue, while Level Zero shared-memory capture
 currently copies inline. Independent queues make live overlap eligible; measured
 event and decode timings still determine whether a device benefits under load.
 
+Workers can publish live smoothed costs instead of relying indefinitely on
+deployment constants. The supplier below preserves configured values until the
+corresponding runtime has produced a sample, then substitutes worker-local
+prefill, first-token, and GPU restore EWMAs. It also attaches sample counts and
+bounds under `:worker/live-calibration`, so policy code can distinguish a first
+sample from an established estimate:
+
+```clojure
+(require '[pretrained.continuation.calibration :as calibration]
+         '[pretrained.continuation.controller.kabel :as kabel]
+         '[pretrained.continuation.paged-runtime :as paged-runtime])
+
+(def live-measurements
+  (calibration/measurements-fn
+   runtime cache (:pool decoder)
+   {:worker/prefill-ms-per-token 1.0
+    :worker/first-token-ms 20.0
+    :worker/gpu-restore-bytes-per-ms 1000000.0}))
+
+(kabel/open-worker-endpoint
+ (:pool decoder)
+ {:worker/id worker-id
+  :worker/epoch 0
+  :worker/models #{model-fingerprint}}
+ (merge (paged-runtime/controller-submission runtime 64)
+        {:handlers handlers
+         :measurements live-measurements}))
+```
+
+The calibration measures accelerator execution separately from queue delay.
+This keeps hardware cost stable under load; queued demand remains an explicit
+controller input rather than being counted both as latency and as backlog.
+Checkpoint EWMAs are exported in the attached calibration for admission and
+retention policies, but are not candidate-routing fields.
+
 For an already loaded model, the benchmark helper separates prefill, checkpoint
 submission and durability, prefix restore, uncached suffix work, first-token
 latency, and context-indexed steady decode:

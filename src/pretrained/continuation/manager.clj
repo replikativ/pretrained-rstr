@@ -11,6 +11,7 @@
             [pretrained.continuation.page-pool :as page-pool]
             [pretrained.continuation.residency :as residency]
             [pretrained.continuation.store :as store]
+            [pretrained.continuation.telemetry :as telemetry]
             [raster.runtime.numerical-content :as content])
   (:import [java.io Closeable]
            [java.lang AutoCloseable]
@@ -25,7 +26,7 @@
 
 (defrecord Manager [connection owns-connection? directory chunk-store chunk-write-store
                     content-provider chunk-size max-chunk-staging-bytes
-                    capture-executor publish-executor closed? metrics]
+                    calibration-alpha capture-executor publish-executor closed? metrics]
   Closeable
   (close [manager] (close-manager! manager)))
 
@@ -116,7 +117,8 @@
   `:max-pending-publications`, and `:max-concurrent-localizations` (all default
   to 2), `:chunk-size` (default 256 processed tokens), and
   `:max-chunk-staging-bytes` (default 256 MiB), and `:warm-catalog-query?`
-  (default true). Warming executes one empty-result chunk lookup while opening
+  (default true). `:calibration-alpha` controls live EWMA smoothing and defaults
+  to 0.2. Warming executes one empty-result chunk lookup while opening
   the manager so Datahike query compilation cannot extend the first accepted
   checkpoint's route lifetime. Paged checkpoints whose single
   host payload would exceed that byte limit are rejected before queueing.
@@ -131,23 +133,28 @@
   ([datahike-config directory {:keys [max-pending-captures max-pending-publications
                                       max-concurrent-localizations chunk-size
                                       max-chunk-staging-bytes chunk-backend-store connection
-                                      warm-catalog-query?]
+                                      warm-catalog-query? calibration-alpha]
                                :or {max-pending-captures 2
                                     max-pending-publications 2
                                     max-concurrent-localizations 2
                                     chunk-size chunk/default-chunk-size
                                     max-chunk-staging-bytes (* 256 1024 1024)
-                                    warm-catalog-query? true}}]
+                                    warm-catalog-query? true
+                                    calibration-alpha telemetry/default-alpha}}]
    (when-not (and (pos? max-pending-captures) (pos? max-pending-publications)
                   (pos? max-concurrent-localizations) (pos? chunk-size)
                   (integer? max-chunk-staging-bytes)
-                  (pos? max-chunk-staging-bytes))
+                  (pos? max-chunk-staging-bytes)
+                  (number? calibration-alpha)
+                  (< 0.0 (double calibration-alpha))
+                  (<= (double calibration-alpha) 1.0))
      (throw (ex-info "Checkpoint capacities must be positive"
                      {:max-pending-captures max-pending-captures
                       :max-pending-publications max-pending-publications
                       :max-concurrent-localizations max-concurrent-localizations
                       :chunk-size chunk-size
-                      :max-chunk-staging-bytes max-chunk-staging-bytes})))
+                      :max-chunk-staging-bytes max-chunk-staging-bytes
+                      :calibration-alpha calibration-alpha})))
    (let [path (.toPath (java.io.File. (str directory)))
          chunk-path (.resolve path "chunks")]
      (Files/createDirectories path (make-array java.nio.file.attribute.FileAttribute 0))
@@ -173,6 +180,7 @@
                        {:max-concurrent-localizations max-concurrent-localizations})
                       (long chunk-size)
                       (long max-chunk-staging-bytes)
+                      (double calibration-alpha)
                       (bounded-executor "pretrained-kv-capture-" max-pending-captures)
                       (bounded-executor "pretrained-kv-publish-" max-pending-publications)
                       (AtomicBoolean. false)
@@ -282,6 +290,8 @@
                             stored))
                         missing)
                   capture-finished (System/nanoTime)
+                  capture-ms (/ (- capture-finished capture-started) 1.0e6)
+                  stored-bytes (reduce + 0 (map :bytes stored))
                   _ (reset! phase-timings
                             {:context-ms (/ (- context-finished context-started)
                                             1.0e6)
@@ -290,10 +300,20 @@
                              :device-export-ms (/ @export-ns 1.0e6)
                              :local-persistence-ms (/ @persistence-ns 1.0e6)
                              :mmap-preparation-ms (/ @mmap-preparation-ns 1.0e6)
-                             :capture-total-ms
-                             (/ (- capture-finished capture-started) 1.0e6)
+                             :capture-total-ms capture-ms
                              :planned-chunks (count plan)
                              :stored-chunks (count missing)})
+                  _ (swap! (:metrics manager)
+                           (fn [metrics]
+                             (cond->
+                              (update metrics :calibration telemetry/record
+                                      :checkpoint-ms capture-ms
+                                      (:calibration-alpha manager))
+                               (pos? stored-bytes)
+                               (update :calibration telemetry/record
+                                       :checkpoint-ms-per-byte
+                                       (/ capture-ms stored-bytes)
+                                       (:calibration-alpha manager)))))
                   publish-task
                   (fn []
                     (try

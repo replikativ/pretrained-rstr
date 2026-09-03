@@ -247,7 +247,11 @@
                (mapv #(get-in % [2 :src-element]) @uploads)))
         (is (every? #(= 4 (get-in % [2 :elements])) @uploads)))
       (is (= 64 (get-in (page-pool/transfer-stats pool)
-                        [:counters [:upload :device-event true] :bytes]))))))
+                        [:counters [:upload :device-event true] :bytes])))
+      (is (= 1 (get-in (page-pool/transfer-stats pool)
+                       [:calibration :gpu-upload-bytes-per-ms :count])))
+      (is (pos? (get-in (page-pool/transfer-stats pool)
+                        [:calibration :gpu-upload-bytes-per-ms :ewma]))))))
 
 (deftest durable-chunk-coalesces-contiguous-physical-pages
   (let [uploads (atom nil)

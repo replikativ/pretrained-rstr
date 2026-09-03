@@ -503,6 +503,12 @@
                             :publication-ms])))
           (is (every? #(not (contains? % :chunk/payload)) stored)
               "completed capture metadata does not retain host staging arrays")
+          (is (= 1 (get-in (manager/stats cache)
+                           [:calibration :checkpoint-ms :count])))
+          (is (pos? (get-in (manager/stats cache)
+                            [:calibration :checkpoint-ms :ewma])))
+          (is (= 1 (get-in (manager/stats cache)
+                           [:calibration :checkpoint-ms-per-byte :count])))
           (is (= [0 2] (mapv (comp :chunk/start second) @captured)))
           (is (= 4 (:cached-token-count lookup)))))
       (finally
