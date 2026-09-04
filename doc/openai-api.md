@@ -89,5 +89,27 @@ for chunk in result:
 The placeholder API key satisfies the client constructor; the embedded server
 does not currently authenticate it.
 
+## Cluster composition
+
+`pretrained.openai.cluster/open-server` owns the lifecycle wiring between HTTP
+ingress and a Datahike-backed Kabel router. Worker sockets attach through its
+`router-middleware`; only control messages and token results cross Kabel, while
+KV chunks remain on the Konserve placement path. The model-free live showcase
+runs two actual worker WebSockets behind one HTTP/SSE listener:
+
+```clojure
+;; clojure -M:distributed-demo
+(require '[pretrained.continuation-kabel-demo :as demo])
+(demo/run-openai-live-simulation)
+;; => {:http-status 200, :selected-worker :fast-gpu,
+;;     :text "<101><102>", :cached-token-count 0, ...}
+```
+
+Its opt-in regression test is:
+
+```sh
+clojure -M:test:distributed-demo:distributed-test -d test-distributed
+```
+
 Authentication, quotas, TLS termination, and production rate limiting belong
 at the deployment boundary and are not part of the first embedded server.

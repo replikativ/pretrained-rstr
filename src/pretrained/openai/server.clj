@@ -150,6 +150,12 @@
   [server delivery]
   (let [request-id (:request/id delivery)]
     (when-let [session (get @(:sessions server) request-id)]
+      (when (contains? #{:completed :cancelled :error}
+                       (:response/type delivery))
+        ;; HTTP-kit may invoke on-close synchronously from a close-after-send.
+        ;; Mark terminal delivery first so that normal completion is not
+        ;; misclassified as a client disconnect and redundantly cancelled.
+        (reset! (:terminal? session) true))
       (if (:stream? session)
         (doseq [value (openai/stream-values (:context session) delivery)]
           (enqueue! server request-id session
@@ -192,6 +198,7 @@
                          :pending (atom clojure.lang.PersistentQueue/EMPTY)
                          :draining? (atom false)
                          :headers-sent? (atom false)
+                         :terminal? (atom false)
                          :overflowed? (atom false)}]
             (swap! (:sessions server) assoc request-id session)
             (try
@@ -204,7 +211,8 @@
         (fn [_ _]
           (when-let [session (get @(:sessions server) request-id)]
             (finish-session! server request-id session)
-            (try ((:cancel! server) request-id) (catch Throwable _))))}))
+            (when-not @(:terminal? session)
+              (try ((:cancel! server) request-id) (catch Throwable _)))))}))
     (catch Throwable error
       (json-response 400 (openai/error-object error)))))
 

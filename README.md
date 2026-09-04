@@ -159,6 +159,11 @@ acknowledgements, and fenced terminal results:
 (kabel-demo/run-live-simulation)
 ;; => {:selected-worker :fast-gpu,
 ;;     :tokens [101 102], :phase :completed, :observed-workers 2}
+
+;; The same two worker sockets behind the OpenAI HTTP/SSE gateway:
+(kabel-demo/run-openai-live-simulation)
+;; => {:http-status 200, :selected-worker :fast-gpu,
+;;     :text "<101><102>", :cached-token-count 0, ...}
 ```
 
 It is model-free and does not send tensors through Kabel. The optional
