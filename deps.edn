@@ -47,6 +47,10 @@
                 org.replikativ/konserve-s3 {:mvn/version "0.1.38"}
                 org.replikativ/http-kit {:mvn/version "2.9.0-beta4-replikativ.1"}}}
 
+  ;; Socket-level tests for the optional distributed demos. Compose with
+  ;; `:test:distributed-demo` so ordinary demo consumers do not see test code.
+  :distributed-test {:extra-paths ["test-distributed"]}
+
   ;; Optional OpenAI-compatible HTTP/SSE ingress. The replikativ http-kit fork
   ;; exposes outbound queued-byte watermarks used to isolate slow clients from
   ;; the controller and device-owning decode loop.
