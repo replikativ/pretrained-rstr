@@ -50,7 +50,8 @@
                 (server/deliver! @holder
                                  {:request/id id :response/type :completed
                                   :response/value
-                                  {:status :completed :tokens [65 66]}}))))
+                                  {:status :completed :tokens [65 66]
+                                   :cached-token-count 1}}))))
           :cancel! #(swap! cancellations conj %)
           :server-options {:port 0}})]
     (reset! holder instance)
@@ -74,6 +75,8 @@
         (is (= 200 (:status completion)))
         (is (= "AB" (get-in completion-body [:choices 0 :message :content])))
         (is (= 2 (get-in completion-body [:usage :completion_tokens])))
+        (is (= 1 (get-in completion-body
+                         [:usage :prompt_tokens_details :cached_tokens])))
         (is (= "gemma/fingerprint-v1"
                (:request/model-fingerprint (first @deliveries)))))
       (finally
@@ -98,6 +101,7 @@
         (is (str/includes? body "\"content\":\"<65>\""))
         (is (str/includes? body "\"content\":\"<66>\""))
         (is (str/includes? body "\"completion_tokens\":2"))
+        (is (str/includes? body "\"cached_tokens\":1"))
         (is (str/ends-with? body "data: [DONE]\n\n")))
       (finally
         (.close instance)))))

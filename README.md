@@ -38,13 +38,13 @@ transport. See [Numerical memory beyond LLM inference](doc/numerical-memory.md).
 
 ## Install
 
-Use JDK 21 or newer and add the latest released library to `deps.edn`:
+Use JDK 21 or newer and add a released library version to `deps.edn`:
 
 ```clojure
-{:deps {org.replikativ/pretrained-rstr {:mvn/version "0.1.26"}}}
+{:deps {org.replikativ/pretrained-rstr {:mvn/version "0.1.42"}}}
 ```
 
-The source tree currently targets Raster `0.2.425`. OpenBLAS is required for
+The source tree currently targets Raster `0.2.545`. OpenBLAS is required for
 floating-point GEMM paths. ffmpeg is optional for non-WAV audio. GPU execution
 requires Level Zero on Intel or a compatible OpenCL ICD on Intel, NVIDIA, or AMD.
 

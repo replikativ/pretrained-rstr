@@ -33,7 +33,8 @@
         {prefilling :state prefill-effects :effects}
         (worker/transition accepted {:event/type :worker/restore-result
                                      :assignment/id [:r1 1]
-                                     :event/ok? true})
+                                     :event/ok? true
+                                     :event/cached-token-count 12})
         {decoding :state decode-effects :effects}
         (worker/transition prefilling {:event/type :worker/prefill-result
                                        :assignment/id [:r1 1]
@@ -52,7 +53,10 @@
            (get-in completed [:state :worker/assignments [:r1 1]
                               :assignment/phase])))
     (is (= [9 10]
-           (get-in completed [:effects 0 :event/result :tokens])))))
+           (get-in completed [:effects 0 :event/result :tokens])))
+    (is (= 12
+           (get-in completed [:effects 0 :event/result
+                              :cached-token-count])))))
 
 (deftest stale-router-snapshot-cannot-overcommit-worker
   (let [initial (worker/initial-state

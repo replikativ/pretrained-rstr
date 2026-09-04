@@ -59,10 +59,35 @@ Replikativ HTTP-kit distribution. It:
 6. configures a hard per-connection queued-byte ceiling;
 7. returns OpenAI-shaped JSON errors with appropriate HTTP status codes.
 
+Terminal usage reports the actual reusable KV prefix as
+`usage.prompt_tokens_details.cached_tokens`. The worker records the count
+returned by restore, rather than the router's potentially stale cache estimate,
+and carries it through the assignment-fenced terminal result.
+
 Integration tests exercise model listing, streamed and non-streamed chat,
-usage, errors, and disconnect cancellation over a real TCP listener. A standard
-OpenAI SDK smoke test with only `base_url` changed is the remaining compatibility
-gate before calling the endpoint complete.
+usage, errors, and disconnect cancellation over a real TCP listener. The same
+surface has been exercised with the Python `openai` 2.21.0 client for model
+listing, non-streamed completion, streamed deltas, and streamed usage with only
+`base_url` redirected:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="local")
+result = client.chat.completions.create(
+    model="gemma-3-270m-it",
+    messages=[{"role": "user", "content": "Explain KV caching briefly."}],
+    stream=True,
+    stream_options={"include_usage": True},
+)
+
+for chunk in result:
+    if chunk.choices:
+        print(chunk.choices[0].delta.content or "", end="", flush=True)
+```
+
+The placeholder API key satisfies the client constructor; the embedded server
+does not currently authenticate it.
 
 Authentication, quotas, TLS termination, and production rate limiting belong
 at the deployment boundary and are not part of the first embedded server.

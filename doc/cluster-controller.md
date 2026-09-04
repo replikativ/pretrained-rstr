@@ -151,8 +151,9 @@ and produces streamed chunk, terminal response, usage, error, and SSE values.
 `pretrained.openai.server` binds those values to the Replikativ HTTP-kit fork.
 It exposes chat completions and model listing, cancels on disconnect, bounds its
 application event queue, and observes the socket's queued-byte watermarks before
-offering more SSE data. A standard OpenAI-client smoke test and real model
-execution remain required before the server is advertised as complete.
+offering more SSE data. An OpenAI Python client smoke test now covers model
+listing, non-streamed completion, streamed deltas, and usage. Real model
+execution remains required before the server is advertised as complete.
 
 ## Next executable slice
 
@@ -166,9 +167,10 @@ The remaining Gemma path is concrete:
    tokens, eviction reasons, and inference/checkpoint overlap.
 
 The live model-free demo now executes the complete observation, selection,
-offer, acknowledgement, and result path across two local Kabel WebSocket
-connections. The implementation does not yet claim a production deployment,
-token streaming, multi-process Gemma execution, or LMCache-beating throughput.
+offer, acknowledgement, streamed token, and terminal-result path across two
+local Kabel WebSocket connections. The implementation does not yet claim a
+production deployment, multi-process Gemma execution, or LMCache-beating
+throughput.
 Localize/upload and device/host checkpoint capture are now scheduled outside the
 decoder loop, and checkpoint chunks have byte-aware host-staging admission.
 Physical transfer/compute overlap is not yet guaranteed by Raster's current

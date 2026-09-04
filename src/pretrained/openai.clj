@@ -147,6 +147,16 @@
        (:request/max-new-tokens context)) "length"
     :else "stop"))
 
+(defn- usage
+  [context result]
+  (let [prompt-tokens (long (:prompt-tokens context))
+        completion-tokens (count (:tokens result))
+        cached-tokens (long (or (:cached-token-count result) 0))]
+    {:prompt_tokens prompt-tokens
+     :completion_tokens completion-tokens
+     :total_tokens (+ prompt-tokens completion-tokens)
+     :prompt_tokens_details {:cached_tokens cached-tokens}}))
+
 (defn stream-values
   "Convert one fenced controller delivery into zero or more SSE payload values.
 
@@ -168,7 +178,6 @@
 
     :completed
     (let [result (:response/value delivery)
-          completion-tokens (count (:tokens result))
           final-chunk
           {:id (:id context)
            :object "chat.completion.chunk"
@@ -182,10 +191,7 @@
            :created (:created context)
            :model (:model context)
            :choices []
-           :usage {:prompt_tokens (:prompt-tokens context)
-                   :completion_tokens completion-tokens
-                   :total_tokens (+ (:prompt-tokens context)
-                                    completion-tokens)}}]
+           :usage (usage context result)}]
       (cond-> [final-chunk]
         (:include-usage? context) (conj usage-chunk)
         true (conj :done)))
@@ -204,8 +210,7 @@
   (if (= :completed (:response/type delivery))
     (let [result (:response/value delivery)
           tokens (:tokens result)
-          text ((:decode-tokens context) tokens)
-          completion-tokens (count tokens)]
+          text ((:decode-tokens context) tokens)]
       {:id (:id context)
        :object "chat.completion"
        :created (:created context)
@@ -213,9 +218,7 @@
        :choices [{:index 0
                   :message {:role "assistant" :content text}
                   :finish_reason (finish-reason context result)}]
-       :usage {:prompt_tokens (:prompt-tokens context)
-               :completion_tokens completion-tokens
-               :total_tokens (+ (:prompt-tokens context) completion-tokens)}})
+       :usage (usage context result)})
     (error-object (or (:response/error delivery) (:response/type delivery)))))
 
 (defn sse

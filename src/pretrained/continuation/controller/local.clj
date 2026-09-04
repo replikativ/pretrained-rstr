@@ -247,11 +247,13 @@
   (merge {:event/type (get operation-result-types (:effect/op effect))
           :assignment/id (:assignment/id effect)
           :event/ok? (not (false? (:ok? result)))}
-         (select-keys result [:reason :tokens])
+         (select-keys result [:reason :tokens :cached-token-count])
          (when (contains? result :reason)
            {:event/reason (:reason result)})
          (when (contains? result :tokens)
-           {:event/tokens (:tokens result)})))
+           {:event/tokens (:tokens result)})
+         (when (contains? result :cached-token-count)
+           {:event/cached-token-count (:cached-token-count result)})))
 
 (defn- release-assignment!
   [controller assignment-id]

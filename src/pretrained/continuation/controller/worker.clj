@@ -188,7 +188,14 @@
       (if-not (:event/ok? event)
         (fail-assignment state assignment
                          (or (:event/reason event) :restore-failed))
-        (let [missing (get-in assignment [:assignment/candidate
+        (let [cached-token-count
+              (long (or (:event/cached-token-count event)
+                        (get-in assignment [:assignment/candidate
+                                            :estimate/cached-token-count])
+                        0))
+              assignment (assoc assignment :assignment/cached-token-count
+                                cached-token-count)
+              missing (get-in assignment [:assignment/candidate
                                           :estimate/missing-token-count])
               [assignment operation]
               (if (pos? missing)
@@ -218,7 +225,14 @@
         (fail-assignment state assignment
                          (or (:event/reason event) :decode-failed))
         (let [request-id (get-in assignment [:assignment/request :request/id])
-              result {:status :completed :tokens (:event/tokens event)}
+              cached-token-count
+              (long (or (:assignment/cached-token-count assignment)
+                        (get-in assignment [:assignment/candidate
+                                            :estimate/cached-token-count])
+                        0))
+              result {:status :completed
+                      :tokens (:event/tokens event)
+                      :cached-token-count cached-token-count}
               completed (assoc assignment
                                :assignment/phase :completed
                                :assignment/result result)
