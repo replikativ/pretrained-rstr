@@ -52,7 +52,8 @@
                       context {:response/type :delta :response/token 7}))
         terminal (openai/stream-values
                   context {:response/type :completed
-                           :response/value {:status :completed :tokens [7 8]}})]
+                           :response/value {:status :completed :tokens [7 8]
+                                            :cached-token-count 3}})]
     (is (= "<7>" (get-in delta [:choices 0 :delta :content])))
     (is (= "length" (get-in (first terminal)
                              [:choices 0 :finish_reason])))
@@ -71,8 +72,10 @@
           :prompt-tokens 3 :request/max-new-tokens 4
           :decode-tokens #(apply str (map char %))}
          {:response/type :completed
-          :response/value {:status :completed :tokens [65 66]}})]
+          :response/value {:status :completed :tokens [65 66]
+                           :cached-token-count 2}})]
     (is (= "AB" (get-in response [:choices 0 :message :content])))
     (is (= "stop" (get-in response [:choices 0 :finish_reason])))
-    (is (= {:prompt_tokens 3 :completion_tokens 2 :total_tokens 5}
+    (is (= {:prompt_tokens 3 :completion_tokens 2 :total_tokens 5
+            :prompt_tokens_details {:cached_tokens 2}}
            (:usage response)))))

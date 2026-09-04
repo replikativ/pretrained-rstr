@@ -40,7 +40,8 @@
                    (sim/run-until-response :request-1 100))]
     (is (= {:request/id :request-1
             :response/type :completed
-            :response/value {:status :completed :tokens [41 42 43 44]}}
+            :response/value {:status :completed :tokens [41 42 43 44]
+                             :cached-token-count 24}}
            (sim/response result :request-1)))
     (is (= :near
            (get-in result [:sim/router :router/requests :request-1

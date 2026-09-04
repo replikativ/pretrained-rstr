@@ -84,7 +84,7 @@
         controller
         (test-controller
          pool pending sent
-         {:worker/restore-prefix (observe nil)
+         {:worker/restore-prefix (observe {:cached-token-count 1})
           :worker/prefill-suffix (observe nil)
           :worker/decode (observe {:tokens [9 10]})})]
     (try
@@ -103,7 +103,7 @@
                                 [:worker/assignments [:request-a 1]
                                  :assignment/phase])))
       (is (zero? (:reserved-pages (page-pool/stats pool))))
-      (is (= {:status :completed :tokens [9 10]}
+      (is (= {:status :completed :tokens [9 10] :cached-token-count 1}
              (:event/result (last @sent))))
       (finally
         (.close controller)))))
