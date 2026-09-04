@@ -151,8 +151,8 @@
   "Advance the cluster router by one event.
 
   Supported events are `:request/submitted`, `:request/cancelled`,
-  `:worker/offer-result`, `:worker/result`, `:worker/unavailable`, and
-  `:router/offer-timeout`.
+  `:worker/offer-result`, ordered `:worker/token` deltas, `:worker/result`,
+  `:worker/unavailable`, and `:router/offer-timeout`.
   Every worker completion is fenced by the active assignment identity; stale or
   duplicate events are no-ops. Returns `{:state state' :effects [...]}`."
   [state {:event/keys [type] :as event}]
@@ -166,6 +166,7 @@
           (let [candidates (rank-candidates request (:event/candidates event))
                 record {:assignment/phase :received
                         :assignment/attempt 0
+                        :assignment/delivered-token-count 0
                         :assignment/request request
                         :assignment/remaining-candidates candidates}]
             (offer-next (assoc-in state [:router/requests request-id] record)
@@ -209,7 +210,41 @@
                           :request/id request-id
                           :response/type :completed
                           :response/value (:event/result event)}]})
-            (offer-next state request-id))))
+            ;; Once a delta reached the consumer, transparent retry could
+            ;; duplicate or diverge the visible stream. Resume after a partial
+            ;; stream needs an explicit continuation handoff protocol.
+            (if (pos? (long (:assignment/delivered-token-count record 0)))
+              (let [failed (assoc record :assignment/phase :failed
+                                  :assignment/failure
+                                  (get-in event [:event/result :reason]))]
+                {:state (assoc-in state [:router/requests request-id] failed)
+                 :effects [{:effect/op :router/deliver
+                            :request/id request-id
+                            :response/type :error
+                            :response/error
+                            (or (get-in event [:event/result :reason])
+                                :worker-failed-after-stream)}]})
+              (offer-next state request-id)))))
+
+      :worker/token
+      (let [request-id (:request/id event)
+            record (get-in state [:router/requests request-id])
+            expected (long (:assignment/delivered-token-count record 0))]
+        (if (and (= :assigned (:assignment/phase record))
+                 (= (:assignment/id record) (:assignment/id event))
+                 (integer? (:event/token event))
+                 (integer? (:event/token-index event))
+                 (= expected (long (:event/token-index event))))
+          {:state (update-in state
+                             [:router/requests request-id
+                              :assignment/delivered-token-count]
+                             inc)
+           :effects [{:effect/op :router/deliver
+                      :request/id request-id
+                      :response/type :delta
+                      :response/token (long (:event/token event))
+                      :response/token-index expected}]}
+          {:state state :effects []}))
 
       :worker/unavailable
       (let [request-id (:request/id event)
@@ -218,7 +253,16 @@
                  (= (:assignment/id record) (:assignment/id event))
                  (= (:worker/id event)
                     (get-in record [:assignment/candidate :candidate/worker-id])))
-          (offer-next state request-id)
+          (if (pos? (long (:assignment/delivered-token-count record 0)))
+            {:state (assoc-in state [:router/requests request-id]
+                              (assoc record :assignment/phase :failed
+                                     :assignment/failure
+                                     :worker-unavailable-after-stream))
+             :effects [{:effect/op :router/deliver
+                        :request/id request-id
+                        :response/type :error
+                        :response/error :worker-unavailable-after-stream}]}
+            (offer-next state request-id))
           {:state state :effects []}))
 
       :request/cancelled

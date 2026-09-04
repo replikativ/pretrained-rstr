@@ -301,6 +301,7 @@ Further reading:
 - [Git-like continuation model](doc/continuation-model.md)
 - [Distributed paged inference architecture](doc/serving-architecture.md)
 - [Cluster continuation controller](doc/cluster-controller.md)
+- [OpenAI-compatible serving boundary](doc/openai-api.md)
 - [Numerical memory and simulation direction](doc/numerical-memory.md)
 - [Contributing and validation](CONTRIBUTING.md)
 

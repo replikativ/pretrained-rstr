@@ -189,6 +189,11 @@
         (let [token (long (:token result))
               output (conj (:job/output job) token)
               reason (stop-reason runtime job token remaining)]
+          (when-let [token! (:job/token! job)]
+            ;; The callback must enqueue consumer delivery without blocking the
+            ;; device-owning loop. Assignment fencing happens in the worker and
+            ;; router state machines, not in this callback.
+            (token! token (dec (count output))))
           (if reason
             {:next-lane nil
              :completion [:complete
@@ -557,6 +562,7 @@
              :request/continuation-id id
              :request/position processed
              :request/pending-token (peek prompt)
+             :job/token! (:worker/token! effect)
              :job/output []})))))
 
 (defn cancel-assignment!

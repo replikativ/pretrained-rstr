@@ -53,7 +53,9 @@
   map from `:worker/restore-prefix`, `:worker/prefill-suffix`, and
   `:worker/decode` to one-argument functions. Restore and prefill handlers may
   return nil or `{:ok? boolean :reason value}`; decode additionally returns
-  `:tokens`. `:send!` receives immutable protocol effects.
+  `:tokens`. Every operation receives a local `:worker/token!` callback; decode
+  handlers may invoke it as `(token! token zero-based-index)` before returning.
+  `:send!` receives immutable protocol effects.
 
   Tests and event-loop integrations may provide the complete trio `:submit!`,
   `:cancel!`, and `:close-submit!`; otherwise a private single-thread executor
@@ -266,7 +268,16 @@
   (let [assignment-id (:assignment/id effect)
         task-key [assignment-id (UUID/randomUUID)]
         reservation (get @(:reservations controller) assignment-id)
-        operation (assoc effect :worker/capacity-reservation reservation)
+        operation (assoc effect
+                         :worker/capacity-reservation reservation
+                         :worker/token!
+                         (fn [token token-index]
+                           (handle-event!
+                            controller
+                            {:event/type :worker/token
+                             :assignment/id assignment-id
+                             :event/token token
+                             :event/token-index token-index})))
         task (fn []
                (try
                  (let [result (or ((get (:handlers controller) (:effect/op effect))

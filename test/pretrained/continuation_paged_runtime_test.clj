@@ -52,14 +52,18 @@
            runtime (effect :prefill-assignment :prefill [1 2 3 4 5] 2)))]
     (try
       (is (true? (deref first-step 1000 false)))
-      (let [decode-result
+      (let [deltas (atom [])
+            decode-result
             (future
               (paged-runtime/decode!
-               runtime (effect :decode-assignment :decode [7 8 9] 3)))]
+               runtime (assoc (effect :decode-assignment :decode [7 8 9] 3)
+                              :worker/token!
+                              #(swap! deltas conj [%1 %2]))))]
         (deliver release-first true)
         (is (= {:ok? true} (deref prefill-result 1000 ::timeout)))
         (is (= {:ok? true :tokens [102 103 104] :stop-reason :length}
                (deref decode-result 1000 ::timeout)))
+        (is (= [[102 0] [103 1] [104 2]] @deltas))
         (is (some #(= #{:prefill :decode}
                       (set (map :continuation-id %)))
                   @submissions))
