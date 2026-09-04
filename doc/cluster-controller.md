@@ -148,9 +148,11 @@ resume of a partial stream remains future continuation-handoff work.
 initial text-only `POST /v1/chat/completions` subset. It validates model and
 message input, preserves sampling controls on the internal generation request,
 and produces streamed chunk, terminal response, usage, error, and SSE values.
-An optional HTTP adapter still needs to bind those values to HTTP-kit channels,
-cancel on disconnect, and enforce bounded per-client output buffering before an
-OpenAI server is advertised as complete.
+`pretrained.openai.server` binds those values to the Replikativ HTTP-kit fork.
+It exposes chat completions and model listing, cancels on disconnect, bounds its
+application event queue, and observes the socket's queued-byte watermarks before
+offering more SSE data. A standard OpenAI-client smoke test and real model
+execution remain required before the server is advertised as complete.
 
 ## Next executable slice
 

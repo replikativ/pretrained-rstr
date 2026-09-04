@@ -45,19 +45,24 @@ worker could duplicate or diverge from already visible output. The current
 contract closes the stream with an error. A future retryable stream must first
 publish or transfer an exact continuation at the last delivered token boundary.
 
-## HTTP adapter acceptance criteria
+## HTTP adapter
 
-The optional HTTP-kit adapter is the next slice. It must:
+`pretrained.openai.server` is available with the `:openai-server` alias and the
+Replikativ HTTP-kit distribution. It:
 
-1. expose chat completions and the configured model ids;
-2. emit `text/event-stream` frames ending in `data: [DONE]`;
-3. aggregate the same terminal tokens for non-streamed responses;
-4. cancel the controller request when the client disconnects;
-5. bound each client's output queue so a slow socket cannot stall the
-   device-owning decode loop;
-6. return OpenAI-shaped JSON errors with appropriate HTTP status codes;
-7. pass an end-to-end test using a standard OpenAI client with only `base_url`
-   changed.
+1. exposes chat completions and configured model ids;
+2. emits `text/event-stream` frames ending in `data: [DONE]`;
+3. aggregates terminal tokens for non-streamed responses;
+4. cancels the controller request when the client disconnects;
+5. bounds each client's application queue and observes HTTP-kit's queued-byte
+   high/low watermarks, keeping a slow socket off controller and decoder loops;
+6. configures a hard per-connection queued-byte ceiling;
+7. returns OpenAI-shaped JSON errors with appropriate HTTP status codes.
+
+Integration tests exercise model listing, streamed and non-streamed chat,
+usage, errors, and disconnect cancellation over a real TCP listener. A standard
+OpenAI SDK smoke test with only `base_url` changed is the remaining compatibility
+gate before calling the endpoint complete.
 
 Authentication, quotas, TLS termination, and production rate limiting belong
 at the deployment boundary and are not part of the first embedded server.
