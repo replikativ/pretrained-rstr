@@ -161,6 +161,8 @@
                         (long (get-in decoder [:decode-state :maxpos]))))
               (let [token (paged-decoder/step! decoder id position)
                     output (conj output token)]
+                (when-let [token! (:worker/token! effect)]
+                  (token! token (dec (count output))))
                 (if (contains? eos-ids token)
                   output
                   (recur (inc position) output)))

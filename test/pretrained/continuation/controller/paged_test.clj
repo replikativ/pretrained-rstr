@@ -43,6 +43,7 @@
   (let [token-count (atom 2)
         primed (atom [])
         stepped (atom [])
+        deltas (atom [])
         touched (atom nil)
         decoder {:pool ::pool :decode-state {:maxpos 8}}
         handlers (paged/handlers ::cache decoder {:eos-ids #{8}})]
@@ -61,7 +62,10 @@
                     (swap! stepped conj [id position])
                     (if (= position 2) 7 8))]
       (is (= {:ok? true :tokens [7 8]}
-             ((:worker/decode handlers) (effect :worker/decode))))
+             ((:worker/decode handlers)
+              (assoc (effect :worker/decode)
+                     :worker/token! #(swap! deltas conj [%1 %2])))))
+      (is (= [[7 0] [8 1]] @deltas))
       (is (= [[:continuation-a [1 2 3]]] @primed))
       (is (= [[:continuation-a 2] [:continuation-a 3]] @stepped))
       (is (= :continuation-a (first @touched)))

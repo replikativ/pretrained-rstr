@@ -55,6 +55,15 @@
    :assignment/id (:assignment/id assignment)
    :event/result result})
 
+(defn- token-effect
+  [assignment token token-index]
+  {:effect/op :worker/send-token
+   :effect/to :router
+   :request/id (get-in assignment [:assignment/request :request/id])
+   :assignment/id (:assignment/id assignment)
+   :event/token (long token)
+   :event/token-index (long token-index)})
+
 (defn- operation-effect
   [assignment op]
   {:effect/op op
@@ -105,9 +114,10 @@
   "Advance a device-local worker by one controller event.
 
   Supported events are `:assignment/offered`, operation result events for
-  restore, prefill, and decode, `:assignment/cancelled`, and lifecycle
-  `:worker/crashed`/`:worker/restarted`. Operation results for stale assignment
-  identities are ignored. Returns `{:state state' :effects [...]}`."
+  restore, prefill, and decode, ordered `:worker/token` deltas,
+  `:assignment/cancelled`, and lifecycle `:worker/crashed`/`:worker/restarted`.
+  Deltas and operation results for stale assignment identities are ignored.
+  Returns `{:state state' :effects [...]}`."
   [state {:event/keys [type] :as event}]
   (case type
     :assignment/offered
@@ -164,6 +174,7 @@
                           :assignment/candidate candidate
                           :assignment/free-pages-reserved from-free
                           :assignment/evicted-pages from-eviction
+                          :assignment/emitted-token-count 0
                           :assignment/phase :accepted}
               [assignment operation] (next-operation assignment)]
           {:state (-> state
@@ -220,6 +231,25 @@
                                              (:assignment/evicted-pages assignment))}))]
           {:state state
            :effects [(result-effect completed result)]}))
+      {:state state :effects []})
+
+    :worker/token
+    (if-let [assignment (active-assignment state event)]
+      (let [expected (long (:assignment/emitted-token-count assignment 0))
+            token-index (:event/token-index event)
+            token (:event/token event)]
+        (if (and (= :decoding (:assignment/phase assignment))
+                 (integer? token-index)
+                 (= expected (long token-index))
+                 (integer? token))
+          {:state (update-in state
+                             [:worker/assignments (:assignment/id event)
+                              :assignment/emitted-token-count]
+                             inc)
+           :effects [(token-effect assignment token token-index)]}
+          ;; Stale, duplicate, out-of-order, and post-cancellation deltas are
+          ;; fenced exactly like terminal operation results.
+          {:state state :effects []}))
       {:state state :effects []})
 
     :assignment/cancelled

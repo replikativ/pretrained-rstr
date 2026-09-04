@@ -2,9 +2,9 @@
   "Optional live Kabel transport for the continuation controller.
 
   This namespace is loaded with the `:distributed-demo` alias. It carries only
-  observations, offers, acknowledgements, cancellations, and results. Datahike
-  remains the durable fact plane and immutable tensor chunks remain on their
-  Konserve/tiered-store path."
+  observations, offers, acknowledgements, cancellations, token deltas, and
+  terminal results. Datahike remains the durable fact plane and immutable tensor
+  chunks remain on their Konserve/tiered-store path."
   (:require [clojure.core.async :as async]
             [pretrained.continuation.controller.candidates :as candidates]
             [pretrained.continuation.controller.cluster :as cluster]
@@ -21,6 +21,7 @@
   #{:continuation/offer :continuation/cancel})
 (def ^:private router-message-types
   #{:continuation/offer-result
+    :continuation/token
     :continuation/result
     :continuation/worker-unavailable})
 

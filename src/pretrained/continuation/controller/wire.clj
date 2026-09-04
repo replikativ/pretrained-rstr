@@ -9,6 +9,7 @@
   #{:continuation/offer
     :continuation/cancel
     :continuation/offer-result
+    :continuation/token
     :continuation/result
     :continuation/worker-observation
     :continuation/worker-unavailable})
@@ -43,6 +44,12 @@
     (-> effect
         (dissoc :effect/op :effect/to)
         (assoc :type :continuation/result
+               :message/to :router))
+
+    :worker/send-token
+    (-> effect
+        (dissoc :effect/op :effect/to)
+        (assoc :type :continuation/token
                :message/to :router))
 
     (throw (ex-info "Continuation effect is local and cannot be encoded"
@@ -87,6 +94,11 @@
       (-> message
           (dissoc :type :message/to)
           (assoc :event/type :worker/result))
+
+      :continuation/token
+      (-> message
+          (dissoc :type :message/to)
+          (assoc :event/type :worker/token))
 
       :continuation/worker-unavailable
       (-> message

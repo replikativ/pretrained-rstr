@@ -214,10 +214,18 @@
       (await-value 1000 #(first (controller-kabel/observations router)))
       (controller-kabel/submit! router (request :batch-a))
       (controller-kabel/submit! router (request :batch-b))
-      (await-value 3000 #(when (= 2 (count @delivered)) true))
-      (is (= #{:batch-a :batch-b}
-             (set (map :request/id @delivered))))
-      (is (every? #(= :completed (:response/type %)) @delivered))
+      (await-value
+       3000
+       #(when (= 2 (count (filter (comp #{:completed} :response/type)
+                                  @delivered)))
+          true))
+      (let [terminal (filter (comp #{:completed} :response/type) @delivered)
+            deltas (filter (comp #{:delta} :response/type) @delivered)]
+        (is (= #{:batch-a :batch-b}
+               (set (map :request/id terminal))))
+        (is (= #{[:batch-a 0] [:batch-a 1]
+                 [:batch-b 0] [:batch-b 1]}
+               (set (map (juxt :request/id :response/token-index) deltas)))))
       (is (some #(= #{:batch-a :batch-b}
                     (set (map :continuation-id %)))
                 @submissions)

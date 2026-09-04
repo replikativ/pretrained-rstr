@@ -31,6 +31,19 @@
       (is (= type (:type message)))
       (is (= event-type (:event/type (wire/router-event message)))))))
 
+(deftest worker-token-deltas-round-trip-to-router
+  (let [effect {:effect/op :worker/send-token
+                :effect/to :router
+                :request/id :request-a
+                :assignment/id [:request-a 1]
+                :event/token 42
+                :event/token-index 0}
+        message (wire/effect->message effect)
+        event (wire/router-event message)]
+    (is (= :continuation/token (:type message)))
+    (is (= :worker/token (:event/type event)))
+    (is (= [42 0] [(:event/token event) (:event/token-index event)]))))
+
 (deftest local-effects-cannot-leak-to-kabel
   (testing "GPU operations and timers are intentionally not serializable here"
     (is (thrown-with-msg?

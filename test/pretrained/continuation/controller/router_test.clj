@@ -103,3 +103,45 @@
     (is (= :completed
            (get-in completed [:state :router/requests :r1 :assignment/phase])))
     (is (= [7] (get-in completed [:effects 0 :response/value :tokens])))))
+
+(deftest streamed-deltas-are-ordered-and-disable-unsafe-retry
+  (let [{offered :state offer-effects :effects}
+        (router/transition
+         (router/initial-state)
+         {:event/type :request/submitted
+          :event/request request
+          :event/candidates [(candidate :first :gpu 100 0 0 0 1)
+                             (candidate :second :ssd 100 1 2 1 1)]})
+        assignment-id (:assignment/id (first offer-effects))
+        assigned (:state
+                  (router/transition
+                   offered {:event/type :worker/offer-result
+                            :request/id :r1 :assignment/id assignment-id
+                            :event/accepted? true}))
+        first-delta (router/transition
+                     assigned {:event/type :worker/token
+                               :request/id :r1 :assignment/id assignment-id
+                               :event/token 7 :event/token-index 0})
+        duplicate (router/transition
+                   (:state first-delta)
+                   {:event/type :worker/token
+                    :request/id :r1 :assignment/id assignment-id
+                    :event/token 7 :event/token-index 0})
+        unavailable (router/transition
+                     (:state first-delta)
+                     {:event/type :worker/unavailable
+                      :request/id :r1 :assignment/id assignment-id
+                      :worker/id :first})]
+    (is (= {:effect/op :router/deliver
+            :request/id :r1
+            :response/type :delta
+            :response/token 7
+            :response/token-index 0}
+           (first (:effects first-delta))))
+    (is (empty? (:effects duplicate)))
+    (is (= :failed
+           (get-in unavailable [:state :router/requests :r1
+                                :assignment/phase])))
+    (is (= [:router/deliver] (mapv :effect/op (:effects unavailable))))
+    (is (= :worker-unavailable-after-stream
+           (get-in unavailable [:effects 0 :response/error])))))

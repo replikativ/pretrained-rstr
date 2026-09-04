@@ -136,9 +136,23 @@ artifacts, tokenizer/config metadata, and architecture adapters. It does not
 need to reproduce every Transformers serving API. A later TGI-compatible
 adapter is useful only if real users require it.
 
-The current worker protocol returns a terminal token vector. Streaming deltas
-and usage accounting should be added as fenced, nonterminal worker events before
-an OpenAI server is advertised as complete.
+The worker protocol now emits ordered, assignment-fenced token deltas before its
+terminal token vector. Serial and continuously batched paged decode use the same
+callback. The router suppresses duplicate, out-of-order, stale, and
+post-cancellation deltas. A failed assignment may be retried before its first
+visible token; after streaming begins the router terminates with an error rather
+than risk duplicating or diverging consumer-visible output. Exact cross-worker
+resume of a partial stream remains future continuation-handoff work.
+
+`pretrained.openai` implements the pure request and response boundary for the
+initial text-only `POST /v1/chat/completions` subset. It validates model and
+message input, preserves sampling controls on the internal generation request,
+and produces streamed chunk, terminal response, usage, error, and SSE values.
+`pretrained.openai.server` binds those values to the Replikativ HTTP-kit fork.
+It exposes chat completions and model listing, cancels on disconnect, bounds its
+application event queue, and observes the socket's queued-byte watermarks before
+offering more SSE data. A standard OpenAI-client smoke test and real model
+execution remain required before the server is advertised as complete.
 
 ## Next executable slice
 

@@ -45,12 +45,21 @@
                 is.simm/distributed-scope {:mvn/version "0.1.6"}
                 org.replikativ/konserve-sync {:mvn/version "0.1.39"}
                 org.replikativ/konserve-s3 {:mvn/version "0.1.38"}
-                http-kit/http-kit {:mvn/version "2.8.1"}}}
+                org.replikativ/http-kit {:mvn/version "2.9.0-beta4-replikativ.1"}}}
+
+  ;; Optional OpenAI-compatible HTTP/SSE ingress. The replikativ http-kit fork
+  ;; exposes outbound queued-byte watermarks used to isolate slow clients from
+  ;; the controller and device-owning decode loop.
+  :openai-server
+  {:extra-deps {org.replikativ/http-kit
+                {:mvn/version "2.9.0-beta4-replikativ.1"}}}
 
   ;; Model-free unit tests. Model-gated tests are ^:anchors-tagged and excluded here
   ;; (they need multi-GB weights and/or a GPU); CI runs exactly `clojure -M:test`.
   :test {:extra-paths ["test" "dev"]
-         :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+         :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}
+                      org.replikativ/http-kit
+                      {:mvn/version "2.9.0-beta4-replikativ.1"}}
          :jvm-opts ["--enable-native-access=ALL-UNNAMED"
                     "--add-modules=jdk.incubator.vector"
                     "-Xss8m"

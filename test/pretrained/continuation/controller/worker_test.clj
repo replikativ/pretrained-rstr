@@ -79,3 +79,39 @@
     (is (= [:worker/cancel-operation]
            (mapv :effect/op (:effects cancelled))))
     (is (empty? (:effects duplicate)))))
+
+(deftest decode-deltas-are-ordered-and-assignment-fenced
+  (let [initial (worker/initial-state
+                 #:worker{:id :w1 :epoch 3 :models #{"gemma/test"}
+                          :free-pages 8 :evictable-pages 0})
+        accepted (:state (worker/transition initial offer))
+        prefilling (:state (worker/transition
+                            accepted {:event/type :worker/restore-result
+                                      :assignment/id [:r1 1] :event/ok? true}))
+        decoding (:state (worker/transition
+                          prefilling {:event/type :worker/prefill-result
+                                      :assignment/id [:r1 1] :event/ok? true}))
+        first-delta (worker/transition
+                     decoding {:event/type :worker/token
+                               :assignment/id [:r1 1]
+                               :event/token 9 :event/token-index 0})
+        duplicate (worker/transition
+                   (:state first-delta) {:event/type :worker/token
+                                         :assignment/id [:r1 1]
+                                         :event/token 9 :event/token-index 0})
+        gap (worker/transition
+             (:state first-delta) {:event/type :worker/token
+                                   :assignment/id [:r1 1]
+                                   :event/token 11 :event/token-index 2})
+        second-delta (worker/transition
+                      (:state first-delta) {:event/type :worker/token
+                                            :assignment/id [:r1 1]
+                                            :event/token 10 :event/token-index 1})]
+    (is (= :worker/send-token (get-in first-delta [:effects 0 :effect/op])))
+    (is (= [9 0] [(get-in first-delta [:effects 0 :event/token])
+                   (get-in first-delta [:effects 0 :event/token-index])]))
+    (is (empty? (:effects duplicate)))
+    (is (empty? (:effects gap)))
+    (is (= 2 (get-in second-delta
+                     [:state :worker/assignments [:r1 1]
+                      :assignment/emitted-token-count])))))
