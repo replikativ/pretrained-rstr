@@ -51,6 +51,10 @@
   ;; `:test:distributed-demo` so ordinary demo consumers do not see test code.
   :distributed-test {:extra-paths ["test-distributed"]}
 
+  ;; Real two-worker Gemma/OpenAI smoke. `run!` performs a conservative host
+  ;; resource preflight before loading weights or compiling device programs.
+  :real-cluster-test {:extra-paths ["dev"]}
+
   ;; Optional OpenAI-compatible HTTP/SSE ingress. The replikativ http-kit fork
   ;; exposes outbound queued-byte watermarks used to isolate slow clients from
   ;; the controller and device-owning decode loop.

@@ -111,5 +111,19 @@ Its opt-in regression test is:
 clojure -M:test:distributed-demo:distributed-test -d test-distributed
 ```
 
+For an opt-in topology in which both Kabel workers own independent real Raster
+paged decoders, use the resource-gated smoke below. It defaults to the local
+`gemma-3-270m-it` checkpoint and proves that a continued OpenAI request reports
+positive resident cached-token usage:
+
+```sh
+clojure -M:valhalla:distributed-demo:real-cluster-test -e \
+  "(require '[pretrained.real-openai-cluster-demo :as demo]) (demo/run!)"
+```
+
+Inspect `(demo/preflight)` first. The smoke refuses to load weights under
+memory, swap, or host-load pressure. `:force? true` bypasses that guard and
+should only be used after checking competing host and integrated-GPU workloads.
+
 Authentication, quotas, TLS termination, and production rate limiting belong
 at the deployment boundary and are not part of the first embedded server.
