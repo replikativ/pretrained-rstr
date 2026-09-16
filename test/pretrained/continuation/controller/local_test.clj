@@ -158,11 +158,16 @@
 (deftest observation-combines-device-capacity-and-exact-prefix-identity
   (let [pool (fixture-pool 4)
         prefix (random-uuid)
+        boundary (random-uuid)
         _ (page-pool/allocate-route!
            pool :resident 2
            {:policy {:durable? true
                      :model-fingerprint model-fingerprint
-                     :prefix-hash prefix}})
+                     :prefix-hash prefix
+                     :prefix-boundaries [{:token-count 1
+                                          :prefix-hash boundary}
+                                         {:token-count 2
+                                          :prefix-hash prefix}]}})
         controller (test-controller pool (atom []) (atom []) {})]
     (try
       (let [result
@@ -184,7 +189,13 @@
                 :token-count 2
                 :bytes 16}
                (get-in result [:worker/gpu-prefixes
-                               [model-fingerprint prefix]]))))
+                               [model-fingerprint prefix]])))
+        (is (= {:continuation-id :resident
+                :token-count 1
+                :bytes 8}
+               (get-in result [:worker/gpu-prefixes
+                               [model-fingerprint boundary]]))
+            "a chunk boundary inside the route is advertised with scaled bytes"))
       (finally
         (.close controller)))))
 
@@ -217,3 +228,20 @@
       (is (= 4 (page-pool/free-page-count pool)))
       (finally
         (.close controller)))))
+
+(deftest gpu-prefix-forks-the-advertised-boundary
+  (let [pool (fixture-pool 8)
+        _ (page-pool/allocate-route! pool :resident 3)
+        ensure! #'local/ensure-gpu-prefix!]
+    (is (= {:ok? true :forked? true}
+           (ensure! pool :request-a
+                    {:candidate/cache-tier :gpu
+                     :estimate/cached-token-count 2
+                     :candidate/source-continuation-id :resident})))
+    (is (= 2 (:token-count (page-pool/route pool :request-a))))
+    (is (= {:ok? false :reason :resident-prefix-unavailable}
+           (ensure! pool :request-b
+                    {:candidate/cache-tier :gpu
+                     :estimate/cached-token-count 4
+                     :candidate/source-continuation-id :resident}))
+        "a prefix longer than the resident route is declined")))

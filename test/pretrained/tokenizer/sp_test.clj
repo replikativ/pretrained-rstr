@@ -39,3 +39,25 @@
       (testing "decode reverses encode (▁→space, byte-fallback fused to UTF-8)"
         (doseq [s ["Hello, world!" "café résumé" "日本語" "The quick brown fox."]]
           (is (= s (sp/decode t (sp/encode t s))) (str "roundtrip " (pr-str s))))))))
+
+;; gold from `AutoTokenizer.apply_chat_template(tokenize=True, add_generation_prompt=True)`
+;; on gemma-3-270m-it; special tokens must encode to their ids, not as text.
+(def ^:private chat-gold
+  {"<start_of_turn>user\nHi<end_of_turn>\n<start_of_turn>model\n"
+   [2 105 2364 107 10979 106 107 105 4368 107]
+   (str "<start_of_turn>user\nBe brief.\n\nHi<end_of_turn>\n"
+        "<start_of_turn>model\nHello.<end_of_turn>\n"
+        "<start_of_turn>user\nCapital of France?<end_of_turn>\n"
+        "<start_of_turn>model\n")
+   [2 105 2364 107 3912 8652 236761 108 10979 106 107 105 4368 107 9259 236761
+    106 107 105 2364 107 64753 529 7001 236881 106 107 105 4368 107]})
+
+(deftest gemma-special-tokens-encode-to-their-ids
+  (if-not present?
+    (println "  [skip] gemma tokenizer not present")
+    (let [t (sp/load-tokenizer tok-path)]
+      (doseq [[s ids] chat-gold]
+        (is (= ids (sp/encode t s)) (str "chat encode " (pr-str s))))
+      (is (= "user\nHi"
+             (sp/decode t (sp/encode t "<start_of_turn>user\nHi<end_of_turn>")))
+          "decode skips special tokens by default"))))

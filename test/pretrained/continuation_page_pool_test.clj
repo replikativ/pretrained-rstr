@@ -635,3 +635,24 @@
       (is (= [0 0]
              (mapv :token-count (page-pool/abort-appends! pool entries))))
       (is (= 8 (page-pool/free-page-count pool))))))
+
+(deftest fork-at-a-shorter-boundary-shares-only-the-covering-pages
+  (let [pool (fixture-pool
+              (atom {:free (apply sorted-set (range 8))
+                     :refcounts {}
+                     :routes {}}))]
+    (page-pool/allocate-route! pool :root 7)
+    (let [root-pages (:pages (page-pool/route pool :root))
+          aligned (page-pool/fork-route! pool :root :aligned 4)
+          partial (page-pool/fork-route! pool :root :partial 5)]
+      (is (= 2 (count root-pages)))
+      (is (= [(first root-pages)] (:pages aligned)))
+      (is (= 4 (:token-count aligned)))
+      (is (= root-pages (:pages partial)))
+      (is (= 5 (:token-count partial)))
+      (is (= 3 (get-in @(:state pool) [:refcounts (first root-pages)])))
+      (is (= 2 (get-in @(:state pool) [:refcounts (second root-pages)])))
+      (is (= 7 (:token-count (page-pool/route pool :root)))
+          "the source route is unchanged")
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exceeds"
+                            (page-pool/fork-route! pool :root :too-long 8))))))

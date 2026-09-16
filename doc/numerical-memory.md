@@ -11,6 +11,11 @@ Those are a research and integration direction.
 
 ## A three-plane architecture
 
+The canonical description of the inference memory model (identity, durable
+bytes, resident pages, and the publish/lookup/restore/fork lifecycle) is
+[continuation-model.md](continuation-model.md). This table maps those planes
+onto the simulation direction.
+
 | Plane | Current stack | Responsibility |
 | --- | --- | --- |
 | semantic/control | Datahike, optionally Yggdrasil/Simmis | identity, provenance, branches, dependencies, policy, observations, accepted results |

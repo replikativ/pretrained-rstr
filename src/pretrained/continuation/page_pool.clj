@@ -679,31 +679,49 @@
 (defn fork-route!
   "Create `target-id` as a page-sharing snapshot of `source-id`.
 
-  A later append to a shared partial tail performs copy-on-write. Full shared
-  pages remain immutable and can be batched through independent page tables."
-  [pool source-id target-id]
-  (locking pool
-    (let [state @(:state pool)
-          source (get-in state [:routes source-id])]
-      (when (nil? target-id)
-        (throw (ex-info "Target continuation requires an identity" {})))
-      (when-not source
-        (throw (ex-info "Source continuation is not resident"
-                        {:continuation-id source-id})))
-      (when (get-in state [:routes target-id])
-        (throw (ex-info "Target continuation already has a resident route"
-                        {:continuation-id target-id})))
-      (when (:pending source)
-        (throw (ex-info "Cannot fork a continuation with an uncommitted append"
-                        {:continuation-id source-id})))
-      (let [target (assoc source :continuation-id target-id)
-            next-state (-> state
-                           (update :refcounts
-                                   #(reduce (fn [refs page] (update refs page inc))
-                                            % (:pages source)))
-                           (assoc-in [:routes target-id] target))]
-        (reset! (:state pool) next-state)
-        target))))
+  With `token-count`, the fork covers only the source's first `token-count`
+  tokens and shares just the pages that hold them; the last shared page may
+  be partially used and is copied on the fork's first append. Without it, the
+  whole route is shared. A later append to a shared partial tail performs
+  copy-on-write. Full shared pages remain immutable and can be batched through
+  independent page tables."
+  ([pool source-id target-id]
+   (fork-route! pool source-id target-id nil))
+  ([pool source-id target-id token-count]
+   (locking pool
+     (let [state @(:state pool)
+           source (get-in state [:routes source-id])]
+       (when (nil? target-id)
+         (throw (ex-info "Target continuation requires an identity" {})))
+       (when-not source
+         (throw (ex-info "Source continuation is not resident"
+                         {:continuation-id source-id})))
+       (when (get-in state [:routes target-id])
+         (throw (ex-info "Target continuation already has a resident route"
+                         {:continuation-id target-id})))
+       (when (:pending source)
+         (throw (ex-info "Cannot fork a continuation with an uncommitted append"
+                         {:continuation-id source-id})))
+       (let [token-count (long (or token-count (:token-count source)))
+             _ (when (or (neg? token-count)
+                         (> token-count (long (:token-count source))))
+                 (throw (ex-info "Fork token count exceeds the source route"
+                                 {:continuation-id source-id
+                                  :token-count token-count
+                                  :source-token-count (:token-count source)})))
+             pages (vec (take (page-count token-count (:page-size pool))
+                              (:pages source)))
+             target (assoc source
+                           :continuation-id target-id
+                           :pages pages
+                           :token-count token-count)
+             next-state (-> state
+                            (update :refcounts
+                                    #(reduce (fn [refs page] (update refs page inc))
+                                             % pages))
+                            (assoc-in [:routes target-id] target))]
+         (reset! (:state pool) next-state)
+         target)))))
 
 (defn- release-page
   [state page]

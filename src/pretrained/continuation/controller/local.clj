@@ -124,18 +124,38 @@
               (:worker/assignments machine))
         gpu-prefixes
         (into {}
-              (keep
+              (mapcat
                (fn [[continuation-id resident-route]]
                  (let [policy (:cache/policy resident-route)
                        model (:model-fingerprint policy)
-                       prefix (:prefix-hash policy)]
+                       prefix (:prefix-hash policy)
+                       token-count (long (:token-count resident-route))
+                       bytes (or (:bytes policy)
+                                 (page-pool/route-bytes
+                                  (:pool controller) continuation-id))]
                    (when (and (string? model) (uuid? prefix))
-                     [[model prefix]
-                      {:continuation-id continuation-id
-                       :token-count (:token-count resident-route)
-                       :bytes (or (:bytes policy)
-                                  (page-pool/route-bytes
-                                   (:pool controller) continuation-id))}]))))
+                     ;; The exact route end plus every chunk-aligned boundary
+                     ;; the paged handlers recorded, so a request that shares
+                     ;; only part of the route can still fork it.
+                     (cons [[model prefix]
+                            {:continuation-id continuation-id
+                             :token-count token-count
+                             :bytes bytes}]
+                           (keep (fn [{boundary-count :token-count
+                                       boundary-hash :prefix-hash}]
+                                   (when (and (uuid? boundary-hash)
+                                              (integer? boundary-count)
+                                              (pos? (long boundary-count))
+                                              (< (long boundary-count)
+                                                 token-count))
+                                     [[model boundary-hash]
+                                      {:continuation-id continuation-id
+                                       :token-count (long boundary-count)
+                                       :bytes (when bytes
+                                                (quot (* (long bytes)
+                                                         (long boundary-count))
+                                                      token-count))}]))
+                                 (:prefix-boundaries policy)))))))
               (:routes snapshot))]
     (merge measurements
            {:worker/id (:worker/id machine)
@@ -184,9 +204,11 @@
           target
           {:ok? false :reason :resident-prefix-mismatch}
 
-          (and source (= cached (:token-count source)))
+          (and source (<= cached (long (:token-count source))))
           (do
-            (page-pool/fork-route! pool source-id continuation-id)
+            ;; Fork the exact advertised prefix; a shorter boundary shares only
+            ;; the pages that hold it.
+            (page-pool/fork-route! pool source-id continuation-id cached)
             {:ok? true :forked? true})
 
           :else

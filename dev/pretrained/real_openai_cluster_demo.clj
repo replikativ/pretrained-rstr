@@ -12,76 +12,29 @@
             [org.httpkit.client :as http-client]
             [pretrained.continuation.catalog :as catalog]
             [pretrained.continuation.controller.kabel :as controller-kabel]
-            [pretrained.continuation.controller.paged :as paged-controller]
-            [pretrained.continuation.manager :as manager]
-            [pretrained.continuation.page-pool :as page-pool]
-            [pretrained.continuation.paged-decoder :as paged-decoder]
+            [pretrained.continuation.model-worker :as model-worker]
             [pretrained.decoder-gpu :as decoder-gpu]
+            [pretrained.host-resources :as host-resources]
             [pretrained.loader :as loader]
             [pretrained.model-identity :as model-identity]
             [pretrained.openai.cluster :as openai-cluster]
-            [raster.gpu.core :as gpu]
             [superv.async :refer [<?? S]])
   (:import (java.io Closeable)
            (java.net ServerSocket)
            (java.nio.file Files Path)
            (java.util Comparator)))
 
-(def ^:private gib (* 1024 1024 1024))
+(def resource-snapshot
+  "See `pretrained.host-resources/resource-snapshot`."
+  host-resources/resource-snapshot)
 
-(defn- read-lines
-  [path]
-  ;; GraalVM's BufferedInputStream calls FileInputStream.available(), which
-  ;; returns EINVAL for procfs. The NIO channel reader does not use available().
-  (vec (Files/readAllLines (Path/of path (make-array String 0)))))
+(def resource-admission
+  "See `pretrained.host-resources/resource-admission`."
+  host-resources/resource-admission)
 
-(defn resource-snapshot
-  "Return the Linux resource facts used to guard the two-worker smoke."
-  []
-  (let [meminfo
-        (into {}
-              (keep (fn [line]
-                      (when-let [[_ field kib]
-                                 (re-matches #"([^:]+):\s+(\d+)\s+kB" line)]
-                        [(keyword field) (* 1024 (Long/parseLong kib))])))
-              (read-lines "/proc/meminfo"))
-        load-one (Double/parseDouble
-                  (first (str/split (first (read-lines "/proc/loadavg")) #"\s+")))]
-    {:available-bytes (:MemAvailable meminfo)
-     :swap-total-bytes (:SwapTotal meminfo)
-     :swap-free-bytes (:SwapFree meminfo)
-     :load-one load-one
-     :processors (.availableProcessors (Runtime/getRuntime))}))
-
-(defn resource-admission
-  "Explain whether `snapshot` is safe for a two-worker compile."
-  ([snapshot] (resource-admission snapshot {}))
-  ([{:keys [available-bytes swap-total-bytes swap-free-bytes load-one processors]
-     :as snapshot}
-    {:keys [minimum-available-bytes minimum-swap-free-bytes
-            maximum-load-per-processor]
-     :or {minimum-available-bytes (* 14 gib)
-          minimum-swap-free-bytes (* 256 1024 1024)
-          maximum-load-per-processor 1.25}}]
-   (let [load-per-processor (/ (double load-one) (max 1 (long processors)))
-         reasons
-         (cond-> []
-           (< (long available-bytes) (long minimum-available-bytes))
-           (conj :insufficient-available-memory)
-           (and (pos? (long swap-total-bytes))
-                (< (long swap-free-bytes) (long minimum-swap-free-bytes)))
-           (conj :insufficient-free-swap)
-           (> load-per-processor (double maximum-load-per-processor))
-           (conj :host-load-too-high))]
-     {:admitted? (empty? reasons)
-      :reasons reasons
-      :load-per-processor load-per-processor
-      :snapshot snapshot})))
-
-(defn preflight
-  "Return current resource admission without loading weights or opening a GPU."
-  ([] (preflight {}))
-  ([thresholds] (resource-admission (resource-snapshot) thresholds)))
+(def preflight
+  "See `pretrained.host-resources/preflight`."
+  host-resources/preflight)
 
 (defn- require-admission!
   [opts]
@@ -105,76 +58,45 @@
                     (.iterator (.sorted paths (Comparator/reverseOrder))))]
         (Files/deleteIfExists path)))))
 
-(defrecord ModelWorker [endpoint cache decoder decode-state]
+(defrecord DemoWorker [endpoint worker]
   Closeable
   (close [_]
     (try
       (when endpoint (.close ^Closeable endpoint))
       (finally
-        (try
-          (when cache (.close ^Closeable cache))
-          (finally
-            (try
-              (when decoder
-                (try
-                  (paged-decoder/close! decoder)
-                  (finally
-                    (page-pool/close-transfer-engines! (:pool decoder)))))
-              (finally
-                (when decode-state
-                  (gpu/close-session! (:sess decode-state)))))))))))
+        (when worker (.close ^Closeable worker))))))
 
 (defn- open-model-worker!
   [model quantized-weights fingerprint connection cache-directory worker-id opts]
   (let [max-position (long (:max-position opts 64))
-        page-size (long (:page-size opts 16))
-        physical-pages (long (:physical-pages opts 8))
-        decode-state (volatile! nil)
-        decoder (volatile! nil)
-        cache (volatile! nil)
-        endpoint (volatile! nil)]
-    (try
-      (vreset! decode-state
-               (decoder-gpu/bind-decode!
-                model :qw quantized-weights :maxpos max-position
-                :cache-mode :paged :batch-size 1
-                :device-id (:device-id opts :ze:0)))
-      (vreset! decoder
-               (paged-decoder/open!
-                @decode-state :page-size page-size
-                :physical-pages physical-pages :key-prefix (name worker-id)))
-      (vreset! cache
-               (manager/open-manager
-                nil cache-directory
-                {:connection connection
-                 :chunk-size (long (:chunk-size opts 4))
-                 :max-pending-captures 1
-                 :max-pending-publications 1}))
-      (vreset! endpoint
-               (controller-kabel/open-worker-endpoint
-                (:pool @decoder)
-                {:worker/id worker-id :worker/epoch 0
-                 :worker/models #{fingerprint}
-                 :worker/free-pages physical-pages :worker/evictable-pages 0}
-                {:handlers (paged-controller/handlers
-                            @cache @decoder {:chunk-size (:chunk-size opts 4)})
+        worker (model-worker/open-worker!
+                model quantized-weights
+                {:fingerprint fingerprint
+                 :connection connection
+                 :cache-directory cache-directory
+                 :worker-id worker-id
+                 :device-id (:device-id opts :ze:0)
+                 :max-position max-position
+                 :page-size (:page-size opts 16)
+                 :physical-pages (:physical-pages opts 8)
+                 :chunk-size (:chunk-size opts 4)
                  :measurements
-                 {:worker/node (name worker-id)
-                  :worker/queue-ms (double (:queue-ms opts 0.0))
-                  :worker/max-context max-position
-                  :worker/prefill-ms-per-token
-                  (double (:prefill-ms-per-token opts 10.0))
-                  :worker/first-token-ms (double (:first-token-ms opts 10.0))
-                  :worker/gpu-restore-bytes-per-ms 1000000.0
-                  :worker/tier-throughput-bytes-per-ms {}
-                  :worker/object-store? false}
-                 :heartbeat-ms (long (:heartbeat-ms opts 250))}))
-      (->ModelWorker @endpoint @cache @decoder @decode-state)
-      (catch Throwable error
-        (try
-          (.close (->ModelWorker @endpoint @cache @decoder @decode-state))
-          (catch Throwable _))
-        (throw error)))))
+                 (assoc (model-worker/default-measurements worker-id max-position)
+                        :worker/queue-ms (double (:queue-ms opts 0.0))
+                        :worker/prefill-ms-per-token
+                        (double (:prefill-ms-per-token opts 10.0))
+                        :worker/first-token-ms
+                        (double (:first-token-ms opts 10.0)))})
+        endpoint (try
+                   (controller-kabel/open-worker-endpoint
+                    (:pool worker) (:worker-opts worker)
+                    {:handlers (:handlers worker)
+                     :measurements (:measurements worker)
+                     :heartbeat-ms (long (:heartbeat-ms opts 250))})
+                   (catch Throwable error
+                     (try (.close ^Closeable worker) (catch Throwable _))
+                     (throw error)))]
+    (->DemoWorker endpoint worker)))
 
 (defn- await-value
   [timeout-ms operation]

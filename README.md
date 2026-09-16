@@ -41,10 +41,10 @@ transport. See [Numerical memory beyond LLM inference](doc/numerical-memory.md).
 Use JDK 21 or newer and add a released library version to `deps.edn`:
 
 ```clojure
-{:deps {org.replikativ/pretrained-rstr {:mvn/version "0.1.42"}}}
+{:deps {org.replikativ/pretrained-rstr {:mvn/version "0.1.45"}}}
 ```
 
-The source tree currently targets Raster `0.2.545`. OpenBLAS is required for
+Raster is pinned in `deps.edn`. OpenBLAS is required for
 floating-point GEMM paths. ffmpeg is optional for non-WAV audio. GPU execution
 requires Level Zero on Intel or a compatible OpenCL ICD on Intel, NVIDIA, or AMD.
 
@@ -72,11 +72,55 @@ known local model directory, then call the task verb.
 ;; => " Paris..."
 
 ;; Select resident GPU execution while loading a supported model.
+;; CPU decode honors {:temperature :top-k :top-p :seed}; GPU decode is greedy.
 (def gpu-model (lm/load-lm :gemma-3-270m-it {:gpu? true}))
 ```
 
 Downloads are sha-pinned and resume into `~/.cache/raster/models`. `HF_TOKEN` is
 honoured. Passing a local directory skips download.
+
+## Serve a local model
+
+One call loads a checkpoint, quantizes it, opens a paged GPU worker with a
+Datahike catalog, and listens on an OpenAI-compatible endpoint. Requires the
+`:openai-server` alias for HTTP-kit.
+
+```clojure
+;; clojure -M:valhalla:openai-server
+(require '[pretrained.openai.local :as serve])
+
+(def server
+  (serve/open-server {:model :gemma-3-270m-it        ; or :model-directory "/path"
+                      :port 8080
+                      :cache-directory "/var/tmp/pretrained-kv"})) ; optional, durable
+
+;; ... later
+(.close server)
+```
+
+Any OpenAI client works with only the base URL changed:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="local")
+reply = client.chat.completions.create(
+    model="gemma-3-270m-it",
+    messages=[{"role": "user", "content": "Name the capital of France."}])
+print(reply.choices[0].message.content, reply.usage.prompt_tokens_details)
+```
+
+The server applies the checkpoint's chat template for Gemma and ChatML
+(Qwen, SmolLM) families and stops at its configured end-of-turn tokens. A
+second turn that extends the same conversation reports the reused prefix in
+`usage.prompt_tokens_details.cached_tokens`. With `:cache-directory`, chunks
+and their identities persist across restarts; without it, the catalog is in
+memory and removed on close. A resident conversation is advertised for reuse
+at its exact end and at every chunk boundary (`:chunk-size`, default 16
+tokens), so a later turn forks the shared prefix and pays only for its new
+tokens. `temperature`, `top_p`, `stop`, and
+`seed` are accepted but not applied; decode is greedy. See
+[openai-api.md](doc/openai-api.md) for the request contract and
+[serving-architecture.md](doc/serving-architecture.md) for sizing options.
 
 ## Validated model families
 
@@ -88,7 +132,7 @@ honoured. Passing a local directory skips download.
 | `:moonshine-streaming-medium` | streaming English ASR | 245M | LibriSpeech-100 WER 1.62%, matching reference |
 | `:qwen3-asr-0.6b`, `:qwen3-asr-1.7b` | multilingual ASR | 0.6/1.7B | character-identical reference transcript |
 | `:gemma-3-270m-it`, `:gemma-3-1b-it` | decoder LLM | Q4/Q8 | token-exact GPU anchors |
-| Qwen3 and SmolLM2 registry entries | decoder LLM | Q4/Q8 | shared descriptor-driven engine |
+| `:qwen3-0.6b`, `:qwen3-1.7b`, `:smollm2-135m-instruct`, `:smollm2-360m-instruct` | decoder LLM | Q4/Q8 | shared descriptor-driven engine |
 
 Architecture support and validated registry support are different claims. The
 generic loader can recognize additional compatible Hugging Face directories,
@@ -133,8 +177,9 @@ token history ──> prefix hash chain ──> Datahike catalog and placement
 The analogy to Git is precise but bounded: chunks are immutable objects, causal
 prefix hashes form parent links, and forks share unchanged pages until a write.
 There is no automatic semantic merge for divergent KV caches. Read the
-[continuation model](doc/continuation-model.md) for the invariants and stack
-ownership.
+[continuation model](doc/continuation-model.md) for the invariants, the
+publish/lookup/restore/fork lifecycle, and how it relates to LMCache and
+engine prefix caches.
 
 The model-free cluster simulator runs the same router and worker state machines
 used by the runtime adapter. It makes locality/load decisions and failure traces
@@ -170,6 +215,12 @@ It is model-free and does not send tensors through Kabel. The optional
 controller middleware can be composed onto the same peers used by the
 Datahike/Konserve distributed demo.
 
+For one process, `pretrained.openai.local/open-server` (see
+[Serve a local model](#serve-a-local-model)) joins the same router and worker
+in memory. For several machines, `pretrained.continuation.model-worker`
+assembles each worker and `dev/pretrained/real_openai_cluster_demo.clj` shows
+how two of them attach to one gateway over Kabel.
+
 The worker-side continuous-batching loop can also be inspected without model
 weights. It runs variable-length prefill and decode jobs in sparse fixed Raster
 lanes, retaining active lanes and priming only refills or prompt-token rows:
@@ -180,13 +231,6 @@ lanes, retaining active lanes and priming only refills or prompt-token rows:
 (batch-demo/run-simulation)
 ```
 
-A single-lane decoder bound with `:prefill-T` executes one complete multi-row
-prompt tile per scheduler turn. Decode remains higher priority and may run before
-the next tile; an incomplete tail uses the ordinary one-row lane graph. This
-bounds preemption latency by the selected tile rather than by the whole prompt.
-Multi-lane prefill continues to share the decode graph one row per lane until a
-fixed-shape multi-sequence prefill graph is available.
-
 Restore overlap has a separate deterministic REPL simulation. Its pending
 restore cannot complete until the demo releases a boundary, while an unrelated
 decode finishes first:
@@ -196,20 +240,13 @@ decode finishes first:
 (transfer-demo/run-simulation)
 ```
 
-Real workers construct `paged-runtime/open-runtime`, pass
-`paged/batched-handlers` to their local/Kabel controller, and merge
-`paged-runtime/controller-submission` into the worker endpoint options. The
-runtime owns decoder calls; close the controller first, then the runtime.
-Raster retains each Konserve mmap lease through its asynchronous upload
-event. The worker polls completion between decode iterations and exposes the
-restored route only after all required chunks are resident. Checkpoint capture
-uses the symmetric retained download API: its event pins the source route until
-the host payload is complete, while the capture worker writes at most one staged
-chunk at a time. `:max-chunk-staging-bytes` rejects an oversized optional capture
-before queueing. Raster reports the physical transfer contract per worker:
-OpenCL has an independent transfer queue, while Level Zero shared-memory capture
-currently copies inline. Independent queues make live overlap eligible; measured
-event and decode timings still determine whether a device benefits under load.
+A multi-request worker composes `paged-runtime/open-runtime` with
+`paged/batched-handlers` and merges `paged-runtime/controller-submission` into
+the worker endpoint options; the runtime owns decoder calls, so close the
+controller first, then the runtime. The batch-size-one real-model smoke uses
+the serialized `paged/handlers` instead. Restore, checkpoint capture, and the
+per-device transfer contract are described in
+[serving-architecture.md](doc/serving-architecture.md).
 
 Workers can publish live smoothed costs instead of relying indefinitely on
 deployment constants. The supplier below preserves configured values until the
@@ -271,14 +308,9 @@ The result reports transfer bytes and commands separately from wall time,
 attributes checkpoint time to catalog lookup, device export, local persistence,
 and publication, and distinguishes first process use from
 process/page-cache-warm restores. It does not label warm filesystem pages as
-cold SSD performance. Manager startup warms the exact Datahike chunk query so
-query compilation cannot extend the first checkpoint's route lifetime. The
-bounded checkpoint and localization workers likewise prepare and validate the
-scoped Konserve/Boring tensor mapping before publishing local readiness. This
-moves one-time FFM/navigation initialization off the first inference request
-without copying or decoding tensor elements; the benchmark charges it to mmap
-preparation in the checkpoint and cache-admission break-even. The
-demo's `:cache-policy-calibration :worker-observation-patch` converts measured
+cold SSD performance. One-time query compilation and mmap preparation happen
+at manager startup and are charged to mmap preparation in the checkpoint and
+cache-admission break-even rather than to the first request. The demo's `:cache-policy-calibration :worker-observation-patch` converts measured
 prefill, lower-tier load, and GPU upload rates into the fields consumed by the
 cluster candidate planner; merge it into that worker's observation. Its
 `:checkpoint-admission` value is directly usable by paged handlers after adding
@@ -330,6 +362,8 @@ engine interprets the descriptor using Raster-compilable blocks.
 | `pretrained.decoder`, `.decoder-gpu` | descriptor-driven CPU and resident GPU decoding |
 | `pretrained.continuation.*` | chunking, catalog, placement, page pools, scheduling, restore |
 | `pretrained.model-identity` | compatibility fingerprints for durable state |
+| `pretrained.openai`, `.openai.server`, `.openai.local`, `.openai.cluster` | OpenAI-compatible request boundary, HTTP/SSE ingress, one-process and Kabel composition |
+| `pretrained.chat`, `pretrained.continuation.model-worker` | chat templates and stop tokens; real-model worker assembly |
 | `raster.*` | typed numerical compiler, schedules, kernels, buffers, and device runtime |
 
 Linear weights repack into int8/int4 streams for Raster's CPU int8-MAC or GPU

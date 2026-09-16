@@ -69,13 +69,21 @@
         resident-route (page-pool/route pool id)
         processed (:token-count resident-route)
         history (into (vec (:request/tokens request)) output)
-        tail (peek (chunk/plan history processed chunk-size))]
+        chunks (chunk/plan history processed chunk-size)
+        tail (peek chunks)]
     (when tail
       (page-pool/touch-route!
        pool id
        (merge policy
               {:model-fingerprint (:request/model-fingerprint request)
                :prefix-hash (:chunk/prefix-hash tail)
+               ;; Every chunk boundary of the resident prefix, so routing can
+               ;; match a request that shares only part of this route.
+               :prefix-boundaries
+               (mapv (fn [{:chunk/keys [start token-count prefix-hash]}]
+                       {:token-count (+ (long start) (long token-count))
+                        :prefix-hash prefix-hash})
+                     chunks)
                :bytes (page-pool/route-bytes pool id)})))))
 
 (defn- checkpoint-policy-for
