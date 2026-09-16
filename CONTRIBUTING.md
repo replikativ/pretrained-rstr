@@ -14,8 +14,10 @@ clojure -P -M:test
 clojure -M:test
 ```
 
-The `:dev` alias replaces Raster with the sibling checkout at `../raster` and
-adds the local development and test paths:
+The `:dev` alias replaces Raster with the sibling checkout at `../raster`,
+adds the local development and test paths, and also requires the sibling
+`../proximum` and `../umap-rstr` checkouts used by the embedding end-to-end
+smoke:
 
 ```sh
 clojure -M:dev

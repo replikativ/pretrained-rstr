@@ -14,6 +14,7 @@
     (def m (from-pretrained \"/path/to/gemma-3-270m-it\"))
     (generate-text m \"The capital of France is\" 20)"
   (:require [clojure.data.json :as json]
+            [pretrained.chat :as chat]
             [pretrained.sampling :as samp]
             [pretrained.tokenizer.sp :as sp]
             [pretrained.tokenizer.bpe :as bpe]))
@@ -79,8 +80,9 @@
 (defn from-pretrained
   "Load an HF model directory. Dispatches on config model_type/architectures to a
   registered architecture handler, loads the model + tokenizer. Returns a model map
-  with :arch, :handler and :tokenizer attached. Bundled architecture namespaces are
-  auto-required on a registry miss, so callers need not require the arch ns first."
+  with :arch, :handler, :tokenizer, and :eos-ids (the checkpoint's generation stop
+  tokens) attached. Bundled architecture namespaces are auto-required on a registry
+  miss, so callers need not require the arch ns first."
   [dir]
   (let [cfg (json/read-str (slurp (str dir "/config.json")) :key-fn keyword)
         k (or (dispatch-key cfg)
@@ -91,7 +93,8 @@
                               {:config cfg})))
         handler (get @arch-registry k)
         model ((:load handler) dir cfg)]
-    (assoc model :arch k :handler handler :tokenizer (detect-tokenizer dir))))
+    (assoc model :arch k :handler handler :tokenizer (detect-tokenizer dir)
+           :eos-ids (chat/eos-ids dir))))
 
 (defn generate-ids
   "Generate n new token ids from a prompt id seq. `opts` is a sampler config

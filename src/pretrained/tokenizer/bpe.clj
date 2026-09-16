@@ -12,7 +12,8 @@
     (def tok (load-bpe-tokenizer \"path/to/tokenizer.json\"))
     (vec (encode tok \"Hello world\"))
     (decode tok (encode tok \"Hello world\"))"
-  (:require [clojure.data.json :as json])
+  (:require [clojure.data.json :as json]
+            [clojure.string :as str])
   (:import [java.util HashMap]
            [java.util.regex Pattern]))
 
@@ -237,6 +238,14 @@
      :id->token id->token
      :merges merges
      :added-tokens added
+     ;; Added tokens are matched verbatim before pre-tokenization so chat
+     ;; templates encode `<|im_start|>` and friends to their real ids.
+     :special-pattern (when (seq added-tokens-raw)
+                        (Pattern/compile
+                         (str/join
+                          "|" (map #(Pattern/quote (get % "content"))
+                                   (sort-by #(count (get % "content")) >
+                                            added-tokens-raw)))))
      :bos-id (some-> bos-id long)
      :eos-id (some-> eos-id long)
      :pad-id (some-> pad-id long)}))
@@ -274,19 +283,28 @@
   is BPE-encoded. Special tokens (BOS/EOS) are NOT automatically added;
   use encode-with-special to include them."
   ^longs [tokenizer ^String text]
-  (let [{:keys [vocab merges added-tokens]} tokenizer
+  (let [{:keys [vocab merges added-tokens special-pattern]} tokenizer
         ^HashMap added-tok->id (:token->id added-tokens)
-        pre-tokens (pre-tokenize text)
-        ids (transient [])]
-    ;; Encode each pre-token
-    (doseq [pre-token pre-tokens]
-      ;; Check if this matches an added token exactly
-      (let [added-id (when (and added-tok->id (pos? (.size added-tok->id)))
-                       (.get added-tok->id pre-token))]
-        (if added-id
-          (conj! ids (long added-id))
-          (doseq [id (bpe-encode-word pre-token vocab merges)]
-            (conj! ids id)))))
+        ids (transient [])
+        encode-segment!
+        (fn [^String segment]
+          (doseq [pre-token (pre-tokenize segment)]
+            ;; Check if this matches an added token exactly
+            (let [added-id (when (and added-tok->id (pos? (.size added-tok->id)))
+                             (.get added-tok->id pre-token))]
+              (if added-id
+                (conj! ids (long added-id))
+                (doseq [id (bpe-encode-word pre-token vocab merges)]
+                  (conj! ids id))))))]
+    (if special-pattern
+      (let [m (.matcher ^Pattern special-pattern text)]
+        (loop [pos 0]
+          (if (.find m)
+            (do (encode-segment! (subs text pos (.start m)))
+                (conj! ids (long (.get added-tok->id (.group m))))
+                (recur (.end m)))
+            (encode-segment! (subs text pos)))))
+      (encode-segment! text))
     (long-array (persistent! ids))))
 
 (defn encode-with-special

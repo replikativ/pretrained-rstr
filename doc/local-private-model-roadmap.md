@@ -76,8 +76,8 @@ checkpoint of a given parameter count will fit.
    existing Gemma, Qwen, Llama/SmolLM, embedding, and ASR families.
 2. Make tokenizer chat templates and stop-token policy part of the uniform model
    contract used by the OpenAI adapter.
-3. Add resource-gated real-model tests for two-worker routing, resident-prefix
-   reuse, durable restore, and restart recovery.
+3. Extend the resource-gated real-model smoke, which already covers two-worker
+   routing and resident-prefix reuse, to durable restore and restart recovery.
 4. Normalize Q4/Q8 selection and record the execution variant in attention-state
    compatibility fingerprints.
 5. Add a small, reproducible LoRA training fixture whose adapter checkpoint and

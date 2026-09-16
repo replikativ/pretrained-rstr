@@ -55,9 +55,24 @@
                       (.put merge-rank (str l SEP r) (int i)))
                     (inc i))
                   0 merges-raw)
-        special-ids (set (map #(int (get % "id")) (or added [])))]
+        ;; Only tokens flagged special are skipped on decode; Gemma also
+        ;; registers whitespace such as "\n" as (non-special) added tokens.
+        special-ids (set (map #(int (get % "id"))
+                              (filter #(get % "special") (or added []))))
+        ;; Special added tokens (<bos>, <start_of_turn>, ...) are matched
+        ;; verbatim before BPE so chat templates encode to their real ids.
+        specials (->> (or added [])
+                      (filter #(get % "special"))
+                      (map #(get % "content"))
+                      (sort-by count >)
+                      vec)
+        special-pattern (when (seq specials)
+                          (java.util.regex.Pattern/compile
+                           (str/join "|" (map #(java.util.regex.Pattern/quote %)
+                                              specials))))]
     {:vocab vocab :id->tok id->tok :merge-rank merge-rank
      :special-ids special-ids
+     :special-pattern special-pattern
      :bos-id (.get ^HashMap vocab "<bos>")
      :eos-id (.get ^HashMap vocab "<eos>")
      :ignore-merges (boolean (get model "ignore_merges"))
@@ -103,13 +118,27 @@
       (vec syms))))
 
 (defn encode
-  "Encode text to token ids. Prepends <bos> (TemplateProcessing). Space -> U+2581."
+  "Encode text to token ids. Prepends <bos> (TemplateProcessing). Space -> U+2581.
+  Special added tokens present verbatim in `text` (for example
+  `<start_of_turn>`) encode to their ids; the surrounding text is BPE-encoded."
   ([tk text] (encode tk text true))
-  ([{:keys [^HashMap vocab bos-id] :as tk} ^String text add-bos?]
-   (let [norm (.replace text " " META)
-         pieces (when (pos? (.length norm)) (bpe tk norm))
-         unk (.getOrDefault vocab "<unk>" (int 0))
-         ids (map (fn [s] (let [v (.get vocab s)] (if v (int v) unk))) pieces)]
+  ([{:keys [^HashMap vocab bos-id special-pattern] :as tk} ^String text add-bos?]
+   (let [unk (.getOrDefault vocab "<unk>" (int 0))
+         encode-plain
+         (fn [^String segment]
+           (let [norm (.replace segment " " META)
+                 pieces (when (pos? (.length norm)) (bpe tk norm))]
+             (map (fn [s] (let [v (.get vocab s)] (if v (int v) unk))) pieces)))
+         ids (if special-pattern
+               (let [m (.matcher ^java.util.regex.Pattern special-pattern text)]
+                 (loop [pos 0 acc []]
+                   (if (.find m)
+                     (recur (.end m)
+                            (-> acc
+                                (into (encode-plain (subs text pos (.start m))))
+                                (conj (int (.get vocab (.group m))))))
+                     (into acc (encode-plain (subs text pos))))))
+               (vec (encode-plain text)))]
      (vec (if (and add-bos? bos-id) (cons (int bos-id) ids) ids)))))
 
 (defn decode

@@ -71,6 +71,10 @@
       (is (= :continuation-a (first @touched)))
       (is (= "fixture-v1" (:model-fingerprint (second @touched))))
       (is (uuid? (:prefix-hash (second @touched))))
+      (is (= [4] (mapv :token-count (:prefix-boundaries (second @touched))))
+          "the processed prefix is advertised at every chunk boundary")
+      (is (= (:prefix-hash (second @touched))
+             (:prefix-hash (peek (:prefix-boundaries (second @touched))))))
       (is (= 128 (:bytes (second @touched)))))))
 
 (deftest positive-value-decode-checkpoint-becomes-durable-after-publication

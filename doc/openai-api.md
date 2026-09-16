@@ -1,32 +1,39 @@
 # OpenAI-compatible serving boundary
 
-The first public serving surface is a deliberately small, tested subset of
+The public serving surface is a small, tested subset of
 `POST /v1/chat/completions`. Compatibility is an ingress/egress concern; HTTP,
-JSON, chat templates, and tokenization do not enter the cluster router or GPU
-worker state machines.
+JSON, and tokenization do not enter the cluster router or GPU worker state
+machines.
 
 ```text
-OpenAI JSON -> chat template/tokenizer -> generation request -> cluster router
+OpenAI JSON -> tokenize-chat -> generation request -> cluster router
      ^                                                        |
      +---- JSON response or SSE chunks <- fenced deliveries <-+
 ```
 
-## Initial contract
+## Request contract
 
-Accepted request fields are:
+Accepted and applied request fields are:
 
 - `model`;
 - nonempty text `messages` with `system`, `developer`, `user`, or `assistant`
   roles;
 - `max_completion_tokens`, with `max_tokens` accepted as an alias;
-- `stream` and `stream_options.include_usage`;
-- `temperature`, `top_p`, `stop`, and `seed`.
+- `stream` and `stream_options.include_usage`.
 
-Known fields with unsupported values produce an OpenAI-shaped
-`invalid_request_error`. Additional fields are currently ignored and must not
-be advertised as implemented. Tool calls, structured outputs, multimodal
-content, log probabilities, and the Responses API are later compatibility
-slices.
+`temperature`, `top_p`, `stop`, and `seed` are validated and carried on the
+generation request but are not applied: paged decode is greedy, and `stop`
+strings are not matched against output. Known fields with unsupported values
+produce an OpenAI-shaped `invalid_request_error`. Unrecognized fields are
+ignored. Tool calls, structured outputs, multimodal content, log
+probabilities, and the Responses API are later compatibility slices.
+
+`pretrained.openai.local/open-server` supplies `:tokenize-chat` from
+`pretrained.chat`, which renders the Gemma and ChatML template families
+directly and falls back to newline-joined contents for other checkpoints, and
+takes stop tokens from the model's `:eos-ids`. Callers composing the ingress
+themselves must supply both; `paged/handlers` defaults `:eos-ids` to the empty
+set, in which case generation stops only at `max_completion_tokens`.
 
 `pretrained.openai/normalize-chat-request` accepts injected model resolution and
 chat tokenization, returning the ordinary continuation `generation-request`.
@@ -47,8 +54,8 @@ publish or transfer an exact continuation at the last delivered token boundary.
 
 ## HTTP adapter
 
-`pretrained.openai.server` is available with the `:openai-server` alias and the
-Replikativ HTTP-kit distribution. It:
+`pretrained.openai.server` requires the Replikativ HTTP-kit distribution,
+supplied by the `:openai-server`, `:distributed-demo`, or `:test` alias. It:
 
 1. exposes chat completions and configured model ids;
 2. emits `text/event-stream` frames ending in `data: [DONE]`;
@@ -66,9 +73,9 @@ and carries it through the assignment-fenced terminal result.
 
 Integration tests exercise model listing, streamed and non-streamed chat,
 usage, errors, and disconnect cancellation over a real TCP listener. The same
-surface has been exercised with the Python `openai` 2.21.0 client for model
+surface has been checked manually against the Python `openai` client for model
 listing, non-streamed completion, streamed deltas, and streamed usage with only
-`base_url` redirected:
+`base_url` redirected; that script is not part of the repository:
 
 ```python
 from openai import OpenAI
@@ -87,7 +94,17 @@ for chunk in result:
 ```
 
 The placeholder API key satisfies the client constructor; the embedded server
-does not currently authenticate it.
+performs no authentication (see the deployment boundary below).
+
+## One-process composition
+
+`pretrained.openai.local/open-server-with-worker` joins a worker-local
+controller and the cluster router in memory. Router effects become worker
+events and worker effects become router events through the same `wire`
+conversions the Kabel transport uses, so fencing is identical; the single
+worker's observation is read at submit time instead of arriving by heartbeat.
+`open-server` wraps it with model loading and a Datahike catalog that is file
+backed under `:cache-directory` or in memory otherwise.
 
 ## Cluster composition
 
@@ -121,9 +138,28 @@ clojure -M:valhalla:distributed-demo:real-cluster-test -e \
   "(require '[pretrained.real-openai-cluster-demo :as demo]) (demo/run!)"
 ```
 
-Inspect `(demo/preflight)` first. The smoke refuses to load weights under
-memory, swap, or host-load pressure. `:force? true` bypasses that guard and
-should only be used after checking competing host and integrated-GPU workloads.
+Inspect `(demo/preflight)` first. The smoke refuses to load weights when
+available memory is below 14 GiB, free swap is below 256 MiB, or the one-minute
+load exceeds 1.25 per processor. Pass `:resource-thresholds` with
+`:minimum-available-bytes`, `:minimum-swap-free-bytes`, or
+`:maximum-load-per-processor` to adjust one guard while keeping the others;
+`:force? true` disables all of them and should only be used after checking
+competing host and integrated-GPU workloads. The model and its Q4 packing are
+shared between the two workers, so the real footprint is well under the default
+gate on an otherwise idle host.
+
+For one process, `pretrained.openai.local/open-server` performs the whole
+composition (load, fingerprint, quantize, worker, in-memory router, HTTP) and
+`dev/pretrained/local_openai_demo.clj` is its resource-gated smoke:
+
+```sh
+clojure -M:valhalla:openai-server:real-cluster-test -e \
+  "(require '[pretrained.local-openai-demo :as demo]) (demo/run!)"
+```
+
+For several machines, `pretrained.continuation.model-worker/open-worker!`
+assembles each worker and `real_openai_cluster_demo.clj` shows two of them
+attached to one gateway over Kabel.
 
 Authentication, quotas, TLS termination, and production rate limiting belong
-at the deployment boundary and are not part of the first embedded server.
+at the deployment boundary and are not part of the embedded server.

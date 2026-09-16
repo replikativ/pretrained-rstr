@@ -68,7 +68,7 @@ wakes handler tasks only after the current append or restore boundary. This
 keeps reservation release from racing in-flight GPU work. Close `endpoint`
 before `runtime` so controller tasks quiesce first.
 
-For batched handlers, restore no longer runs on the decoder-owning loop. A
+For batched handlers, restore runs off the decoder-owning loop. A
 bounded Raster `ContentProvider` localizes a Hasch-addressed chunk into the
 worker's Konserve filestore, opens its Boring payload as a scoped segment, and
 transfers that lease to a Raster upload event. The handler polls storage and GPU
@@ -118,63 +118,36 @@ context limit, model availability, worker epoch, and exactness are hard
 constraints. The worker repeats capacity admission against current page state
 because a candidate can be stale by the time its offer arrives.
 
-This policy is intentionally deterministic and inspectable. Datahike should
-eventually record the candidate snapshot, selected alternative, predicted cost,
-decline/retry reason, and measured outcome. High-rate queue and kernel samples
-remain locally aggregated; the database stores decision-grade observations.
+The policy is deterministic and inspectable. High-rate queue and kernel
+samples are aggregated locally; Datahike stores decision-grade catalog and
+placement facts. Recording each candidate snapshot, selected alternative,
+predicted cost, and measured outcome is a planned extension.
 
 ## Consumer and model interfaces
 
-The first external surface should implement the small OpenAI-compatible subset
-needed by common clients: model selection, chat/completion input, maximum new
-tokens, cancellation, and streamed token deltas. The ingress adapter owns chat
-templating and tokenization, then submits the protocol request. The controller
-does not depend on HTTP or OpenAI JSON.
+The ingress adapter tokenizes through a caller-supplied `:tokenize-chat`
+function and submits the protocol request; the controller does not depend on
+HTTP or OpenAI JSON. The model's chat template is not applied automatically.
 
 Hugging Face compatibility is a different boundary: pretrained-rstr loads model
 artifacts, tokenizer/config metadata, and architecture adapters. It does not
-need to reproduce every Transformers serving API. A later TGI-compatible
-adapter is useful only if real users require it.
+reproduce the Transformers serving API.
 
-The worker protocol now emits ordered, assignment-fenced token deltas before its
+The worker protocol emits ordered, assignment-fenced token deltas before its
 terminal token vector. Serial and continuously batched paged decode use the same
 callback. The router suppresses duplicate, out-of-order, stale, and
 post-cancellation deltas. A failed assignment may be retried before its first
 visible token; after streaming begins the router terminates with an error rather
 than risk duplicating or diverging consumer-visible output. Exact cross-worker
-resume of a partial stream remains future continuation-handoff work.
+resume of a partial stream is not implemented.
 
 `pretrained.openai` implements the pure request and response boundary for the
-initial text-only `POST /v1/chat/completions` subset. It validates model and
-message input, preserves sampling controls on the internal generation request,
-and produces streamed chunk, terminal response, usage, error, and SSE values.
+text-only `POST /v1/chat/completions` subset. It validates model and message
+input, carries sampling controls on the internal generation request (they are
+validated but not applied; paged decode is greedy), and produces streamed
+chunk, terminal response, usage, error, and SSE values.
 `pretrained.openai.server` binds those values to the Replikativ HTTP-kit fork.
 It exposes chat completions and model listing, cancels on disconnect, bounds its
 application event queue, and observes the socket's queued-byte watermarks before
-offering more SSE data. An OpenAI Python client smoke test now covers model
-listing, non-streamed completion, streamed deltas, and usage. Real model
-execution remains required before the server is advertised as complete.
-
-## Next executable slice
-
-The remaining Gemma path is concrete:
-
-1. measure retained asynchronous checkpoint downloads under live decode and
-   tune their transfer-stream priority and pinned-memory budget;
-2. run cold, local-SSD, resident-prefix, partial-prefix, cancellation, and
-   worker-restart cases with one small Gemma model;
-3. report TTFT, inter-token latency, page occupancy, bytes by tier, recomputed
-   tokens, eviction reasons, and inference/checkpoint overlap.
-
-The live model-free demo now executes the complete observation, selection,
-offer, acknowledgement, streamed token, and terminal-result path across two
-local Kabel WebSocket connections. The implementation does not yet claim a
-production deployment, multi-process Gemma execution, or LMCache-beating
-throughput.
-Localize/upload and device/host checkpoint capture are now scheduled outside the
-decoder loop, and checkpoint chunks have byte-aware host-staging admission.
-Physical transfer/compute overlap is not yet guaranteed by Raster's current
-OpenCL or Level Zero mappings. Cancellation preserves the current restore event
-boundary before releasing a partial route. Fragmented staging pipelines, an
-independent copy path, pinned host-memory pooling, and real multi-process Gemma
-measurements remain required before making throughput claims.
+offering more SSE data. See [openai-api.md](openai-api.md) for the request
+contract and the real-model cluster smoke.
