@@ -4,6 +4,8 @@
             [pretrained.continuation.chunk :as chunk]
             [pretrained.continuation.controller.protocol :as protocol]
             [pretrained.continuation.controller.router :as router]
+            [pretrained.attention-state :as attention-state]
+            [pretrained.continuation.parts :as parts]
             [pretrained.continuation.placement :as placement]))
 
 (def ^:private lower-tier-rank {:ram 0 :ssd 1 :object 2})
@@ -152,29 +154,108 @@
             (/ (double cached-bytes)
                (double (:worker/gpu-restore-bytes-per-ms observation)))})))
 
+(defn- chunk-costs
+  "Return per-chunk facts for `matched` up to the first chunk no worker tier
+  can serve: its end, source tier, fixed and per-byte load cost, token-group
+  bytes, and window-group bytes. Returns nil when a chunk's parts do not match
+  the layout's groups."
+  [observation matched replicas-by-prefix groups]
+  (let [group-ids (into #{} (map :id) groups)
+        token-ids (into #{} (comp (filter #(= :token (get-in % [:extent :kind])))
+                                  (map :id))
+                        groups)]
+    (loop [remaining matched
+           result []]
+      (if-let [entry (first remaining)]
+        (let [entry-parts (parts/entry-parts entry)
+              bytes-by-group (into {} (map (juxt :group (comp long :bytes))) entry-parts)]
+          (if-not (= group-ids (set (keys bytes-by-group)))
+            nil
+            (if-let [source (fastest-source
+                             observation
+                             (get replicas-by-prefix (:kv/prefix-hash entry))
+                             (reduce + 0 (vals bytes-by-group)))]
+              (let [tier (:tier source)
+                    throughput (double (get-in observation
+                                               [:worker/tier-throughput-bytes-per-ms tier]))]
+                (recur (next remaining)
+                       (conj result
+                             {:end (+ (long (:kv/start-token entry))
+                                      (long (:kv/token-count entry)))
+                              :source source
+                              :fixed-ms (double (get-in observation
+                                                        [:worker/tier-fixed-ms tier] 0.0))
+                              :throughput throughput
+                              :token-bytes (reduce + 0 (map bytes-by-group token-ids))
+                              :token-parts (count token-ids)
+                              :window-bytes bytes-by-group})))
+              result)))
+        result))))
+
+(defn- prefix-sums
+  [values]
+  (vec (reductions + 0 values)))
+
 (defn- durable-alternatives
-  [request observation matched replicas-by-prefix]
-  (loop [remaining matched
-         sources []
-         cached-tokens 0
-         cached-bytes 0
-         load-ms 0.0
-         alternatives []]
-    (if-let [entry (first remaining)]
-      (if-let [source (fastest-source
-                       observation
-                       (get replicas-by-prefix (:kv/prefix-hash entry))
-                       (:kv/bytes entry))]
-        (let [sources (conj sources source)
-              cached-tokens (+ cached-tokens (:kv/token-count entry))
-              cached-bytes (+ cached-bytes (:kv/bytes entry))
-              load-ms (+ load-ms (:load-ms source))]
-          (recur (next remaining) sources cached-tokens cached-bytes load-ms
-                 (conj alternatives
-                       (durable-candidate request observation sources
-                                          cached-tokens cached-bytes load-ms))))
-        alternatives)
-      alternatives)))
+  "Return one durable candidate per restorable boundary of `matched`.
+
+  Bytes are not additive along the chain: a window group needs only the parts
+  its boundary's next token attends to. Each boundary is priced from prefix
+  sums and one nondecreasing pointer per window group, so the whole chain costs
+  linear time; the result equals `parts/boundary-selection` at every boundary.
+  Each loaded part is one stored object, so a tier's fixed cost is charged per
+  part, not per chunk.
+  Returns no candidates when the chain's parts do not match `attention-layout`."
+  [request observation matched replicas-by-prefix attention-layout]
+  (let [groups (attention-state/groups attention-layout)
+        windows (filterv #(= :window (get-in % [:extent :kind])) groups)
+        chunks (chunk-costs observation matched replicas-by-prefix groups)]
+    (if (empty? chunks)
+      []
+      (let [chunks (vec chunks)
+            n (count chunks)
+            ends (mapv :end chunks)
+            token-bytes (prefix-sums (map :token-bytes chunks))
+            token-ms (prefix-sums (map #(+ (* (:token-parts %) (:fixed-ms %))
+                                           (/ (double (:token-bytes %)) (:throughput %)))
+                                       chunks))
+            window-bytes (into {} (for [g windows]
+                                    [(:id g) (prefix-sums (map #(get-in % [:window-bytes (:id g)])
+                                                               chunks))]))
+            window-ms (into {} (for [g windows]
+                                 [(:id g) (prefix-sums (map #(+ (:fixed-ms %)
+                                                                (/ (double (get-in % [:window-bytes (:id g)]))
+                                                                   (:throughput %)))
+                                                            chunks))]))
+            range-sum (fn [sums from to] (- (double (nth sums to)) (double (nth sums from))))]
+        (loop [k 0
+               pointers (zipmap (map :id windows) (repeat 0))
+               sources []
+               alternatives []]
+          (if (= k n)
+            alternatives
+            (let [boundary (long (nth ends k))
+                  ;; First chunk each window group loads: the first whose end
+                  ;; exceeds the first row the token at `boundary` attends to.
+                  pointers (into {}
+                                 (for [g windows
+                                       :let [first-row (attention-state/first-attended-row g boundary)]]
+                                   [(:id g)
+                                    (loop [j (long (get pointers (:id g)))]
+                                      (if (and (<= j k) (<= (long (nth ends j)) first-row))
+                                        (recur (inc j))
+                                        j))]))
+                  bytes (+ (range-sum token-bytes 0 (inc k))
+                           (reduce + 0.0 (for [[id from] pointers]
+                                           (range-sum (get window-bytes id) from (inc k)))))
+                  load-ms (+ (range-sum token-ms 0 (inc k))
+                             (reduce + 0.0 (for [[id from] pointers]
+                                             (range-sum (get window-ms id) from (inc k)))))
+                  sources (conj sources (:source (nth chunks k)))]
+              (recur (inc k) pointers sources
+                     (conj alternatives
+                           (durable-candidate request observation sources boundary
+                                              (long bytes) load-ms))))))))))
 
 (defn- gpu-alternatives
   [request observation descriptors]
@@ -236,7 +317,16 @@
                   database (:request/model-fingerprint request) prefixes)
          matched (catalog/longest-prefix descriptors entries)
          replicas (placement/replicas-for-prefixes
-                   database (:request/model-fingerprint request) prefixes)]
+                   database (:request/model-fingerprint request) prefixes)
+         ;; A catalog written before layout records existed holds single-group
+         ;; nodes, which the implicit group of an empty layout describes. A
+         ;; record that cannot be read costs only the durable alternatives.
+         attention-layout (try
+                            (or (get-in (catalog/lookup-layout
+                                         database (:request/model-fingerprint request))
+                                        [:layout :attention-state])
+                                {})
+                            (catch Exception _ ::unusable))]
      (router/rank-candidates
       request
       (mapcat
@@ -244,5 +334,7 @@
          (into [(miss-alternative request observation)]
                (concat
                 (gpu-alternatives request observation descriptors)
-                (durable-alternatives request observation matched replicas))))
+                (when-not (= ::unusable attention-layout)
+                  (durable-alternatives request observation matched replicas
+                                        attention-layout)))))
        observations)))))

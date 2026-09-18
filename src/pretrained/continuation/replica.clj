@@ -25,10 +25,28 @@
     Returns `{:store-key :path :bytes}` only after the target can serve the
     immutable content. Implementations must throw on missing or corrupt data."))
 
+(defn- multi-part-error
+  "Return an error for nodes stored as per-group parts, or nil.
+
+  Replicas are tracked per node with one store key, so they cannot yet describe
+  a node whose groups are stored separately."
+  [catalog-chunk]
+  (when (or (seq (:kv/parts catalog-chunk))
+            (nil? (or (:kv/blob catalog-chunk) (:kv/store-key catalog-chunk))))
+    (ex-info "Replicas of multi-group chunks are not implemented; they need per-part placement"
+             {:prefix-hash (:kv/prefix-hash catalog-chunk)
+              :parts (mapv :kv.part/group (:kv/parts catalog-chunk))})))
+
+(defn- require-single-blob!
+  [catalog-chunk]
+  (when-let [error (multi-part-error catalog-chunk)]
+    (throw error)))
+
 (defrecord KonserveTieredPromoter [frontend-store backend-store]
   ReplicaPromoter
   (ensure-local! [_ action]
     (let [catalog-chunk (:chunk action)
+          _ (require-single-blob! catalog-chunk)
           store-key (or (:kv/blob catalog-chunk)
                         (:kv/store-key catalog-chunk))]
       (when-not (chunk-store/stored? frontend-store store-key)
@@ -96,6 +114,10 @@
   promoter returned the catalog's content identity. Failures are announced and
   returned as `:error`."
   [connection node tier promoter action]
+  (if-let [error (multi-part-error (:chunk action))]
+    ;; Returned, not thrown, so one unsupported node cannot abort the rest of a
+    ;; reconciliation pass.
+    {:status :failed :error error :action action :unsupported? true}
   (let [catalog-chunk (:chunk action)
         expected-store-key (or (:kv/blob catalog-chunk)
                                (:kv/store-key catalog-chunk))]
@@ -118,7 +140,7 @@
                                {:store-key expected-store-key
                                 :error (or (.getMessage error)
                                            (str (class error)))}))
-        {:status :failed :error error :action action}))))
+        {:status :failed :error error :action action})))))
 
 (declare close-executor!)
 

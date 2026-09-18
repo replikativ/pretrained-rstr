@@ -15,7 +15,8 @@
   Matmuls use the GPU Q4K dp4a kernels (raster.quant.kernels-k); the weight packers
   for the kernel layouts live next to the kernels (raster.quant.pack) — this ns only
   walks the descriptor's linear roles and packs one tensor at a time."
-  (:require [pretrained.decoder :as dec]
+  (:require [pretrained.attention-state :as attention-state]
+            [pretrained.decoder :as dec]
             [raster.arrays :as arr]
             [raster.quant.kernels-k :as qk]
             [raster.quant.pack :as qpack]
@@ -478,14 +479,9 @@
   "Per-layer rope base from descriptor flags: :dual = global theta on global layers
   (explicit set or every-p pattern), local otherwise; :single = one theta."
   [m l]
-  (let [flags (get-in m [:desc :flags])]
-    (if (= :dual (:rope flags))
-      (if (cond (:global-layers flags) (contains? (:global-layers flags) l)
-                (:global-layer-pattern flags) (zero? (mod (inc (long l))
-                                                          (long (:global-layer-pattern flags))))
-                :else true)
-        (:rope-global m) (:rope-local m))
-      (:rope-global m))))
+  (if (= :dual (get-in m [:desc :flags :rope]))
+    (if (attention-state/global-layer? m l) (:rope-global m) (:rope-local m))
+    (:rope-global m)))
 
 (defn- scalar-args [prog kvs]
   (mapv (fn [p] (get kvs (name p))) (:all-params prog)))
@@ -1130,6 +1126,19 @@
         (try (gpu/close-session! sess) (catch Throwable _))
         (throw error)))))
 
+(defn- require-contiguous-window!
+  "Refuse a contiguous step whose attention span exceeds a sliding window.
+
+  Contiguous decode and prefill attend to the whole cached prefix on every
+  layer. That is exact only while the span fits every layer's window; beyond
+  it, sliding layers would attend to tokens the model never sees."
+  [dstate attended]
+  (when-let [window (attention-state/min-window (:model dstate))]
+    (when (> (long attended) (long window))
+      (throw (ex-info (str "Contiguous GPU decode does not apply sliding windows; "
+                           "use :cache-mode :paged beyond the window")
+                      {:attended attended :window window})))))
+
 (defn prefill-rows!
   "Batched prompt prefill: upload the [T,d] input rows (token embeddings with
   any multimodal rows already spliced; zero-pad past the real prompt) and
@@ -1143,13 +1152,15 @@
                       {:cache-mode (:cache-mode dstate)
                        :prefill-T prefill-T})))
     (assert (= (alength rows) (* (long prefill-T) (long (:d-model model)))))
+    (require-contiguous-window! dstate prefill-T)
     (gpu/upload! sess :pr0 rows)
     (if prefill-executable
       (gpu-link/run! prefill-executable)
       (throw (ex-info "Decode state has no resident prefill LinkPlan executable" {})))))
 
 (defn- run-contiguous-decode!
-  [dstate]
+  [dstate attended]
+  (require-contiguous-window! dstate attended)
   (if-let [executable (:decode-executable dstate)]
     (gpu-link/run! executable)
     (throw (ex-info "Contiguous decode requires a resident decode LinkPlan"
@@ -1166,7 +1177,7 @@
     (gpu/upload! sess :positions (int-array [(int pos)]))
     (gpu/upload! sess :clenbuf (long-array [(inc pos)]))
     (gpu/upload! sess :r0 row)
-    (run-contiguous-decode! dstate)
+    (run-contiguous-decode! dstate (inc (long pos)))
     (gpu/download sess :logits)))
 
 (defn decode-token!
@@ -1283,7 +1294,7 @@
     (gpu/upload! sess :posbuf (long-array [pos]))
     (gpu/upload! sess :positions (int-array [(int pos)]))
     (gpu/upload! sess :clenbuf (long-array [(inc (long pos))]))
-    (run-contiguous-decode! dstate)
+    (run-contiguous-decode! dstate (inc (long pos)))
     (long (aget ^ints (gpu/download sess :tokbuf) 0))))
 
 (defn generate-resident
@@ -1303,7 +1314,7 @@
         (do (gpu/upload! sess :posbuf (long-array [p]))
             (gpu/upload! sess :positions (int-array [(int p)]))
             (gpu/upload! sess :clenbuf (long-array [(inc p)]))
-            (run-contiguous-decode! dstate)
+            (run-contiguous-decode! dstate (inc (long p)))
             (let [t (aget ^ints (gpu/download sess :tokbuf) 0)
                   out (conj out t)]
               (if (contains? eos-ids t) out (recur (inc p) out))))

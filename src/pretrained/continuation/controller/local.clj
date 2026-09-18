@@ -204,6 +204,11 @@
           target
           {:ok? false :reason :resident-prefix-mismatch}
 
+          (and source
+               (<= cached (long (:token-count source)))
+               (not (page-pool/fork-allowed? pool source-id cached)))
+          {:ok? false :reason :window-floor}
+
           (and source (<= cached (long (:token-count source))))
           (do
             ;; Fork the exact advertised prefix; a shorter boundary shares only

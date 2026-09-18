@@ -15,7 +15,8 @@
   swapping the compute profile — the descriptor never names a backend.
 
   A new standard architecture = a descriptor (names + dims + flags), no engine code."
-  (:require [pretrained.sampling :as samp]
+  (:require [pretrained.attention-state :as attention-state]
+            [pretrained.sampling :as samp]
             [raster.dl.nn :as nn]
             [raster.dl.attention :as attn]
             [raster.par :as par]
@@ -212,14 +213,7 @@
       (ql/qlinear-i8-q8 x wqi wsi in out)
       (ql/qlinear-i8 x wqi wsi in out))))
 
-(defn- global-layer?
-  "Is layer l a full/global-attention layer? From descriptor data: an explicit set
-  :global-layers, else a :global-layer-pattern p (every p-th, gemma-style), else all."
-  [m l]
-  (let [flags (get-in m [:desc :flags])]
-    (cond (:global-layers flags) (contains? (:global-layers flags) l)
-          (:global-layer-pattern flags) (zero? (mod (inc l) (long (:global-layer-pattern flags))))
-          :else true)))
+(def ^:private global-layer? attention-state/global-layer?)
 
 (defn- rope-theta [m l]
   (if (= :dual (get-in m [:desc :flags :rope]))
