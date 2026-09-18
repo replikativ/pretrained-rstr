@@ -65,7 +65,8 @@
   - `:checkpoint-policy`, passed to the paged handlers;
   - `:measurements`, a map or zero-argument function (default
     `default-measurements`); and
-  - `:max-pending-captures` / `:max-pending-publications` (default 1).
+  - `:max-pending-captures` / `:max-pending-publications` (default 1); and
+  - `:numerical-contract`, a structured execution variant's contract.
 
   Returns a `ModelWorker` whose `:pool`, `:worker-opts`, `:handlers`, and
   `:measurements` are ready for a controller."
@@ -73,7 +74,7 @@
    {:keys [fingerprint connection datahike-config cache-directory worker-id
            device-id max-position page-size physical-pages chunk-size eos-ids
            checkpoint-policy measurements max-pending-captures
-           max-pending-publications]
+           max-pending-publications numerical-contract]
     :or {worker-id :worker-a
          device-id :ze:0
          max-position 1024
@@ -110,7 +111,8 @@
                 (cond-> {:chunk-size (long chunk-size)
                          :max-pending-captures max-pending-captures
                          :max-pending-publications max-pending-publications}
-                  connection (assoc :connection connection))))
+                  connection (assoc :connection connection)
+                  numerical-contract (assoc :numerical-contract numerical-contract))))
       (->ModelWorker
        worker-id @decode-state @decoder @cache (:pool @decoder)
        {:worker/id worker-id :worker/epoch 0

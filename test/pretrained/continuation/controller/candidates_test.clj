@@ -3,7 +3,9 @@
             [datahike.api :as d]
             [pretrained.continuation.catalog :as catalog]
             [pretrained.continuation.chunk :as chunk]
+            [pretrained.attention-state :as attention-state]
             [pretrained.continuation.controller.candidates :as candidates]
+            [pretrained.continuation.parts :as parts]
             [pretrained.continuation.placement :as placement]))
 
 (def ^:private model "fixture-model-v1")
@@ -152,3 +154,58 @@
             @connection request
             [(observation {:worker/models #{}})]
             {:chunk-size 2}))))))
+
+(def ^:private windowed-layout
+  ;; Layer 1 is global, layer 0 slides over 8 tokens.
+  (attention-state/layout
+   {:n-layers 2 :n-kv 1 :head-dim 2
+    :desc {:flags {:global-layer-pattern 2 :sliding-window {:size 8}}}}))
+
+(deftest durable-costs-follow-the-boundary-selection
+  ;; The router prices every boundary in one linear pass. At each boundary it
+  ;; must charge exactly the parts restore loads, with the tier's fixed cost
+  ;; charged once per loaded part, because each part is one stored object.
+  (let [chunk-size 3
+        entries (vec (for [i (range 9)]
+                       {:kv/prefix-hash (keyword (str "h" i))
+                        :kv/start-token (* i chunk-size)
+                        :kv/token-count chunk-size
+                        :kv/parts [{:kv.part/group :global :kv.part/store-key (random-uuid)
+                                    :kv.part/bytes (+ 100 i)}
+                                   {:kv.part/group :window-8 :kv.part/store-key (random-uuid)
+                                    :kv.part/bytes (+ 1000 (* 10 i))}]}))
+        tier-of (fn [i] (if (even? i) :ssd :ram))
+        replicas (into {} (for [i (range 9)]
+                            [(keyword (str "h" i))
+                             [{:kv/replica-node "worker-a" :kv/replica-tier (tier-of i)
+                               :kv/replica-state :kv.replica/ready}]]))
+        obs (observation {:worker/tier-throughput-bytes-per-ms {:ssd 100 :ram 1000}
+                          :worker/tier-fixed-ms {:ssd 5.0 :ram 0.5}})
+        alternatives (#'candidates/durable-alternatives
+                      request obs entries replicas windowed-layout)
+        expected
+        (for [k (range 1 10)
+              :let [selection (parts/boundary-selection windowed-layout (subvec entries 0 k))]]
+          {:tokens (:boundary selection)
+           :bytes (parts/selected-bytes selection)
+           :load-ms (reduce + 0.0
+                            (for [{:keys [entry parts]} (:chunks selection)
+                                  :when (seq parts)
+                                  :let [i (quot (long (:kv/start-token entry)) chunk-size)
+                                        tier (tier-of i)]]
+                              (+ (* (count parts) ({:ssd 5.0 :ram 0.5} tier))
+                                 (/ (double (reduce + (map :bytes parts)))
+                                    ({:ssd 100.0 :ram 1000.0} tier)))))})]
+    (is (= 9 (count alternatives)))
+    (doseq [[alternative {:keys [tokens bytes load-ms]}] (map vector alternatives expected)]
+      (is (= tokens (:candidate/cached-token-count alternative)))
+      (is (= bytes (:candidate/cached-bytes alternative)))
+      (is (< (Math/abs (- load-ms (double (:candidate/prefix-load-ms alternative)))) 1e-9)
+          (str "load time at boundary " tokens)))
+    (testing "the window drops early chunks once the boundary passes them"
+      (is (< (:candidate/cached-bytes (nth alternatives 8))
+             (reduce + (for [e entries p (:kv/parts e)] (:kv.part/bytes p))))))
+    (testing "parts that do not match the layout yield no durable candidates"
+      (is (empty? (#'candidates/durable-alternatives
+                   request obs (mapv #(update % :kv/parts pop) entries)
+                   replicas windowed-layout))))))

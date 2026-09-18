@@ -3,7 +3,10 @@
   (:require [datahike.api :as d]
             [konserve.tiered :as tiered]
             [pretrained.continuation :as continuation]
+            [pretrained.attention-state :as attention-state]
             [pretrained.continuation.catalog :as catalog]
+            [pretrained.continuation.manifest :as manifest]
+            [pretrained.continuation.parts :as parts]
             [pretrained.continuation.chunk :as chunk]
             [pretrained.continuation.chunk-store :as chunk-store]
             [pretrained.continuation.content-provider :as content-provider]
@@ -26,7 +29,8 @@
 
 (defrecord Manager [connection owns-connection? directory chunk-store chunk-write-store
                     content-provider chunk-size max-chunk-staging-bytes
-                    calibration-alpha capture-executor publish-executor closed? metrics]
+                    calibration-alpha capture-executor publish-executor closed? metrics
+                    numerical-contract layout-records]
   Closeable
   (close [manager] (close-manager! manager)))
 
@@ -127,13 +131,17 @@
   local filestore frontend and publish to Datahike only after their write-behind
   receipts succeed. `:connection` optionally supplies an already connected,
   caller-owned Datahike connection, including a Kabel client connection; when
-  present, `datahike-config` is ignored. Each stage has one low-priority daemon
+  present, `datahike-config` is ignored. `:numerical-contract` is the
+  `{:mode :determinism}` of a structured execution variant
+  (`model-identity/numerical-contract`); it is recorded with the fingerprint's
+  durable layout and otherwise defaults to the dtype's mode and `:toleranced`. Each stage has one low-priority daemon
   worker. Queue saturation rejects cache work instead of blocking inference."
   ([datahike-config directory] (open-manager datahike-config directory {}))
   ([datahike-config directory {:keys [max-pending-captures max-pending-publications
                                       max-concurrent-localizations chunk-size
                                       max-chunk-staging-bytes chunk-backend-store connection
-                                      warm-catalog-query? calibration-alpha]
+                                      warm-catalog-query? calibration-alpha
+                                      numerical-contract]
                                :or {max-pending-captures 2
                                     max-pending-publications 2
                                     max-concurrent-localizations 2
@@ -189,7 +197,9 @@
                              :chunks-planned 0 :chunks-reused 0 :chunks-stored 0
                              :prefix-lookups 0 :full-hits 0 :partial-hits 0 :misses 0
                              :requested-tokens 0 :cached-tokens 0
-                             :restored-chunks 0 :restored-bytes 0}))]
+                             :restored-chunks 0 :restored-bytes 0})
+                      numerical-contract
+                      (atom {}))]
        (try
          (when warm-catalog-query?
            (catalog/lookup-chunks
@@ -208,22 +218,63 @@
         present-hashes (into #{} (map :kv/prefix-hash) present)]
     (vec (remove #(contains? present-hashes (:chunk/prefix-hash %)) descriptors))))
 
+(defn- store-part!
+  [^Manager manager tensor-chunk]
+  (if (identical? (:chunk-store manager) (:chunk-write-store manager))
+    (chunk-store/put! (:chunk-store manager) tensor-chunk)
+    (chunk-store/put-write-behind!
+     (:chunk-store manager) (:chunk-write-store manager) tensor-chunk)))
+
+(defn- persist-node!
+  "Store the parts of one chain node and return its catalog-ready description.
+
+  A single part without `:chunk/group` is today's node-level blob. Several
+  parts become `:parts`, each with its group and storage fields."
+  [^Manager manager parts]
+  (let [parts (if (map? parts) [parts] (vec parts))
+        head (dissoc (first parts) :chunk/payload :chunk/group :chunk/slabs
+                     :chunk/elements-per-slab)]
+    (if (and (= 1 (count parts)) (nil? (:chunk/group (first parts))))
+      (merge (dissoc (first parts) :chunk/payload) (store-part! manager (first parts)))
+      (assoc head :parts
+             (mapv (fn [part]
+                     (assoc (store-part! manager part) :group (:chunk/group part)))
+                   parts)))))
+
 (defn- persist-chunks!
-  [^Manager manager tensor-chunks]
-  (mapv (fn [tensor-chunk]
-          (merge (dissoc tensor-chunk :chunk/payload)
-                 (if (identical? (:chunk-store manager)
-                                 (:chunk-write-store manager))
-                   (chunk-store/put! (:chunk-store manager) tensor-chunk)
-                   (chunk-store/put-write-behind!
-                    (:chunk-store manager) (:chunk-write-store manager)
-                    tensor-chunk))))
-        tensor-chunks))
+  [^Manager manager nodes]
+  (mapv #(persist-node! manager %) nodes))
+
+(defn- node-store-keys
+  [stored]
+  (if-let [parts (:parts stored)]
+    (mapv :store-key parts)
+    [(:store-key stored)]))
+
+(defn- node-bytes
+  [stored]
+  (if-let [parts (:parts stored)]
+    (reduce + 0 (map :bytes parts))
+    (:bytes stored)))
+
+(defn- durable-node!
+  [stored]
+  (if (:parts stored)
+    (update stored :parts #(mapv chunk-store/await-durable! %))
+    (chunk-store/await-durable! stored)))
+
+(defn- local-node
+  [stored]
+  (if (:parts stored)
+    (update stored :parts #(mapv chunk-store/local-result %))
+    (chunk-store/local-result stored)))
 
 (defn- publish-chunks!
   [^Manager manager model-fingerprint stored-chunks]
-  (let [durable-chunks (mapv chunk-store/await-durable! stored-chunks)]
-    (catalog/put-chunks! (:connection manager) model-fingerprint durable-chunks)
+  (let [durable-chunks (mapv durable-node! stored-chunks)]
+    (catalog/put-chunks! (:connection manager) model-fingerprint durable-chunks
+                         {:content-algorithm chunk-store/content-algorithm
+                          :numerical-contract (:numerical-contract manager)})
     durable-chunks))
 
 (defn checkpoint-cpu-chunks!
@@ -237,7 +288,7 @@
                  manager (:continuation/model-fingerprint state) plan)
         _ (record-chunk-plan! manager plan missing)
         stored (persist-chunks!
-                manager (mapv #(chunk/cpu-tensor-chunk state %) missing))]
+                manager (mapv #(chunk/cpu-tensor-chunks state %) missing))]
     (publish-chunks! manager (:continuation/model-fingerprint state) stored)))
 
 (defn- submit-chunk-checkpoint!
@@ -276,13 +327,13 @@
                   stored
                   (mapv (fn [descriptor]
                           (let [started (System/nanoTime)
-                                tensor-chunk (export descriptor)
+                                tensor-parts (export descriptor)
                                 exported (System/nanoTime)
-                                stored (first (persist-chunks!
-                                               manager [tensor-chunk]))
+                                stored (persist-node! manager tensor-parts)
                                 persisted (System/nanoTime)
-                                _ (chunk-store/prepare-mmap-payload!
-                                   (:chunk-store manager) (:store-key stored))
+                                _ (doseq [store-key (node-store-keys stored)]
+                                    (chunk-store/prepare-mmap-payload!
+                                     (:chunk-store manager) store-key))
                                 prepared (System/nanoTime)]
                             (vswap! export-ns + (- exported started))
                             (vswap! persistence-ns + (- persisted exported))
@@ -291,7 +342,7 @@
                         missing)
                   capture-finished (System/nanoTime)
                   capture-ms (/ (- capture-finished capture-started) 1.0e6)
-                  stored-bytes (reduce + 0 (map :bytes stored))
+                  stored-bytes (reduce + 0 (map node-bytes stored))
                   _ (reset! phase-timings
                             {:context-ms (/ (- context-finished context-started)
                                             1.0e6)
@@ -329,9 +380,9 @@
               (try
                 (.execute ^ExecutorService (:publish-executor manager)
                           ^Runnable publish-task)
-                (.complete captured (mapv chunk-store/local-result stored))
+                (.complete captured (mapv local-node stored))
                 (catch RejectedExecutionException error
-                  (.complete captured (mapv chunk-store/local-result stored))
+                  (.complete captured (mapv local-node stored))
                   (.completeExceptionally published error))))
             (catch Throwable error
               (reject! error))))]
@@ -378,7 +429,7 @@
    (fn []
      {:model-fingerprint (:continuation/model-fingerprint state)
       :plan (:chunks (chunk/continuation-plan state (:chunk-size manager)))
-      :export #(continuation-gpu/export-gpu-chunk state %)})))
+      :export #(continuation-gpu/export-gpu-chunks state %)})))
 
 (defn- complete-export-after-error!
   [pool export error]
@@ -441,8 +492,14 @@
              processed (long (:token-count resident-route))]
          {:model-fingerprint model-fingerprint
           :plan (chunk/plan tokens processed (:chunk-size manager))
-          :export #(await-paged-export!
-                    pool continuation-id model-fingerprint %)}))
+          :export (fn [descriptor]
+                    (if (:groups (:layout pool))
+                      (mapv #(await-paged-export!
+                              pool continuation-id model-fingerprint
+                              (assoc descriptor :chunk/group (:id %)))
+                            (:groups (:layout pool)))
+                      [(await-paged-export!
+                        pool continuation-id model-fingerprint descriptor)]))}))
      {:estimated-staging-bytes estimated-staging-bytes})))
 
 (defn lookup-chunk-prefix
@@ -486,6 +543,51 @@
       :matched matched
       :cached-token-count cached-token-count})))
 
+(defn- restore-record
+  "Return the layout record for restoring `model-fingerprint` into
+  `durable-layout`, the layout the restore target stores.
+
+  A recorded layout must equal the target's; a catalog written before layout
+  records existed falls back to the target's layout."
+  [^Manager manager model-fingerprint durable-layout]
+  (let [recorded (or (get @(:layout-records manager) model-fingerprint)
+                     ;; A recorded layout never changes, so it is cached per
+                     ;; fingerprint once found.
+                     (when-let [record (catalog/lookup-layout @(:connection manager)
+                                                              model-fingerprint)]
+                       (swap! (:layout-records manager) assoc model-fingerprint record)
+                       record))]
+    (when (and recorded (not= (:layout recorded) durable-layout))
+      (throw (ex-info "The fingerprint's recorded durable layout differs from the restore target"
+                      {:model-fingerprint model-fingerprint
+                       :recorded (:layout recorded)
+                       :target durable-layout})))
+    (when (and (nil? recorded) (get-in durable-layout [:attention-state :groups]))
+      ;; Only single-group catalogs predate layout records, so a multi-group
+      ;; chain without one cannot be checked against its target.
+      (throw (ex-info "A multi-group restore requires the fingerprint's recorded layout"
+                      {:model-fingerprint model-fingerprint})))
+    (or recorded
+        (catalog/layout-record model-fingerprint durable-layout
+                               (:numerical-contract manager)))))
+
+(defn- paged-load-plan
+  "Return the certified manifest's load plan for the matched chain."
+  [^Manager manager pool model-fingerprint matched]
+  (if (empty? matched)
+    {:parts [] :window-floors {}}
+    (manifest/load-plan
+     (manifest/boundary-manifest
+      (restore-record manager model-fingerprint (page-pool/durable-layout pool))
+      model-fingerprint matched))))
+
+(defn- part-descriptor
+  [pool part]
+  {:chunk/start (:start part)
+   :chunk/token-count (:token-count part)
+   :chunk/group (:group part)
+   :chunk/layout (page-pool/durable-layout pool)})
+
 (defn restore-gpu-prefix
   "Restore the longest cached prompt prefix and compute only its missing suffix.
 
@@ -493,24 +595,38 @@
   address-space and page residency. Returns cache statistics with a ready GPU
   continuation under `:continuation`."
   [^Manager manager dstate model-fingerprint tokens]
+  (when-let [window (attention-state/min-window (:model dstate))]
+    ;; Contiguous decode refuses spans beyond a sliding window; refuse the
+    ;; restore before loading rows it could never use.
+    (when (> (count tokens) (long window))
+      (throw (ex-info (str "Contiguous GPU decode does not apply sliding windows; "
+                           "use :cache-mode :paged beyond the window")
+                      {:tokens (count tokens) :window window}))))
   (let [{:keys [matched cached-token-count] :as lookup-result}
         (lookup-chunk-prefix manager model-fingerprint tokens)]
-    (doseq [entry matched]
+    ;; Contiguous decode attends to the whole cached span, so every part of
+    ;; every chunk is restored regardless of retention group.
+    (doseq [entry matched
+            part (parts/entry-parts entry)]
       (chunk-store/with-mmap-payload
-       (:chunk-store manager) (:kv/store-key entry)
+       (:chunk-store manager) (:store-key part)
        (fn [payload]
          (when-not (and (= :float32 (:element-type payload))
                         (= :little-endian (:byte-order payload)))
            (throw (ex-info "Stored KV chunk is not a little-endian FP32 payload"
-                           {:store-key (:kv/store-key entry)
+                           {:store-key (:store-key part)
                             :element-type (:element-type payload)
                             :byte-order (:byte-order payload)})))
-         (continuation-gpu/upload-gpu-chunk! dstate entry (:segment payload)))))
+         (continuation-gpu/upload-gpu-chunk!
+          dstate (assoc entry :chunk/group (:group part)) (:segment payload)))))
     (swap! (:metrics manager)
            (fn [metrics]
              (-> metrics
                  (update :restored-chunks + (count matched))
-                 (update :restored-bytes + (reduce + 0 (map :kv/bytes matched))))))
+                 (update :restored-bytes +
+                         (reduce + 0 (for [entry matched
+                                           part (parts/entry-parts entry)]
+                                       (long (:bytes part))))))))
     (assoc lookup-result
            :continuation
            (continuation-gpu/resume-prompt-from-prefix
@@ -552,11 +668,16 @@
           manager model-fingerprint tokens
           {:maximum-cached-token-count maximum-cached-token-count})
          lookup-finished (System/nanoTime)
-         allocation-started lookup-finished
+         ;; The plan is computed before allocation: a layout mismatch allocates
+         ;; nothing, and the route is created with its window floors.
+         {load-parts :parts window-floors :window-floors}
+         (paged-load-plan manager pool model-fingerprint matched)
+         allocation-started (System/nanoTime)
          admission (when admit?
                      (residency/admit-route!
                       pool continuation-id cached-token-count
                       {:policy policy
+                       :window-floors window-floors
                        :protected-continuation-ids protected-continuation-ids}))
          _ (when (and admission (not (:admissible? admission)))
              (throw (ex-info "Cached prefix cannot be admitted to the GPU page pool"
@@ -566,41 +687,38 @@
                           (page-pool/allocate-route!
                            pool continuation-id cached-token-count
                            {:policy policy
+                            :window-floors window-floors
                             :capacity-reservation capacity-reservation}))
          allocation-finished (System/nanoTime)
          mapping-lifecycle-ns (volatile! 0)
          gpu-restore-ns (volatile! 0)]
      (try
-       (doseq [entry matched]
-         (let [mapping-started (System/nanoTime)
-               transfer-ns (volatile! 0)]
-           (chunk-store/with-mmap-payload
-            (:chunk-store manager) (:kv/store-key entry)
-            (fn [payload]
-              (when-not (and (= :int16 (:element-type payload))
-                             (= :little-endian (:byte-order payload)))
-                (throw (ex-info "Stored KV chunk is not a little-endian FP16 carrier payload"
-                                {:store-key (:kv/store-key entry)
-                                 :element-type (:element-type payload)
-                                 :byte-order (:byte-order payload)})))
-              (let [started (System/nanoTime)]
-                (page-pool/restore-chunk!
-                 pool continuation-id
-                 {:chunk/start (:kv/start-token entry)
-                  :chunk/token-count (:kv/token-count entry)
-                  :chunk/layout {:dtype :float16
-                                 :attention-state
-                                 (assoc (:layout pool) :dtype :float16)}}
-                 (:segment payload))
-                (vreset! transfer-ns (- (System/nanoTime) started)))))
-           (let [lifecycle-ns (- (System/nanoTime) mapping-started)]
-             (vswap! gpu-restore-ns + @transfer-ns)
-             (vswap! mapping-lifecycle-ns + (- lifecycle-ns @transfer-ns)))))
-       (swap! (:metrics manager)
-              (fn [metrics]
-                (-> metrics
-                    (update :restored-chunks + (count matched))
-                    (update :restored-bytes + (reduce + 0 (map :kv/bytes matched))))))
+       (do
+         (doseq [part load-parts]
+           (let [mapping-started (System/nanoTime)
+                 transfer-ns (volatile! 0)]
+             (chunk-store/with-mmap-payload
+              (:chunk-store manager) (:store-key part)
+              (fn [payload]
+                (when-not (and (= :int16 (:element-type payload))
+                               (= :little-endian (:byte-order payload)))
+                  (throw (ex-info "Stored KV chunk is not a little-endian FP16 carrier payload"
+                                  {:store-key (:store-key part)
+                                   :element-type (:element-type payload)
+                                   :byte-order (:byte-order payload)})))
+                (let [started (System/nanoTime)]
+                  (page-pool/restore-chunk!
+                   pool continuation-id (part-descriptor pool part) (:segment payload))
+                  (vreset! transfer-ns (- (System/nanoTime) started)))))
+             (let [lifecycle-ns (- (System/nanoTime) mapping-started)]
+               (vswap! gpu-restore-ns + @transfer-ns)
+               (vswap! mapping-lifecycle-ns + (- lifecycle-ns @transfer-ns)))))
+         (swap! (:metrics manager)
+                (fn [metrics]
+                  (-> metrics
+                      (update :restored-chunks + (count matched))
+                      (update :restored-bytes +
+                              (reduce + 0 (map #(long (:bytes %)) load-parts)))))))
        (cond-> (assoc lookup-result
                       :resident-route resident-route
                       :restore-phase-timings
@@ -703,16 +821,20 @@
          (lookup-chunk-prefix
           manager model-fingerprint tokens
           {:maximum-cached-token-count maximum-cached-token-count})
+         {load-parts :parts window-floors :window-floors}
+         (paged-load-plan manager pool model-fingerprint matched)
          resident-route
          (page-pool/allocate-route!
           pool continuation-id cached-token-count
-          {:policy policy :capacity-reservation capacity-reservation})
+          {:policy policy :window-floors window-floors
+           :capacity-reservation capacity-reservation})
          provider (:content-provider manager)]
      (try
-       (doseq [entry matched]
+       (do
+       (doseq [part load-parts]
          (when (cancelled?)
            (throw (cancellation-error continuation-id :chunk)))
-         (let [address (content-provider/content-address (:kv/store-key entry))
+         (let [address (content-provider/content-address (:store-key part))
                localization (content/submit-localization! provider address)
                _ (await-storage-boundary!
                   provider localization continuation-id cancelled? poll-ms)
@@ -726,29 +848,26 @@
                               (= :little-endian (:byte-order payload)))
                  (throw (ex-info
                          "Stored KV chunk is not a little-endian FP16 carrier payload"
-                         {:store-key (:kv/store-key entry)
+                         {:store-key (:store-key part)
                           :element-type (:element-type payload)
                           :byte-order (:byte-order payload)})))
                (let [transfer
                      (page-pool/submit-restore-chunk!
-                      pool continuation-id
-                      {:chunk/start (:kv/start-token entry)
-                       :chunk/token-count (:kv/token-count entry)
-                       :chunk/layout
-                       {:dtype :float16
-                        :attention-state (assoc (:layout pool) :dtype :float16)}}
+                      pool continuation-id (part-descriptor pool part)
                       (:segment payload) [lease])]
                  (vreset! submitted? true)
                  (await-transfer-boundary!
-                  pool transfer continuation-id cancelled? poll-ms)
-                 (swap! (:metrics manager)
-                        (fn [metrics]
-                          (-> metrics
-                              (update :restored-chunks inc)
-                              (update :restored-bytes + (:kv/bytes entry)))))))
+                  pool transfer continuation-id cancelled? poll-ms)))
              (finally
                (when-not @submitted?
                  (.close ^AutoCloseable lease))))))
+       ;; Chunks and bytes are counted together, only for a completed restore.
+       (swap! (:metrics manager)
+              (fn [metrics]
+                (-> metrics
+                    (update :restored-chunks + (count matched))
+                    (update :restored-bytes +
+                            (reduce + 0 (map #(long (:bytes %)) load-parts)))))))
        (when (cancelled?)
          (throw (cancellation-error continuation-id :completion)))
        (assoc lookup-result :resident-route resident-route)

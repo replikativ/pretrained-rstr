@@ -44,3 +44,41 @@
                             :buffer-prefix "x" :count 1 :elements-per-token 1}
                            {:name :b :tensor-key :continuation/b
                             :buffer-prefix "x" :count 1 :elements-per-token 1}]}}})))))
+
+(deftest rejects-slabs-that-are-not-sized-per-token
+  (let [state-slab {:name :state :tensor-key :continuation/state
+                    :buffer-prefix "ss" :count 2}]
+    (testing "a fixed-size recurrent state is not silently allocated per token"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"only per-token slabs are implemented"
+           (attention-state/layout
+            {:desc {:attention-state
+                    {:slabs [(assoc state-slab :elements-per-sequence 64)]}}}))))
+    (testing "a slab-level extent is rejected with its unsupported keys"
+      (let [data (try (attention-state/layout
+                       {:desc {:attention-state
+                               {:slabs [(assoc state-slab
+                                               :elements-per-token 4
+                                               :extent :sequence)]}}})
+                      nil
+                      (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+        (is (= [:extent] (:unsupported data)))))
+    (testing "a non-positional token axis is rejected"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #":position token axis"
+           (attention-state/layout
+            {:n-layers 1 :n-kv 1 :head-dim 2
+             :desc {:attention-state {:token-axis :sequence}}}))))))
+
+(deftest one-window-predicate-for-every-decoder
+  (let [gemma {:n-layers 18
+               :desc {:flags {:global-layer-pattern 6 :sliding-window {:size 512}}}}]
+    (is (= [5 11 17] (filterv #(attention-state/global-layer? gemma %) (range 18))))
+    (is (nil? (attention-state/layer-window gemma 5)))
+    (is (= 512 (attention-state/layer-window gemma 0)))
+    (is (= 512 (attention-state/min-window gemma)))
+    (is (nil? (attention-state/min-window {:n-layers 2 :desc {:flags {}}}))
+        "a model without a window has no limit")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"at least one token"
+                          (attention-state/layer-window
+                           (assoc-in gemma [:desc :flags :sliding-window :size] 0) 0)))))

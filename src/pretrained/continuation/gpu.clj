@@ -152,6 +152,52 @@
      (merge (export-gpu-metadata state)
             (allocate-tensor-groups layout processed)))))
 
+(declare export-gpu-chunk)
+
+(defn- export-gpu-group-chunk
+  [state descriptor layout group]
+  (let [metadata (export-gpu-metadata state)
+        dstate (:continuation/dstate state)
+        slabs (attention-state/group-payload-plan
+               layout group (:chunk/token-count descriptor))
+        slab-layouts (into {} (map (juxt :name identity)) (:slabs layout))
+        payload (float-array (reduce + 0 (map :elements slabs)))]
+    (when (> (+ (:chunk/start descriptor) (:chunk/token-count descriptor))
+             (:continuation/processed-count state))
+      (throw (ex-info "GPU chunk extends beyond the occupied KV prefix"
+                      {:descriptor descriptor
+                       :processed-count (:continuation/processed-count state)})))
+    (gpu/download-ranges!
+     (:sess dstate)
+     (mapv (fn [{:keys [slab layer element-offset elements]}]
+             (let [slab-layout (get slab-layouts slab)]
+               [(attention-state/buffer-key slab-layout layer) payload
+                {:src-element (* (long (:chunk/start descriptor))
+                                 (:elements-per-token slab-layout))
+                 :dst-element element-offset
+                 :elements elements}]))
+           slabs))
+    (merge descriptor
+           {:chunk/version 2
+            :chunk/model-fingerprint (:continuation/model-fingerprint metadata)
+            :chunk/layout (:continuation/layout metadata)
+            :chunk/group (:id group)
+            :chunk/slabs slabs
+            ;; A group's members share one row width.
+            :chunk/elements-per-slab (:elements (first slabs))
+            :chunk/payload payload})))
+
+(defn export-gpu-chunks
+  "Download one token-range descriptor, one durable part per retention group.
+
+  A layout with one group returns exactly `[(export-gpu-chunk ...)]`."
+  [state descriptor]
+  (let [layout (get-in (export-gpu-metadata state)
+                       [:continuation/layout :attention-state])]
+    (if (:groups layout)
+      (mapv #(export-gpu-group-chunk state descriptor layout %) (:groups layout))
+      [(export-gpu-chunk state descriptor)])))
+
 (defn export-gpu-chunk
   "Download one immutable token-range descriptor into a contiguous float payload.
 
@@ -162,6 +208,9 @@
   (let [metadata (export-gpu-metadata state)
         dstate (:continuation/dstate state)
         layout (get-in metadata [:continuation/layout :attention-state])
+        _ (when (:groups layout)
+            (throw (ex-info "A layout with several retention groups is stored per group"
+                            {:groups (mapv :id (:groups layout))})))
         slabs (attention-state/payload-plan layout (:chunk/token-count descriptor))
         slab-layouts (into {} (map (juxt :name identity)) (:slabs layout))
         payload (float-array (reduce + 0 (map :elements slabs)))]
@@ -191,13 +240,17 @@
   "Upload one contiguous chunk payload at its declared token offset.
 
   `payload` may be a float array or a Konserve mmap MemorySegment. The complete
-  per-layer batch is validated before any device buffer is changed."
+  per-layer batch is validated before any device buffer is changed.
+  `:chunk/group` names the retention group the payload holds; it defaults to
+  the layout's implicit group."
   [dstate descriptor payload]
   (let [{:keys [model maxpos sess]} dstate
         start (long (:kv/start-token descriptor (:chunk/start descriptor)))
         token-count (long (:kv/token-count descriptor (:chunk/token-count descriptor)))
         layout (attention-state/layout model)
-        slabs (attention-state/payload-plan layout token-count)
+        group (attention-state/group
+               layout (or (:chunk/group descriptor) attention-state/implicit-group-id))
+        slabs (attention-state/group-payload-plan layout group token-count)
         slab-layouts (into {} (map (juxt :name identity)) (:slabs layout))
         expected-elements (reduce + 0 (map :elements slabs))]
     (when (> (+ start token-count) (long maxpos))

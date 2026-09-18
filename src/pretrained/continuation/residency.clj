@@ -184,7 +184,7 @@
   Planning and application are serialized on the pool, so a lease cannot appear
   between validation and eviction. Returns the plan plus `:resident-route`, or
   an unchanged non-admissible plan. `opts` accepts `:start-position`, `:policy`,
-  and `:protected-continuation-ids`."
+  `:window-floors`, and `:protected-continuation-ids`."
   ([pool continuation-id token-count]
    (admit-route! pool continuation-id token-count {}))
   ([pool continuation-id token-count opts]
@@ -199,4 +199,4 @@
            (assoc plan :resident-route
                   (page-pool/allocate-route!
                    pool continuation-id token-count
-                   (select-keys opts [:start-position :policy])))))))))
+                   (select-keys opts [:start-position :policy :window-floors])))))))))

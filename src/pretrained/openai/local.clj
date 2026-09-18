@@ -248,6 +248,9 @@
                          model (cond-> {:execution-variant execution-variant}
                                  weights-id (assoc :weights-id weights-id)))
             quantized-weights (decoder-gpu/gpu-quantize model)
+            ;; The paged pool stores FP16 rows.
+            _ (model-identity/require-cache-dtype! execution-variant :float16)
+            contract (model-identity/numerical-contract execution-variant)
             {:keys [tok encode decode]} (:tokenizer model)
             render (chat/render-fn directory)
             tokenize-chat (or tokenize-chat
@@ -267,7 +270,8 @@
                     page-size (assoc :page-size page-size)
                     physical-pages (assoc :physical-pages physical-pages)
                     eos-ids (assoc :eos-ids eos-ids)
-                    measurements (assoc :measurements measurements))))
+                    measurements (assoc :measurements measurements)
+                    contract (assoc :numerical-contract contract))))
         (let [server
               (open-server-with-worker
                @connection

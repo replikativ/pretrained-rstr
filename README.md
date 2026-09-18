@@ -73,6 +73,9 @@ known local model directory, then call the task verb.
 
 ;; Select resident GPU execution while loading a supported model.
 ;; CPU decode honors {:temperature :top-k :top-p :seed}; GPU decode is greedy.
+;; This contiguous GPU path does not apply sliding windows, so for Gemma it
+;; refuses sequences longer than the 512-token window; the paged path used by
+;; `pretrained.openai.local` applies them.
 (def gpu-model (lm/load-lm :gemma-3-270m-it {:gpu? true}))
 ```
 

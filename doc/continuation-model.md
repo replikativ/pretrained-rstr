@@ -81,6 +81,27 @@ where a replica is ready, and which worker requested it. Tensor bytes follow a
 separate data plane through mmap-compatible Konserve stores or an authoritative
 object store.
 
+## Retention groups
+
+Attention state is stored per retention group: an ordered set of
+`[slab layer]` members with one extent and one row width. A model without
+sliding windows has one implicit token group, and its layout, fingerprint, and
+chunk content ids are exactly those it had before groups existed. A model with
+sliding-window layers, such as Gemma 3, has a `:global` token group for its
+full-attention layers and a `:window-N` group for its sliding layers. Group
+membership comes from the same predicate the decoders use to choose attention
+visibility (`attention-state/global-layer?` and `layer-window`).
+
+A chain node of a multi-group layout stores one part per group, published in
+one Datahike transaction; the node carries no node-level blob, so a path that
+does not understand parts fails instead of loading one part as a chunk.
+Restoring the state at boundary b loads every token-group part but only the
+window-group parts that intersect `[b - w + 1, b)`, the rows the next token
+attends to. `pretrained.continuation.parts` makes that selection;
+`pretrained.continuation.manifest` turns it into a certified Raster
+`NumericalStateManifest`, and paged restore loads exactly the manifest's
+`load-plan`.
+
 ## Lifecycle of a continuation
 
 Two movements connect the layers. Publish flows down from resident pages to
@@ -105,11 +126,17 @@ compatible chunks exist, together with where ready replicas are placed.
 **Restore** localizes each chunk through Konserve, verifies its content identity
 and fingerprint, maps it into page-pool pages, and marks the replica ready. A
 continuation becomes runnable only after every required page event completes.
+For a window group, the restored route records a window floor, the first row
+it holds; rows below it are never loaded and never read, because Raster lowers
+a sliding window to the attention loop's lower bound. The fingerprint's
+recorded layout must equal the target pool's layout.
 Datahike is consulted for lookup and placement, not per token; workers keep
 their hot scheduling state locally.
 
 **Fork** creates a second continuation that references the source's pages,
 either the whole route or the pages covering a shorter advertised boundary.
+A fork whose next token would attend below a window floor is refused, and a
+restored route advertises only the boundaries a fork can serve.
 Nothing is copied until a branch appends into a partially filled page, at
 which point that page alone is copied. A worker advertises each resident
 route at its exact end and at every chunk boundary, so a request that shares

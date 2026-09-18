@@ -3,7 +3,8 @@
   (:require [datahike.api :as d]
             [pretrained.continuation :as continuation]
             [pretrained.continuation.chunk-store :as chunk-store]
-            [pretrained.continuation.manager :as manager])
+            [pretrained.continuation.manager :as manager]
+            [pretrained.continuation.parts :as parts])
   (:import [java.nio.file Files Path]
            [java.nio.file.attribute FileAttribute]))
 
@@ -62,7 +63,7 @@
             mmap-summary
             (chunk-store/with-mmap-payload
              (manager/local-chunk-store cache)
-             (:kv/store-key first-entry)
+             (:store-key (first (parts/entry-parts first-entry)))
              #(select-keys % [:element-type :element-count :byte-order]))]
         {:processed-tokens 512
          :chunk-size 256

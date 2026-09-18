@@ -55,15 +55,22 @@
               :ownership :external
               :allocation-id allocation-id}))
 
+(defn- all-members
+  [layout]
+  (vec (for [slab (:slabs layout)
+             layer (range (:count slab))]
+         [(:name slab) layer])))
+
 (defn- transfer-plan
-  [id device-id descriptor layout page-size physical-pages buffer-keys
+  [id device-id descriptor layout members page-size physical-pages buffer-keys
    staging-keys index-key nblocks direction]
   (let [index-node :block-indices
+        slab-by-name (into {} (map (juxt :name identity)) (:slabs layout))
         layer-specs
         (vec
-         (for [slab (:slabs layout)
-               layer (range (:count slab))
-               :let [slab-layer [(:name slab) layer]
+         (for [[slab-name layer] members
+               :let [slab (get slab-by-name slab-name)
+                     slab-layer [slab-name layer]
                      block-width (* (long page-size)
                                     (long (:elements-per-token slab)))]]
            {:slab-layer slab-layer
@@ -110,29 +117,43 @@
   "Allocate dense FP16 staging and compose Raster gather/scatter graphs.
 
   The engine borrows the page-pool buffers, shares one staging workspace across
-  both directions, and owns its linked executables. Call `close!` before closing
-  the owning Raster session."
-  [session layout page-size physical-pages buffer-keys nblocks]
+  both directions, and owns its linked executables. `members` restricts the
+  graphs to `[slab layer]` pairs, one retention group; it defaults to every
+  member. A scatter writes exactly its members' rows, so restoring one group
+  never overwrites another group's rows in shared pages. Call `close!` before
+  closing the owning Raster session."
+  ([session layout page-size physical-pages buffer-keys nblocks]
+   (open! session layout page-size physical-pages buffer-keys nblocks
+          (all-members layout)))
+  ([session layout page-size physical-pages buffer-keys nblocks members]
   (when-not (pos-int? nblocks)
     (throw (ex-info "Block-transfer extent is invalid"
                     {:nblocks nblocks})))
   (let [device-id (:device-id @session)
         prefix (str "kv-block-" (UUID/randomUUID))
         index-key (keyword (str prefix "-indices"))
+        slab-by-name (into {} (map (juxt :name identity)) (:slabs layout))
+        members (vec members)
+        _ (when-not (and (seq members)
+                         (every? (fn [[slab-name layer]]
+                                   (when-let [slab (get slab-by-name slab-name)]
+                                     (< -1 (long layer) (long (:count slab)))))
+                                 members))
+            (throw (ex-info "Block-transfer members must name existing slab layers"
+                            {:members members})))
         staging-keys
         (into {}
-              (for [slab (:slabs layout)
-                    layer (range (:count slab))]
-                [[(:name slab) layer]
-                 (keyword (str prefix "-" (name (:name slab)) "-" layer))]))
+              (for [[slab-name layer] members]
+                [[slab-name layer]
+                 (keyword (str prefix "-" (name slab-name) "-" layer))]))
         allocations
         (into
          {index-key [:int nblocks nil :state]}
-         (for [slab (:slabs layout)
-               layer (range (:count slab))
+         (for [[slab-name layer] members
                :let [elements (* (long nblocks) (long page-size)
-                                 (long (:elements-per-token slab)))]]
-           [(get staging-keys [(:name slab) layer])
+                                 (long (:elements-per-token
+                                        (get slab-by-name slab-name))))]]
+           [(get staging-keys [slab-name layer])
             [:half elements nil :state]]))
         opened (atom [])]
     (try
@@ -141,7 +162,9 @@
             external-buffers
             (into {}
                   (map (fn [key] [key (gpu/buffer session key)]))
-                  (concat allocation-keys (vals buffer-keys)))
+                  ;; A LinkPlan binds exactly the buffers it names, so only
+                  ;; this group's pool buffers are external.
+                  (concat allocation-keys (map #(get buffer-keys %) members)))
             executables
             (into {}
                   (for [direction [:scatter :gather]
@@ -150,7 +173,7 @@
                                      (random-uuid)]
                                     device-id
                                     (compiled-descriptor direction device-id)
-                                    layout page-size physical-pages buffer-keys
+                                    layout members page-size physical-pages buffer-keys
                                     staging-keys index-key nblocks direction)
                               executable
                               (gpu-link/instantiate!
@@ -165,7 +188,7 @@
         (doseq [key (keys allocations)]
           (when (gpu/buffer session key)
             (gpu/free-buffer! session key)))
-        (throw error)))))
+        (throw error))))))
 
 (defn index-buffer-key
   "Return the engine's resident physical-page index buffer key."

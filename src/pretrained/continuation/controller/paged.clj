@@ -77,12 +77,16 @@
        (merge policy
               {:model-fingerprint (:request/model-fingerprint request)
                :prefix-hash (:chunk/prefix-hash tail)
-               ;; Every chunk boundary of the resident prefix, so routing can
-               ;; match a request that shares only part of this route.
+               ;; Every chunk boundary of the resident prefix that a fork can
+               ;; serve, so routing can match a request that shares only part
+               ;; of this route. A restored route whose window groups hold rows
+               ;; only from a floor cannot serve boundaries below it.
                :prefix-boundaries
-               (mapv (fn [{:chunk/keys [start token-count prefix-hash]}]
-                       {:token-count (+ (long start) (long token-count))
-                        :prefix-hash prefix-hash})
+               (into []
+                     (comp (map (fn [{:chunk/keys [start token-count prefix-hash]}]
+                                  {:token-count (+ (long start) (long token-count))
+                                   :prefix-hash prefix-hash}))
+                           (filter #(page-pool/fork-allowed? pool id (:token-count %))))
                      chunks)
                :bytes (page-pool/route-bytes pool id)})))))
 

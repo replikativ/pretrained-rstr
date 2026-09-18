@@ -44,3 +44,46 @@
     (testing "an unidentifiable checkpoint is rejected"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"weights-id"
                             (model-identity/compatibility-fingerprint model))))))
+
+(deftest structured-execution-variants
+  (let [directory (Files/createTempDirectory
+                   "pretrained-model-identity-" (make-array FileAttribute 0))
+        weights (.resolve directory "model.safetensors")
+        variant {:name :gpu-paged
+                 :cache {:attention-state {:dtype :float16 :quantization :none}}
+                 :numerical {:mode :fp16-kv :determinism :reproducible-order}}]
+    (try
+      (Files/write weights (byte-array [1 2 3])
+                   (make-array java.nio.file.OpenOption 0))
+      (let [model (fixture-model directory)
+            fingerprint #(model-identity/compatibility-fingerprint
+                          model {:execution-variant %})]
+        (testing "keyword variants hash exactly as before"
+          (is (= (fingerprint :default) (model-identity/compatibility-fingerprint model))))
+        (testing "cache precision is part of identity"
+          (is (not= (fingerprint variant)
+                    (fingerprint (assoc-in variant [:cache :attention-state :dtype]
+                                           :float32)))))
+        (testing "the numerical contract is readable from the variant"
+          (is (= {:mode :fp16-kv :determinism :reproducible-order}
+                 (model-identity/numerical-contract variant)))
+          (is (nil? (model-identity/numerical-contract :gpu-q4k-paged))))
+        (testing "malformed variants are rejected before hashing"
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"known :determinism"
+                                (fingerprint (assoc-in variant [:numerical :determinism]
+                                                       :sometimes))))
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsupported keys"
+                                (fingerprint (assoc variant :rope :yarn)))))
+        (testing "the cache names exactly the layout's groups"
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"every attention-state group"
+                                (fingerprint (assoc variant :cache
+                                                    {:global {:dtype :float16
+                                                              :quantization :none}})))))
+        (testing "the cache dtype must be the storage dtype"
+          (is (= variant (model-identity/require-cache-dtype! variant :float16)))
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"storage dtype"
+                                (model-identity/require-cache-dtype! variant :float32)))
+          (is (= :default (model-identity/require-cache-dtype! :default :float32)))))
+      (finally
+        (Files/deleteIfExists weights)
+        (Files/deleteIfExists directory)))))
