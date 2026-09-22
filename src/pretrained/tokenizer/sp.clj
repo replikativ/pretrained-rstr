@@ -35,6 +35,7 @@
   [path]
   (let [raw (json/read-str (slurp path))
         model (get raw "model")
+        pre-tokenizer (get raw "pre_tokenizer")
         vocab-raw (get model "vocab")
         merges-raw (get model "merges")
         added (get raw "added_tokens")
@@ -75,6 +76,14 @@
      :special-pattern special-pattern
      :bos-id (.get ^HashMap vocab "<bos>")
      :eos-id (.get ^HashMap vocab "<eos>")
+     :cls-id (or (.get ^HashMap vocab "[CLS]") (.get ^HashMap vocab "<bos>"))
+     :sep-id (or (.get ^HashMap vocab "[SEP]") (.get ^HashMap vocab "<eos>"))
+     :pad-id (or (.get ^HashMap vocab "[PAD]") (.get ^HashMap vocab "<pad>"))
+     :mask-id (or (.get ^HashMap vocab "[MASK]") (.get ^HashMap vocab "<mask>"))
+     :mask-token (cond (.containsKey ^HashMap vocab "[MASK]") "[MASK]"
+                       (.containsKey ^HashMap vocab "<mask>") "<mask>")
+     :prepend-metaspace? (= "always" (get pre-tokenizer "prepend_scheme"))
+     :split-metaspace? (boolean (get pre-tokenizer "split"))
      :ignore-merges (boolean (get model "ignore_merges"))
      :byte-fallback (boolean (get model "byte_fallback"))}))
 
@@ -122,12 +131,22 @@
   Special added tokens present verbatim in `text` (for example
   `<start_of_turn>`) encode to their ids; the surrounding text is BPE-encoded."
   ([tk text] (encode tk text true))
-  ([{:keys [^HashMap vocab bos-id special-pattern] :as tk} ^String text add-bos?]
+  ([{:keys [^HashMap vocab bos-id special-pattern prepend-metaspace? split-metaspace?] :as tk}
+    ^String text add-bos?]
    (let [unk (.getOrDefault vocab "<unk>" (int 0))
          encode-plain
          (fn [^String segment]
            (let [norm (.replace segment " " META)
-                 pieces (when (pos? (.length norm)) (bpe tk norm))]
+                 norm (if (and prepend-metaspace?
+                               (pos? (.length norm))
+                               (not (.startsWith norm META)))
+                        (str META norm)
+                        norm)
+                 pre-tokens (cond
+                              (zero? (.length norm)) nil
+                              split-metaspace? (re-seq #"▁[^▁]*" norm)
+                              :else [norm])
+                 pieces (mapcat #(bpe tk %) pre-tokens)]
              (map (fn [s] (let [v (.get vocab s)] (if v (int v) unk))) pieces)))
          ids (if special-pattern
                (let [m (.matcher ^java.util.regex.Pattern special-pattern text)]

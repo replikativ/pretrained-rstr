@@ -76,6 +76,106 @@ known local model directory, then call the task verb.
 (def gpu-model (lm/load-lm :gemma-3-270m-it {:gpu? true}))
 ```
 
+### Typed decisions with Laya
+
+The three checkpoints bundled by `convaiinnovations/laya` are available without
+Python. Only the selected checkpoint is downloaded, and every question in one
+`predict` call shares a padded encoder/head pass.
+
+```clojure
+(require '[pretrained.decision :as decision]
+         '[pretrained.decision.router :as laya-router])
+
+(def agent (decision/load-decision :laya-english))
+
+(def state
+  {:from "user@acme.com"
+   :subject "Duplicate charge"
+   :body "Please refund the duplicate or we will cancel."})
+
+(def questions
+  {:department
+   {:type :choice
+    :instructions "Which department should handle this request?"
+    :criteria {:billing "invoices, payments, refunds"
+               :technical "bugs, outages, system errors"
+               :other "everything else"}}
+   :urgency
+   {:type :score
+    :instructions "How urgent is this request?"
+    :criteria ["not urgent" "soon" "critical"]}
+   :refund-requested
+   {:type :noul
+    :instructions "Does the user explicitly request a refund?"}})
+
+(agent state questions)
+;; => {:model :laya, :answers {...},
+;;     :usage {:input-tokens ... :output-tokens 0}}
+
+;; The named form is equivalent when it reads better at a call site.
+(decision/predict agent state questions)
+
+;; Route English to ModernBERT and non-English/scripted text to mmBERT.
+(def route-decision
+  (laya-router/router {:max-loaded 2
+                       :preload [:english :multilingual]}))
+(route-decision state questions)
+;; Adds :routing with :model, :checkpoint, :reason, and detection metadata.
+
+;; Route overrides use the callable three-argument form.
+(route-decision state questions {:model :typed-decisions})
+
+;; Routers are Closeable; this unloads every retained checkpoint.
+(.close ^java.io.Closeable route-decision)
+```
+
+Registry keys are `:laya-english`, `:laya-multilingual`, and
+`:laya-typed-decisions`. The router also supports explicit `:model`, `:task`,
+and `:lang` overrides, opt-in typed-workflow detection, preloading, attachment
+of an existing agent, unloading, and bounded LRU residency. For example:
+
+```clojure
+(laya-router/preload! router [:english :multilingual])
+(laya-router/predict router hindi-state questions {:lang :hi})
+(laya-router/unload! router)
+```
+
+Like Python's `agent.predict(state, questions)`, both forms execute entirely in
+the current process. No Python runtime, subprocess, HTTP service, or JSON
+round-trip is involved; Clojure maps and keywords go in and an immutable result
+map comes back. The router is lazy by default, or `:preload true` loads all
+checkpoints up front.
+
+The CPU implementation is the numerical reference path: checkpoint values are
+expanded to F32 and match the upstream Torch outputs at public precision. An
+experimental fixed-shape Level Zero path keeps both ModernBERT and Laya's two
+decision-head transformer layers resident. It is intentionally a lower-level
+API until padded batching and the scorer are resident too:
+
+```clojure
+(require '[pretrained.decision.laya :as laya]
+         '[pretrained.decision.laya-gpu :as laya-gpu])
+
+(def built
+  (laya/build-sequence (:tokenizer agent) state (:department questions)))
+
+(def resident
+  (laya-gpu/compile-decision-hidden
+   agent (count (:ids built))
+   {:target :ze:0 :gemm-precision :mixed-f16-f32}))
+
+(def hidden
+  (laya-gpu/decision-hidden-tokens
+   resident (:ids built) (:question-type built)))
+
+(laya-gpu/close! resident)
+```
+
+Mixed F16/F32 is the useful policy on Intel Arc; callers can select a different
+Raster precision schedule for other GPUs. Cold graph instantiation remains
+expensive, so compiled shapes should be cached and replayed rather than created
+per request.
+
 Downloads are sha-pinned and resume into `~/.cache/raster/models`. `HF_TOKEN` is
 honoured. Passing a local directory skips download.
 
@@ -131,6 +231,7 @@ tokens. `temperature`, `top_p`, `stop`, and
 | `:all-minilm-l6-v2`, `:bge-small-en-v1.5` | BERT embedding | 23–33M f32 | sentence-transformers parity |
 | `:moonshine-streaming-medium` | streaming English ASR | 245M | LibriSpeech-100 WER 1.62%, matching reference |
 | `:qwen3-asr-0.6b`, `:qwen3-asr-1.7b` | multilingual ASR | 0.6/1.7B | character-identical reference transcript |
+| `:laya-english`, `:laya-multilingual`, `:laya-typed-decisions` | typed decisions | 322–421M f32 CPU | tokenizer, encoder, and typed-output parity vs Torch |
 | `:gemma-3-270m-it`, `:gemma-3-1b-it` | decoder LLM | Q4/Q8 | token-exact GPU anchors |
 | `:qwen3-0.6b`, `:qwen3-1.7b`, `:smollm2-135m-instruct`, `:smollm2-360m-instruct` | decoder LLM | Q4/Q8 | shared descriptor-driven engine |
 
