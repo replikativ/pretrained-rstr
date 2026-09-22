@@ -26,6 +26,26 @@
 (def ^:private allow-re
   #"(?i)(\.safetensors|\.json|\.jinja|tokenizer\.model|merges\.txt|vocab\..*)$")
 
+(defn- included-path?
+  "Whether `path` is selected by an exact path or a `dir/**` prefix. An empty
+  selector preserves the historical extension-based snapshot behavior."
+  [include path]
+  (if (seq include)
+    (boolean
+     (some (fn [selector]
+             (if (str/ends-with? selector "/**")
+               (str/starts-with? path (subs selector 0 (- (count selector) 2)))
+               (= path selector)))
+           include))
+    (boolean (re-find allow-re path))))
+
+(defn- selected-entry? [include entry]
+  (and (= "file" (get entry "type"))
+       (included-path? include (get entry "path"))))
+
+(defn- manifest-file [dir snapshot]
+  (io/file dir (if snapshot (str ".files-" (name snapshot) ".json") ".files.json")))
+
 (def ^:private ^HttpClient client
   (-> (HttpClient/newBuilder) (.followRedirects HttpClient$Redirect/NORMAL) (.build)))
 
@@ -93,9 +113,11 @@
   "Ensure `repo` (e.g. \"Qwen/Qwen3-ASR-0.6B-hf\") is in the local cache; download
   what's missing. Returns the model dir path. Offline-tolerant: if the API is
   unreachable but a complete cached copy exists, uses it."
-  [repo]
-  (let [dir (io/file *cache-dir* (str/replace repo "/" "--"))
-        manifest (io/file dir ".files.json")
+  ([repo] (ensure-model repo {}))
+  ([repo {:keys [include snapshot subfolder]}]
+   (let [dir (io/file *cache-dir* (str/replace repo "/" "--"))
+         selected-dir (if subfolder (io/file dir subfolder) dir)
+         manifest (manifest-file dir snapshot)
         complete? (fn []
                     (and (.exists manifest)
                          (every? (fn [{:strs [path size]}]
@@ -103,16 +125,21 @@
                                      (and (.exists f) (= (.length f) (long size)))))
                                  (json/read-str (slurp manifest)))))]
     (if (complete?)
-      (.getPath dir)
+      (.getPath selected-dir)
       (let [info (try (get-json (str "https://huggingface.co/api/models/" repo))
                       (catch Exception e
                         (if (complete?) nil (throw e))))]
         (if (nil? info)
-          (.getPath dir)
+          (.getPath selected-dir)
           (let [sha (get info "sha")
                 tree (get-json (str "https://huggingface.co/api/models/" repo
                                     "/tree/main?recursive=true"))
-                files (filterv #(re-find allow-re (get % "path")) tree)]
+                ;; Recursive tree responses include directory nodes. They match
+                ;; prefix selectors too but have no downloadable resolve URL.
+                files (filterv #(selected-entry? include %) tree)
+                _ (when (empty? files)
+                    (throw (ex-info (str "HF snapshot selection matched no files for " repo)
+                                    {:repo repo :include include :snapshot snapshot})))]
             (.mkdirs dir)
             (doseq [f files]
               (loop [attempt 1]
@@ -123,4 +150,4 @@
                     (recur (inc attempt))))))
             (spit manifest (json/write-str (mapv #(select-keys % ["path" "size"]) files)))
             (spit (io/file dir ".revision") sha)
-            (.getPath dir)))))))
+            (.getPath selected-dir))))))))

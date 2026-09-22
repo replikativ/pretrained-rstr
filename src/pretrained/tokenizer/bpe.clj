@@ -15,6 +15,7 @@
   (:require [clojure.data.json :as json]
             [clojure.string :as str])
   (:import [java.util HashMap]
+           [java.text Normalizer Normalizer$Form]
            [java.util.regex Pattern]))
 
 ;; ---------------------------------------------------------------------------
@@ -209,6 +210,7 @@
   [path]
   (let [raw (json/read-str (slurp path))
         model (get raw "model")
+        normalizer (get raw "normalizer")
         vocab-raw (get model "vocab")
         merges-raw (get model "merges")
         added-tokens-raw (get raw "added_tokens")
@@ -233,7 +235,8 @@
         ;; Also check for LLaMA-style tokens
         bos-id (or bos-id (.get vocab "<s>"))
         eos-id (or eos-id (.get vocab "</s>"))
-        pad-id (or (.get vocab "<pad>") (.get vocab "<|padding|>"))]
+        pad-id (or (.get vocab "<pad>") (.get vocab "<|padding|>")
+                   (.get vocab "[PAD]"))]
     {:vocab vocab
      :id->token id->token
      :merges merges
@@ -248,7 +251,13 @@
                                             added-tokens-raw)))))
      :bos-id (some-> bos-id long)
      :eos-id (some-> eos-id long)
-     :pad-id (some-> pad-id long)}))
+     :pad-id (some-> pad-id long)
+     :cls-id (some-> (or (.get vocab "[CLS]") bos-id) long)
+     :sep-id (some-> (or (.get vocab "[SEP]") eos-id) long)
+     :mask-id (some-> (or (.get vocab "[MASK]") (.get vocab "<mask>")) long)
+     :mask-token (cond (.containsKey vocab "[MASK]") "[MASK]"
+                       (.containsKey vocab "<mask>") "<mask>")
+     :normalizer-type (get normalizer "type")}))
 
 ;; ---------------------------------------------------------------------------
 ;; Encoding
@@ -283,8 +292,11 @@
   is BPE-encoded. Special tokens (BOS/EOS) are NOT automatically added;
   use encode-with-special to include them."
   ^longs [tokenizer ^String text]
-  (let [{:keys [vocab merges added-tokens special-pattern]} tokenizer
+  (let [{:keys [vocab merges added-tokens special-pattern normalizer-type]} tokenizer
         ^HashMap added-tok->id (:token->id added-tokens)
+        text (if (= "NFC" normalizer-type)
+               (Normalizer/normalize text Normalizer$Form/NFC)
+               text)
         ids (transient [])
         encode-segment!
         (fn [^String segment]

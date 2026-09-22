@@ -6,6 +6,20 @@
             [pretrained.hub :as hub])
   (:import [java.io File]))
 
+(deftest selective-path-matching
+  (let [included? #'hub/included-path?]
+    (is (included? ["model.safetensors" "encoder/**"] "model.safetensors"))
+    (is (included? ["model.safetensors" "encoder/**"] "encoder/config.json"))
+    (is (not (included? ["model.safetensors" "encoder/**"]
+                        "multilingual/model.safetensors")))
+    (is (included? nil "tokenizer.json"))
+    (is (not (included? nil "README.md"))))
+  (let [selected? #'hub/selected-entry?]
+    (is (selected? ["multilingual/**"]
+                   {"type" "file" "path" "multilingual/model.safetensors"}))
+    (is (not (selected? ["multilingual/**"]
+                        {"type" "directory" "path" "multilingual/encoder"})))))
+
 (deftest cache-complete-detection
   (let [dir (doto (File/createTempFile "hubc" "") (.delete) (.mkdirs))]
     (binding [hub/*cache-dir* (.getPath dir)]
