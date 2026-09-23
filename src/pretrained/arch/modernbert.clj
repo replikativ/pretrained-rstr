@@ -145,6 +145,8 @@
   (native-kernel #'attn/rope-prefill-strided-table!))
 (def ^:private native-pack-heads-strided
   (native-kernel #'ops/pack-heads-strided))
+(def ^:private native-unpack-heads
+  (native-kernel #'ops/unpack-heads))
 (def ^:private native-segmented-mask
   (native-kernel #'attn/attn-prefill-mask-segmented-head-major!))
 (def ^:private native-softmax (native-kernel #'attn/attn-prefill-softmax!))
@@ -221,6 +223,12 @@
                    src (long nrows) (long heads) (long head-dim)
                    (long row-stride) (long column-offset))))
 
+(defn- unpack-heads
+  ^floats [^floats src nrows heads head-dim]
+  ;; The value-returning AOT wrapper owns reusable storage, while callers retain
+  ;; each attention result as the residual stream.
+  (aclone ^floats (@native-unpack-heads src (long nrows) (long heads) (long head-dim))))
+
 (defn attention-strided!
   "Attention over Q/K/V fields embedded in independently strided row-major
   sources. Packing remains a generic layout map and both contractions remain
@@ -242,7 +250,7 @@
     (@native-softmax scores (long nrows) (long heads))
     (blas/batched-gemm-nn! scores vh context-h (long heads) (long nrows)
                            (long nrows) (long head-dim) (float 1.0))
-    (let [context (ops/unpack-heads context-h nrows heads head-dim)]
+    (let [context (unpack-heads context-h nrows heads head-dim)]
       (System/arraycopy context 0 out 0 (alength out))))
   out)
 
@@ -271,7 +279,7 @@
     (@native-softmax scores (long nrows) matrix-batch)
     (blas/batched-gemm-nn! scores vh context-h matrix-batch (long nrows)
                            (long nrows) (long head-dim) (float 1.0))
-    (let [context (ops/unpack-heads context-h rows heads head-dim)]
+    (let [context (unpack-heads context-h rows heads head-dim)]
       (System/arraycopy context 0 out 0 (alength out))))
   out)
 
