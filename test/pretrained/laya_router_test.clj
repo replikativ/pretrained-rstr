@@ -100,3 +100,22 @@
     (is (apply = (map deref workers)))
     (is (= 1 @loads))
     (is (= [:english] (router/loaded r)))))
+
+(deftest gpu-router-options-close-evicted-and-unloaded-agents
+  (let [loads (atom [])
+        closed (atom [])]
+    (with-redefs [decision/load-decision
+                  (fn [checkpoint opts]
+                    (swap! loads conj [checkpoint opts])
+                    (reify java.io.Closeable
+                      (close [_] (swap! closed conj checkpoint))))]
+      (let [r (router/router {:max-loaded 1
+                              :decision-opts {:gpu? true :target :ze:0}})]
+        (router/load! r :english)
+        (router/load! r :multilingual)
+        (is (= [:laya-english] @closed))
+        (.close ^java.io.Closeable r)
+        (is (= [:laya-english :laya-multilingual] @closed))
+        (is (= [[:laya-english {:gpu? true :target :ze:0}]
+                [:laya-multilingual {:gpu? true :target :ze:0}]]
+               @loads))))))
