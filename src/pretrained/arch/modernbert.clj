@@ -139,6 +139,8 @@
   (native-kernel #'attn/rope-prefill-strided!))
 (def ^:private native-pack-heads-strided
   (native-kernel #'ops/pack-heads-strided))
+(def ^:private native-segmented-mask
+  (native-kernel #'attn/attn-prefill-mask-segmented-head-major!))
 (def ^:private native-softmax (native-kernel #'attn/attn-prefill-softmax!))
 
 (defn- window-mask-fallback!
@@ -210,6 +212,35 @@
     (blas/batched-gemm-nn! scores vh context-h (long heads) (long nrows)
                            (long nrows) (long head-dim) (float 1.0))
     (let [context (ops/unpack-heads context-h nrows heads head-dim)]
+      (System/arraycopy context 0 out 0 (alength out))))
+  out)
+
+(defn attention-segmented-strided!
+  "Uniform padded batch of independent attention segments. Q/K/V use the
+  ordinary row-strided view contract; `lengths` prevents padding or neighboring
+  examples from entering any active softmax row. Matrix batches are ordered
+  head-major then example-major, matching `pack-heads-strided`."
+  ^floats [^floats q ^floats k ^floats v ^floats out lengths
+           batch nrows heads head-dim scale left right
+           q-row-stride q-column-offset
+           k-row-stride k-column-offset
+           v-row-stride v-column-offset]
+  (let [rows (* (long batch) (long nrows))
+        matrix-batch (* (long heads) (long batch))
+        ^longs lengths (long-array lengths)
+        qh (pack-heads-strided q rows heads head-dim q-row-stride q-column-offset)
+        kh (pack-heads-strided k rows heads head-dim k-row-stride k-column-offset)
+        vh (pack-heads-strided v rows heads head-dim v-row-stride v-column-offset)
+        scores (float-array (* matrix-batch (long nrows) (long nrows)))
+        context-h (float-array (* matrix-batch (long nrows) (long head-dim)))]
+    (blas/batched-gemm-nt! qh kh scores matrix-batch (long nrows)
+                           (long head-dim) (long nrows) (float scale))
+    (@native-segmented-mask scores lengths (long batch) (long nrows) (long heads)
+                            (long left) (long right))
+    (@native-softmax scores (long nrows) matrix-batch)
+    (blas/batched-gemm-nn! scores vh context-h matrix-batch (long nrows)
+                           (long nrows) (long head-dim) (float 1.0))
+    (let [context (ops/unpack-heads context-h rows heads head-dim)]
       (System/arraycopy context 0 out 0 (alength out))))
   out)
 

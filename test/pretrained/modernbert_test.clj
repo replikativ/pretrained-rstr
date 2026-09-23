@@ -49,7 +49,34 @@
           expected (nn/hadamard activated gate (* rows width))
           actual (float-array (* rows width))]
       (mb/gelu-erf-mul-strided! fused actual rows stride 0 width width)
-      (is (< (max-error expected actual) 1.0e-7)))))
+      (is (< (max-error expected actual) 1.0e-7))))
+  (testing "one padded matrix batch matches independent active segments"
+    (let [batch 2 nrows 3 heads 2 head-dim 2 width (* heads head-dim)
+          lengths [2 3]
+          q (random-floats (* batch nrows width) 15)
+          k (random-floats (* batch nrows width) 16)
+          v (random-floats (* batch nrows width) 17)
+          actual (float-array (* batch nrows width))]
+      (mb/attention-segmented-strided!
+       q k v actual lengths batch nrows heads head-dim 0.5 2 2
+       width 0 width 0 width 0)
+      (doseq [b (range batch)]
+        (let [len (long (nth lengths b))
+              elements (* len width)
+              source (* b nrows width)
+              qb (float-array elements)
+              kb (float-array elements)
+              vb (float-array elements)
+              scores (float-array (* heads len len))
+              expected (float-array elements)]
+          (System/arraycopy q source qb 0 elements)
+          (System/arraycopy k source kb 0 elements)
+          (System/arraycopy v source vb 0 elements)
+          (mb/attention! qb kb vb scores expected len heads head-dim 0.5 2)
+          (dotimes [i elements]
+            (is (< (Math/abs
+                    (double (- (aget expected i) (aget actual (+ source i)))))
+                   1.0e-7))))))))
 
 (deftest resident-blocks-preserve-modernbert-semantics
   (let [seq-len 4 d-model 8 d-ff 16 n-heads 2 head-dim 4
