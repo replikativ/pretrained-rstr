@@ -139,6 +139,8 @@
 (def ^:private native-relu (native-kernel #'nn/leaky-relu!))
 (def ^:private native-rope-strided
   (native-kernel #'attn/rope-prefill-strided!))
+(def ^:private native-rope-strided-table
+  (native-kernel #'attn/rope-prefill-strided-table!))
 (def ^:private native-pack-heads-strided
   (native-kernel #'ops/pack-heads-strided))
 (def ^:private native-segmented-mask
@@ -191,6 +193,14 @@
   ^floats [^floats src ^floats out nrows heads head-dim theta row-stride column-offset]
   (@native-rope-strided src out (long nrows) (long heads) (long head-dim)
                         (double theta) (long row-stride) (long column-offset))
+  out)
+
+(defn rope-strided-table!
+  ^floats [^floats src ^floats cosines ^floats sines ^floats out
+           nrows heads head-dim row-stride column-offset]
+  (@native-rope-strided-table src cosines sines out
+                              (long nrows) (long heads) (long head-dim)
+                              (long row-stride) (long column-offset))
   out)
 
 (defn- pack-heads-strided
@@ -277,19 +287,39 @@
                    (.getMessage error)))
         modernbert-block))))
 
+(defn- rope-table
+  [nrows head-dim theta]
+  (let [half (quot (long head-dim) 2)
+        cosines (float-array (* (long nrows) half))
+        sines (float-array (* (long nrows) half))
+        log-theta (Math/log (double theta))]
+    (dotimes [row (long nrows)]
+      (dotimes [i half]
+        (let [frequency (Math/exp (* (/ (* -2.0 i) (double head-dim)) log-theta))
+              angle (* (double row) frequency)
+              index (+ (* row half) i)]
+          (aset cosines index (float (Math/cos angle)))
+          (aset sines index (float (Math/sin angle))))))
+    {:cosines cosines :sines sines}))
+
 (defn load-model
   "Load the ModernBERT encoder embedded in a Laya checkpoint directory."
   [dir]
   (let [cfg (json/read-str (slurp (str dir "/encoder/config.json")) :key-fn keyword)
-        d (long (:hidden_size cfg))]
+        d (long (:hidden_size cfg))
+        n-heads (long (:num_attention_heads cfg))
+        head-dim (quot d n-heads)
+        max-position (long (or (:max_position_embeddings cfg) 8192))
+        global-theta (double (or (:global_rope_theta cfg) 160000.0))
+        local-theta (double (or (:local_rope_theta cfg) 10000.0))]
     {:dir dir
      :config cfg
      :weights (st/load-safetensors (str dir "/model.safetensors"))
      :d-model d
      :d-ff (long (:intermediate_size cfg))
      :n-layers (long (:num_hidden_layers cfg))
-     :n-heads (long (:num_attention_heads cfg))
-     :head-dim (quot d (long (:num_attention_heads cfg)))
+     :n-heads n-heads
+     :head-dim head-dim
      :vocab-size (long (:vocab_size cfg))
      :eps (double (or (:norm_eps cfg) (:layer_norm_eps cfg) 1.0e-5))
      :local-attention (long (:local_attention cfg))
@@ -298,8 +328,12 @@
      ;; fields. Some converted mmBERT configs also contain `rope_parameters`,
      ;; but the reference model currently ignores that map; notably its nested
      ;; sliding theta is 160000 while the executed local_rope_theta is 10000.
-     :global-theta (double (or (:global_rope_theta cfg) 160000.0))
-     :local-theta (double (or (:local_rope_theta cfg) 10000.0))
+     :global-theta global-theta
+     :local-theta local-theta
+     :rope-tables (into {}
+                        (map (fn [theta]
+                               [theta (rope-table max-position head-dim theta)]))
+                        (distinct [global-theta local-theta]))
      :zero-bias (float-array d)}))
 
 (defn weight
@@ -429,6 +463,7 @@
                           rows d-model (* 3 d-model))
         global? (zero? (mod layer global-every))
         theta (if global? (:global-theta model) (:local-theta model))
+        {:keys [cosines sines]} (get (:rope-tables model) theta)
         scale (/ 1.0 (Math/sqrt (double head-dim)))
         context (float-array (* rows d-model))]
     ;; Keep attention segmented by example. Linears above and below operate on
@@ -440,10 +475,10 @@
             source-row0 (* row0 (* 3 d-model))
             qb (float-array (* len d-model))
             kb (float-array (* len d-model))
-            _ (rope-strided! qkv qb len n-heads head-dim theta
-                             (* 3 d-model) source-row0)
-            _ (rope-strided! qkv kb len n-heads head-dim theta
-                             (* 3 d-model) (+ source-row0 d-model))
+            _ (rope-strided-table! qkv cosines sines qb len n-heads head-dim
+                                   (* 3 d-model) source-row0)
+            _ (rope-strided-table! qkv cosines sines kb len n-heads head-dim
+                                   (* 3 d-model) (+ source-row0 d-model))
             scores (float-array (* len n-heads len))
             out (float-array (* len d-model))
             _ (attention-strided!
