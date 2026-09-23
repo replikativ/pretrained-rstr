@@ -1,6 +1,8 @@
 (ns pretrained.modernbert-test
   (:require [clojure.test :refer [deftest is testing]]
-            [pretrained.arch.modernbert :as mb]))
+            [pretrained.arch.modernbert :as mb]
+            [raster.dl.array-ops :as ops]
+            [raster.dl.nn :as nn]))
 
 (defn- random-floats [n seed]
   (let [out (float-array n)
@@ -11,6 +13,83 @@
 
 (defn- max-error [^floats a ^floats b]
   (reduce max 0.0 (map #(Math/abs (double (- %1 %2))) a b)))
+
+(deftest strided-projection-fields-preserve-dense-results
+  (testing "compiled reassociated LayerNorm matches the reference"
+    (let [rows 3 width 7
+          x (random-floats (* rows width) 10)
+          gamma (random-floats width 11)
+          beta (random-floats width 12)
+          expected (nn/layer-norm x gamma beta rows width 1.0e-5)
+          actual (mb/layer-norm x gamma beta rows width 1.0e-5)]
+      (is (< (max-error expected actual) 2.0e-6))))
+  (testing "compiled residual addition matches the reference"
+    (let [a (random-floats 37 8)
+          b (random-floats 37 9)]
+      (is (< (max-error (nn/residual-add a b 37) (mb/residual-add a b))
+             1.0e-7))))
+  (testing "Q/K/V fields embedded in one projection match dense attention"
+    (let [nrows 3 heads 2 head-dim 2 width (* heads head-dim)
+          stride 15 q-offset 1 k-offset 6 v-offset 11
+          q (random-floats (* nrows width) 11)
+          k (random-floats (* nrows width) 12)
+          v (random-floats (* nrows width) 13)
+          packed (float-array (* nrows stride))
+          _ (doseq [row (range nrows)
+                    col (range width)]
+              (aset packed (+ (* row stride) q-offset col)
+                    (aget q (+ (* row width) col)))
+              (aset packed (+ (* row stride) k-offset col)
+                    (aget k (+ (* row width) col)))
+              (aset packed (+ (* row stride) v-offset col)
+                    (aget v (+ (* row width) col))))
+          dense-scores (float-array (* heads nrows nrows))
+          strided-scores (float-array (* heads nrows nrows))
+          dense-out (float-array (* nrows width))
+          strided-out (float-array (* nrows width))]
+      (mb/attention! q k v dense-scores dense-out nrows heads head-dim 0.5 0)
+      (mb/attention-strided! packed packed packed strided-scores strided-out
+                             nrows heads head-dim 0.5 0
+                             stride q-offset stride k-offset stride v-offset)
+      (is (< (max-error dense-scores strided-scores) 1.0e-7))
+      (is (< (max-error dense-out strided-out) 1.0e-7))))
+  (testing "fused strided GeGLU matches the materialized operations"
+    (let [rows 3 width 5 stride (* 2 width)
+          fused (random-floats (* rows stride) 14)
+          activated (ops/slice-strided-2d fused rows stride 0 width)
+          gate (ops/slice-strided-2d fused rows stride width width)
+          _ (nn/gelu-erf! activated activated (* rows width))
+          expected (nn/hadamard activated gate (* rows width))
+          actual (float-array (* rows width))]
+      (mb/gelu-erf-mul-strided! fused actual rows stride 0 width width)
+      (is (< (max-error expected actual) 1.0e-7))))
+  (testing "one padded matrix batch matches independent active segments"
+    (let [batch 2 nrows 3 heads 2 head-dim 2 width (* heads head-dim)
+          lengths [2 3]
+          q (random-floats (* batch nrows width) 15)
+          k (random-floats (* batch nrows width) 16)
+          v (random-floats (* batch nrows width) 17)
+          actual (float-array (* batch nrows width))]
+      (mb/attention-segmented-strided!
+       q k v actual lengths batch nrows heads head-dim 0.5 2 2
+       width 0 width 0 width 0)
+      (doseq [b (range batch)]
+        (let [len (long (nth lengths b))
+              elements (* len width)
+              source (* b nrows width)
+              qb (float-array elements)
+              kb (float-array elements)
+              vb (float-array elements)
+              scores (float-array (* heads len len))
+              expected (float-array elements)]
+          (System/arraycopy q source qb 0 elements)
+          (System/arraycopy k source kb 0 elements)
+          (System/arraycopy v source vb 0 elements)
+          (mb/attention! qb kb vb scores expected len heads head-dim 0.5 2)
+          (dotimes [i elements]
+            (is (< (Math/abs
+                    (double (- (aget expected i) (aget actual (+ source i)))))
+                   1.0e-7))))))))
 
 (deftest resident-blocks-preserve-modernbert-semantics
   (let [seq-len 4 d-model 8 d-ff 16 n-heads 2 head-dim 4

@@ -261,8 +261,12 @@
   "Single-query MHA over cached K/V [n, heads*hd] — MHA as GQA with n-kv = n-q
   (group 1) on the raster substrate decode-attention kernel."
   ^floats [^floats q ^floats kc ^floats vc n heads hd]
-  (attn/gqa-decode-attention q kc vc (long n) (long heads) (long heads) (long hd)
-                             (/ 1.0 (Math/sqrt (double hd)))))
+  (let [out (float-array (* (long heads) (long hd)))
+        scratch (float-array (* (long heads) (long n)))]
+    (attn/gqa-decode-attention-gpu!
+     q kc vc out scratch (long n) (long heads) 1 (long heads) (long hd)
+     (/ 1.0 (Math/sqrt (double hd))))
+    out))
 
 (defn- attend-cache+w
   "attend-cache that also ACCUMULATES head-averaged attention weights into wsink

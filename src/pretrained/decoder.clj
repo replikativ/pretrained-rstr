@@ -226,6 +226,30 @@
     (if (global-layer? m l) (:rope-global m) (:rope-local m))
     (:rope-global m)))
 
+(defn- decode-attention
+  "Run the current Raster decode primitive, presenting a sliding KV suffix as
+  a compact cache when necessary. Raster owns the attention arithmetic; this
+  adapter only preserves the descriptor-level window policy."
+  ^floats [^floats q ^floats k ^floats v cache-len kv-start
+           n-q n-kv head-dim scale]
+  (let [active-len (- (long cache-len) (long kv-start))
+        kvrow (* (long n-kv) (long head-dim))
+        elements (* active-len kvrow)
+        [ks vs] (if (zero? (long kv-start))
+                  [k v]
+                  (let [ks (float-array elements)
+                        vs (float-array elements)
+                        source-offset (* (long kv-start) kvrow)]
+                    (System/arraycopy k source-offset ks 0 elements)
+                    (System/arraycopy v source-offset vs 0 elements)
+                    [ks vs]))
+        out (float-array (* (long n-q) (long head-dim)))
+        scratch (float-array (* (long n-q) active-len))]
+    (attn/gqa-decode-attention-gpu!
+     q ks vs out scratch active-len (long n-q) (quot (long n-q) (long n-kv))
+     (long n-kv) (long head-dim) (double scale))
+    out))
+
 ;; ---------------------------------------------------------------------------
 ;; The generic decode step
 ;; ---------------------------------------------------------------------------
@@ -279,16 +303,11 @@
                      ^floats kcl (nth kc l) ^floats vcl (nth vc l)
                      _ (System/arraycopy knew 0 kcl (* p kvrow) kvrow)
                      _ (System/arraycopy vnew 0 vcl (* p kvrow) kvrow)
-                     cl (inc p) group (quot n-q n-kv)
+                     cl (inc p)
                      kv-start (if (and sw (not (global-layer? m l)))
                                 (max 0 (- cl (long (:size sw)))) 0)
-                     ao (float-array (* n-q head-dim))
-                     _ (cq/run-par-fn!
-                        (fn [wid n]
-                          (let [chunk (quot (+ n-q (dec (int n))) (int n))
-                                h0 (* (int wid) chunk) hc (min chunk (- n-q h0))]
-                            (when (pos? hc)
-                              (attn/gqa-decode-attention-heads! q kcl vcl ao cl kv-start h0 hc group n-kv head-dim attn-scale)))))
+                     ao (decode-attention q kcl vcl cl kv-start
+                                          n-q n-kv head-dim attn-scale)
                      o (qsl qm (nm :attn-o l) ao)
                      o (if sand? (nn/rms-norm o (raw m :attn-post-norm l) 1 d-model eps go) o)
                      o (tapped tap :attn-out l o)
