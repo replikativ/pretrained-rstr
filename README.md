@@ -41,8 +41,11 @@ transport. See [Numerical memory beyond LLM inference](doc/numerical-memory.md).
 Use JDK 21 or newer and add a released library version to `deps.edn`:
 
 ```clojure
-{:deps {org.replikativ/pretrained-rstr {:mvn/version "0.1.52"}}}
+{:deps {org.replikativ/pretrained-rstr {:mvn/version "0.1.53"}}}
 ```
+
+The snippet is a known released version; use the current version shown by the
+Clojars badge above for the newest APIs described below.
 
 Raster is pinned in `deps.edn`. Intel MKL or OpenBLAS is required for
 floating-point GEMM paths. ffmpeg is optional for non-WAV audio. GPU execution
@@ -108,17 +111,19 @@ Python. Only the selected checkpoint is downloaded, and every question in one
    {:type :noul
     :instructions "Does the user explicitly request a refund?"}})
 
-(agent state questions)
+(def result (agent state questions))
 ;; => {:model :laya, :answers {...},
 ;;     :usage {:input-tokens ... :output-tokens 0}}
+
+(get-in result [:answers :department :choice])
+;; => :billing (the result depends on the input and checkpoint)
 
 ;; The named form is equivalent when it reads better at a call site.
 (decision/predict agent state questions)
 
 ;; Route English to ModernBERT and non-English/scripted text to mmBERT.
 (def route-decision
-  (laya-router/router {:max-loaded 2
-                       :preload [:english :multilingual]}))
+  (laya-router/router {:preload [:english :multilingual]}))
 (route-decision state questions)
 ;; Adds :routing with :model, :checkpoint, :reason, and detection metadata.
 
@@ -135,10 +140,20 @@ and `:lang` overrides, opt-in typed-workflow detection, preloading, attachment
 of an existing agent, unloading, and bounded LRU residency. For example:
 
 ```clojure
-(laya-router/preload! router [:english :multilingual])
-(laya-router/predict router hindi-state questions {:lang :hi})
-(laya-router/unload! router)
+(laya-router/preload! route-decision [:english :multilingual])
+(laya-router/predict route-decision
+                     {:body "मुझसे दो बार शुल्क लिया गया"}
+                     questions {:lang :hi})
+(laya-router/unload! route-decision)
 ```
+
+The router keeps English and multilingual checkpoints resident by default
+(`:max-loaded 2`), but loads each only when first needed. Set `:max-loaded 1`
+on a memory-constrained host; switching languages will then reload the evicted
+checkpoint. If your application already knows the language, pass `{:lang :de}`
+or install a `:lang-guess` code/function on the router; a function returning
+`nil` lets the built-in detector decide. Explicit `:model`, `:task`, and `:lang`
+take precedence over a guess.
 
 Choice option order affects the model's prediction. Use a vector of labels, or
 an ordered map such as `sorted-map` when descriptions are needed (`array-map`
@@ -151,6 +166,36 @@ the current process. No Python runtime, subprocess, HTTP service, or JSON
 round-trip is involved; Clojure maps and keywords go in and an immutable result
 map comes back. The router is lazy by default, or `:preload true` loads all
 checkpoints up front.
+
+The returned `:answers` map has one entry per question. `:choice` includes the
+selected label and probabilities by label; `:score` includes the expected
+zero-based level, its legend, and probabilities by level; `:noul` is the
+probability of true. Each includes `:confidence` and `:action`. Upstream notes
+that `act-probability` is not presently a useful gate; use task-specific
+validation and calibrated confidence instead. [Upstream's model card](https://huggingface.co/convaiinnovations/laya/blob/main/README.md)
+also cautions that Laya's probabilities can be
+overconfident on a new domain, and its base checkpoints perform poorly on some
+specialized workflows without fine-tuning. The typed-decisions checkpoint is
+specialized for its published four-workflow benchmark, not a universal default.
+
+The first use may download hundreds of megabytes of weights; the first JVM
+prediction additionally compiles Raster kernels. Keep the loaded agent in a
+long-lived REPL or service when latency matters. The CPU path works on JDK 21+;
+allow several gigabytes of heap for one checkpoint, and more when preloading
+both routed languages. A GPU is not required for this public API today.
+
+The default English context is 512 tokens; multilingual and typed-decisions
+default to 1024. Instructions and options consume part of that budget. Large
+choice sets can therefore lose option detail; start with fewer than about 20
+labels, or increase `head_max_len` in the checkpoint configuration after
+measuring on your data. Option order is semantically significant.
+
+This is the core inference interface, not the whole Python SDK: it currently
+accepts one state and a batch of questions per call. Python's multi-state
+`predict_batch`, lifecycle hooks, Jev-compatible `laya-serve` endpoint, and
+end-to-end RLCD training are not provided here. Training objectives and
+evaluation components live in `finetune-rstr`; resident GPU prediction is
+still an experimental lower-level path below.
 
 The CPU implementation is the numerical reference path: checkpoint values are
 expanded to F32 and match the upstream Torch outputs at public precision. An
