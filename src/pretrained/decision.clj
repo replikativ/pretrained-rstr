@@ -20,11 +20,19 @@
 (defn load-decision
   "Load a callable typed-decision checkpoint, downloading only that checkpoint
   when no explicit local directory is supplied. Invoke the result directly as
-  `(model state questions)` or pass it to `predict`."
-  ([key] (load-decision key nil))
-  ([key dir]
-   (let [dir (or dir (ensure-checkpoint key))]
-     (assoc (laya/load-agent dir) ::entry (get registry key)))))
+  `(model state questions)` or pass it to `predict`. Pass `{:gpu? true}` as
+  the second argument for a lazy resident GPU agent; it is Closeable."
+  ([key] (load-decision key nil {}))
+  ([key dir-or-opts]
+   (if (map? dir-or-opts)
+     (load-decision key (:dir dir-or-opts) dir-or-opts)
+     (load-decision key dir-or-opts {})))
+  ([key dir opts]
+   (let [dir (or dir (ensure-checkpoint key))
+         cpu (assoc (laya/load-agent dir) ::entry (get registry key))]
+     (if (:gpu? opts)
+       ((requiring-resolve 'pretrained.decision.laya-gpu/gpu-agent) cpu opts)
+       cpu))))
 
 (defn predict
   "Run a loaded decision model in process through the backend-neutral callable

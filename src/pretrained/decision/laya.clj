@@ -469,9 +469,8 @@
                                 (- 1.0 (nth probabilities 1))))
        :action action})))
 
-(defn predict
-  "Evaluate every typed question in one padded encoder/head pass. Matrix
-  operations are batched while attention is segmented by each valid prefix."
+(defn prepare-items
+  "Validate and tokenize the shared Laya request for either execution backend."
   [agent state questions]
   (when (empty? questions)
     (throw (ex-info "Laya requires at least one question" {})))
@@ -494,8 +493,8 @@
             (throw (ex-info "Laya choice and score questions require at least two options"
                             {:id id :type type :options options})))))))
   (let [cfg (:config agent)
-        entries (vec questions)
-        items (mapv (fn [[id question]]
+        entries (vec questions)]
+    (mapv (fn [[id question]]
                       (let [built (build-sequence
                                    (:tokenizer agent) state question
                                    {:max-len (get cfg "max_len" 512)
@@ -507,7 +506,21 @@
                                            :markers (count (:markers built))
                                            :head-max-len (get cfg "head_max_len")})))
                         (assoc built :id id :question question)))
-                    entries)
+          entries)))
+
+(defn answer-from-hidden
+  "Format one already-encoded question using the shared Laya scorer and policy."
+  [agent question ^floats hidden markers]
+  (let [d (:d-model (:encoder agent))
+        logits (vec (score-markers agent hidden markers))
+        first-row (copy-rows hidden 0 1 d)]
+    (answer-from-logits agent question first-row logits)))
+
+(defn predict
+  "Evaluate every typed question in one padded encoder/head pass. Matrix
+  operations are batched while attention is segmented by each valid prefix."
+  [agent state questions]
+  (let [items (prepare-items agent state questions)
         {:keys [data lengths max-len]} (decision-hidden-batch agent items)
         d (:d-model (:encoder agent))
         answers
@@ -515,10 +528,8 @@
               (map-indexed
                (fn [b {:keys [id question markers]}]
                  (let [len (long (nth lengths b))
-                       segment (copy-rows data (* b max-len) len d)
-                       logits (vec (score-markers agent segment markers))
-                       first-row (copy-rows segment 0 1 d)]
-                   [id (answer-from-logits agent question first-row logits)]))
+                       segment (copy-rows data (* b max-len) len d)]
+                   [id (answer-from-hidden agent question segment markers)]))
                items))]
     {:model :laya
      :answers answers

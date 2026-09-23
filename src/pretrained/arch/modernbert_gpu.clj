@@ -19,7 +19,7 @@
   '[attn-norm mlp-norm zero-bias wqkv wo wi w-mlp-out])
 
 (defn- layer-args
-  [model x seq-len layer]
+  [model x segments seq-len layer]
   (let [{:keys [d-model d-ff n-heads head-dim global-every local-attention
                 global-theta local-theta eps zero-bias]} model
         prefix (str "encoder.layers." layer ".")
@@ -31,14 +31,16 @@
               (if global? seq-len (inc (quot local-attention 2)))]]
     (if (zero? layer)
       (vec (concat
-            [x (mb/weight model (str prefix "mlp_norm.weight")) zero-bias
+            (if segments [x segments] [x])
+            [(mb/weight model (str prefix "mlp_norm.weight")) zero-bias
              (mb/weight model (str prefix "attn.Wqkv.weight"))
              (mb/weight model (str prefix "attn.Wo.weight"))
              (mb/weight model (str prefix "mlp.Wi.weight"))
              (mb/weight model (str prefix "mlp.Wo.weight"))]
             tail))
       (vec (concat
-            [x (mb/weight model (str prefix "attn_norm.weight"))
+            (if segments [x segments] [x])
+            [(mb/weight model (str prefix "attn_norm.weight"))
              (mb/weight model (str prefix "mlp_norm.weight")) zero-bias
              (mb/weight model (str prefix "attn.Wqkv.weight"))
              (mb/weight model (str prefix "attn.Wo.weight"))
@@ -47,12 +49,16 @@
             tail)))))
 
 (defn- lower-layer
-  [model x seq-len layer opts]
+  [model x segments seq-len layer opts]
   (compiled/lower
-   (if (zero? layer)
-     #'mb/modernbert-resident-first-block
-     #'mb/modernbert-resident-block)
-   (layer-args model x seq-len layer)
+   (if segments
+     (if (zero? layer)
+       #'mb/modernbert-resident-segmented-first-block
+       #'mb/modernbert-resident-segmented-block)
+     (if (zero? layer)
+       #'mb/modernbert-resident-first-block
+       #'mb/modernbert-resident-block))
+   (layer-args model x segments seq-len layer)
    (merge {:target :ze:0
            :dtype :float
            :constants (if (zero? layer) first-layer-constants layer-constants)
@@ -74,7 +80,9 @@
              (throw (ex-info "ModernBERT GPU encoder must contain at least one layer"
                              {:n-layers n-layers})))
          x (float-array (* (long seq-len) d-model))
-         layers (mapv #(lower-layer model x (long seq-len) % opts)
+         segments (when (:segments? opts)
+                    (or (:segments-placeholder opts) (float-array (long seq-len))))
+         layers (mapv #(lower-layer model x segments (long seq-len) % opts)
                       (range n-layers))
          final-args [x (mb/weight model "encoder.final_norm.weight")
                      zero-bias (long seq-len) d-model eps]
@@ -100,16 +108,19 @@
              :to [:final-norm :x]}]))
          zero-bias-share
          (conj (mapv (fn [id] [id :zero-bias]) ids)
-               [:final-norm :beta])]
+               [:final-norm :beta])
+         segment-share (when segments
+                         (mapv (fn [id] [id :segments]) ids))]
      (compiled/compose
       {:id [:modernbert-encoder (or (:target opts) :ze:0) seq-len]
        :components components
        :connections connections
-       :shares [zero-bias-share]
+       :shares (cond-> [zero-bias-share] segment-share (conj segment-share))
        :outputs [{:key :encoded :from [:final-norm final-out]}]
        :attributes {:architecture :modernbert
                     :sequence-length seq-len
-                    :layers n-layers}}))))
+                    :layers n-layers
+                    :segmented? (boolean segments)}}))))
 
 (defn compile-encoder
   "Instantiate a fixed-shape resident encoder and upload its weights once."

@@ -57,6 +57,45 @@
 ;; graph: full attention is the exact windowed case window=seq-len, while local
 ;; layers pass their configured radius. This leaves a flat kernel/GEMM sequence
 ;; for Raster's resident extractor.
+(deftm mask-segment-scores
+  (All [T]
+       [scores :- (Array T) segments :- (Array T)
+        nrows :- Long n-heads :- Long] :- (Array T)
+       (let [out (alloc-like scores (* nrows (* n-heads nrows)))]
+         (raster.par/map! out idx (* nrows (* n-heads nrows)) nil
+                          (let [i (quot idx (* n-heads nrows))
+                                j (rem idx nrows)]
+                            (if (= (aget segments i) (aget segments j))
+                              (aget scores idx)
+                              -1.0e30))))))
+
+(deftm modernbert-resident-tail
+  (All [T]
+       [x :- (Array T) qkv :- (Array T) probs :- (Array T)
+        mlp-norm :- (Array T) zero-bias :- (Array T)
+        wo :- (Array T) wi :- (Array T) w-mlp-out :- (Array T)
+        seq-len :- Long d-model :- Long d-ff :- Long n-heads :- Long head-dim :- Long
+        eps :- Double]
+       :- (Array T)
+       (let [context (alloc-like x (* seq-len d-model))
+             _ (raster.dl.attention/attn-prefill-out-strided!
+                probs qkv context seq-len n-heads 1 n-heads head-dim
+                (* 3 d-model) (* 2 d-model))
+             projected (nn/linear-nb context wo seq-len d-model d-model)
+             x1-buffer (alloc-like x (* seq-len d-model))
+             x1 (raster.par/map! x1-buffer i (* seq-len d-model) nil
+                                 (+ (aget x i) (aget projected i)))
+             mlp-in (raster.dl.nn/layer-norm-reassociated
+                     x1 mlp-norm zero-bias seq-len d-model eps)
+             fused (nn/linear-nb mlp-in wi seq-len d-model (* 2 d-ff))
+             hidden (alloc-like fused (* seq-len d-ff))
+             _ (raster.dl.nn/gelu-erf-mul-strided!
+                fused hidden seq-len (* 2 d-ff) 0 d-ff d-ff)
+             down (nn/linear-nb hidden w-mlp-out seq-len d-ff d-model)
+             out-buffer (alloc-like x (* seq-len d-model))]
+         (raster.par/map! out-buffer i (* seq-len d-model) nil
+                          (+ (aget x1 i) (aget down i))))))
+
 (deftm modernbert-resident-body
   (All [T]
        [x :- (Array T) attn-in :- (Array T)
@@ -75,25 +114,32 @@
              scores (alloc-like x (* seq-len (* n-heads seq-len)))
              _ (attn/attn-prefill-scores-windowed! qr kr scores seq-len n-heads 1
                                                    n-heads head-dim scale window window)
-             probs (raster.dl.attention/attn-prefill-softmax scores seq-len n-heads)
-             context (alloc-like x (* seq-len d-model))
-             _ (raster.dl.attention/attn-prefill-out-strided!
-                probs qkv context seq-len n-heads 1 n-heads head-dim
-                (* 3 d-model) (* 2 d-model))
-             projected (nn/linear-nb context wo seq-len d-model d-model)
-             x1-buffer (alloc-like x (* seq-len d-model))
-             x1 (raster.par/map! x1-buffer i (* seq-len d-model) nil
-                                 (+ (aget x i) (aget projected i)))
-             mlp-in (raster.dl.nn/layer-norm-reassociated
-                     x1 mlp-norm zero-bias seq-len d-model eps)
-             fused (nn/linear-nb mlp-in wi seq-len d-model (* 2 d-ff))
-             hidden (alloc-like fused (* seq-len d-ff))
-             _ (raster.dl.nn/gelu-erf-mul-strided!
-                fused hidden seq-len (* 2 d-ff) 0 d-ff d-ff)
-             down (nn/linear-nb hidden w-mlp-out seq-len d-ff d-model)
-             out-buffer (alloc-like x (* seq-len d-model))]
-         (raster.par/map! out-buffer i (* seq-len d-model) nil
-                          (+ (aget x1 i) (aget down i))))))
+             probs (raster.dl.attention/attn-prefill-softmax scores seq-len n-heads)]
+         (modernbert-resident-tail x qkv probs mlp-norm zero-bias wo wi w-mlp-out
+                                  seq-len d-model d-ff n-heads head-dim eps))))
+
+(deftm modernbert-resident-segmented-body
+  (All [T]
+       [x :- (Array T) attn-in :- (Array T) segments :- (Array T)
+        mlp-norm :- (Array T) zero-bias :- (Array T)
+        wqkv :- (Array T) wo :- (Array T) wi :- (Array T) w-mlp-out :- (Array T)
+        seq-len :- Long d-model :- Long d-ff :- Long n-heads :- Long head-dim :- Long
+        theta :- Double scale :- Double eps :- Double window :- Long]
+       :- (Array T)
+       (let [qkv (nn/linear-nb attn-in wqkv seq-len d-model (* 3 d-model))
+             qr (alloc-like qkv (* seq-len d-model))
+             kr (alloc-like qkv (* seq-len d-model))
+             _ (raster.dl.attention/rope-prefill-strided!
+                qkv qr seq-len n-heads head-dim theta (* 3 d-model) 0)
+             _ (raster.dl.attention/rope-prefill-strided!
+                qkv kr seq-len n-heads head-dim theta (* 3 d-model) d-model)
+             scores (alloc-like x (* seq-len (* n-heads seq-len)))
+             _ (attn/attn-prefill-scores-windowed! qr kr scores seq-len n-heads 1
+                                                   n-heads head-dim scale window window)
+             masked (mask-segment-scores scores segments seq-len n-heads)
+             probs (raster.dl.attention/attn-prefill-softmax masked seq-len n-heads)]
+         (modernbert-resident-tail x qkv probs mlp-norm zero-bias wo wi w-mlp-out
+                                  seq-len d-model d-ff n-heads head-dim eps))))
 
 (deftm modernbert-resident-first-block
   (All [T]
@@ -119,6 +165,32 @@
          (modernbert-resident-body x attn-in mlp-norm zero-bias wqkv wo wi w-mlp-out
                                    seq-len d-model d-ff n-heads head-dim
                                    theta scale eps window))))
+
+(deftm modernbert-resident-segmented-first-block
+  (All [T]
+       [x :- (Array T) segments :- (Array T)
+        mlp-norm :- (Array T) zero-bias :- (Array T)
+        wqkv :- (Array T) wo :- (Array T) wi :- (Array T) w-mlp-out :- (Array T)
+        seq-len :- Long d-model :- Long d-ff :- Long n-heads :- Long head-dim :- Long
+        theta :- Double scale :- Double eps :- Double window :- Long]
+       :- (Array T)
+       (modernbert-resident-segmented-body x x segments mlp-norm zero-bias wqkv wo wi w-mlp-out
+                                 seq-len d-model d-ff n-heads head-dim
+                                 theta scale eps window)))
+
+(deftm modernbert-resident-segmented-block
+  (All [T]
+       [x :- (Array T) segments :- (Array T)
+        attn-norm :- (Array T) mlp-norm :- (Array T) zero-bias :- (Array T)
+        wqkv :- (Array T) wo :- (Array T) wi :- (Array T) w-mlp-out :- (Array T)
+        seq-len :- Long d-model :- Long d-ff :- Long n-heads :- Long head-dim :- Long
+        theta :- Double scale :- Double eps :- Double window :- Long]
+       :- (Array T)
+       (let [attn-in (raster.dl.nn/layer-norm-reassociated
+                      x attn-norm zero-bias seq-len d-model eps)]
+         (modernbert-resident-segmented-body x attn-in segments mlp-norm zero-bias
+                                   wqkv wo wi w-mlp-out seq-len d-model d-ff
+                                   n-heads head-dim theta scale eps window))))
 
 (defn- native-kernel [v]
   (delay

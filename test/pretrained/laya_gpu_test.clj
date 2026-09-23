@@ -1,7 +1,90 @@
 (ns pretrained.laya-gpu-test
   (:require [clojure.test :refer [deftest is]]
+            [pretrained.arch.modernbert :as mb]
             [pretrained.decision.laya :as laya]
             [pretrained.decision.laya-gpu :as laya-gpu]))
+
+(deftest segment-score-mask-is-block-diagonal
+  (let [scores (float-array (range 32))
+        segments (float-array [0 0 1 1])
+        masked (mb/mask-segment-scores scores segments 4 2)]
+    (is (= 32 (alength masked)))
+    (doseq [i (range 4) h (range 2) j (range 4)]
+      (let [idx (+ (* i 8) (* h 4) j)]
+        (if (= (aget segments i) (aget segments j))
+          (is (= (aget scores idx) (aget masked idx)))
+          (is (< (double (aget masked idx)) -1.0e29)))))))
+
+(deftest packed-request-keeps-question-boundaries-and-padding-separate
+  (let [weights {"type_emb.weight" {:data (float-array [1 2 3 4 5 6])}}
+        cpu (laya/map->LayaAgent
+             {:encoder {:d-model 2 :weights weights}
+              :tokenizer {:tok {:pad-id 9}}})
+        agent (laya-gpu/gpu-agent cpu {:shape-bucket 4 :max-packed-tokens 16})
+        items [{:ids [1 2] :question-type 0}
+               {:ids [3] :question-type 2}]
+        packed (#'laya-gpu/pack-items agent items)]
+    (is (= [1 2 3 9] (:ids packed)))
+    (is (= [0 2] (:offsets packed)))
+    (is (= [2 1] (:lengths packed)))
+    (is (= [0.0 0.0 1.0 2.0] (vec (:segments packed))))
+    (is (= [1.0 2.0 1.0 2.0 5.0 6.0 0.0 0.0]
+           (vec (:type-values packed))))))
+
+(deftest packed-groups-respect-token-limit
+  (let [items [{:id :a :ids [1 2 3]}
+               {:id :b :ids [4 5]}
+               {:id :c :ids [6 7 8]}]]
+    (is (= [[:a :b] [:c]]
+           (mapv #(mapv :id %) (#'laya-gpu/packed-groups items 5))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (#'laya-gpu/packed-groups items 2)))))
+
+(deftest gpu-shape-limits-must-fit-a-bucket
+  (is (thrown? clojure.lang.ExceptionInfo
+               (laya-gpu/gpu-agent nil {:shape-bucket 0})))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (laya-gpu/gpu-agent nil {:shape-bucket 8
+                                        :max-packed-tokens 7})))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (laya-gpu/gpu-agent nil {:max-cached-shapes 0}))))
+
+(deftest public-gpu-agent-packs-reuses-and-closes
+  (let [cpu (laya/map->LayaAgent
+             {:encoder {:d-model 2
+                        :weights {"type_emb.weight"
+                                  {:data (float-array [1 2 3 4 5 6])}}}
+              :tokenizer {:tok {:pad-id 9}}})
+        agent (laya-gpu/gpu-agent cpu {:shape-bucket 4 :max-packed-tokens 16})
+        items [{:id :a :question {:type :choice} :ids [1 2]
+                :question-type 0 :markers [0 1]}
+               {:id :b :question {:type :noul} :ids [3]
+                :question-type 2 :markers [0 1]}]
+        compiled (atom [])
+        closed (atom [])]
+    (with-redefs [laya/prepare-items (fn [_ _ _] items)
+                  laya-gpu/compile-decision-hidden
+                  (fn [_ shape _] (swap! compiled conj shape) {:shape shape})
+                  laya-gpu/decision-hidden-tokens
+                  (fn [_ ids _ segments]
+                    (is (= [1 2 3 9] ids))
+                    (is (= [0.0 0.0 1.0 2.0] (vec segments)))
+                    (float-array 8))
+                  laya/answer-from-hidden
+                  (fn [_ question hidden _]
+                    {:type (:type question) :rows (quot (alength hidden) 2)})
+                  laya-gpu/close! (fn [resident] (swap! closed conj (:shape resident)))]
+      (is (= {:model :laya
+              :answers {:a {:type :choice :rows 2}
+                        :b {:type :noul :rows 1}}
+              :usage {:input-tokens 3 :output-tokens 0}}
+             (agent nil nil)))
+      (is (= 4 (-> @(:cache agent) :programs vals first :shape)))
+      (agent nil nil)
+      (is (= [4] @compiled))
+      (.close ^java.io.Closeable agent)
+      (is (= [4] @closed))
+      (is (thrown? clojure.lang.ExceptionInfo (agent nil nil))))))
 
 (defn- random-floats [n seed scale]
   (let [out (float-array n)

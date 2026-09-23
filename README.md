@@ -194,14 +194,44 @@ This is the core inference interface, not the whole Python SDK: it currently
 accepts one state and a batch of questions per call. Python's multi-state
 `predict_batch`, lifecycle hooks, Jev-compatible `laya-serve` endpoint, and
 end-to-end RLCD training are not provided here. Training objectives and
-evaluation components live in `finetune-rstr`; resident GPU prediction is
-still an experimental lower-level path below.
+evaluation components live in `finetune-rstr`. The GPU path below is usable
+through the public callable API, but remains Intel-specific and less mature
+than the CPU numerical reference.
 
 The CPU implementation is the numerical reference path: checkpoint values are
-expanded to F32 and match the upstream Torch outputs at public precision. An
-experimental fixed-shape Level Zero path keeps both ModernBERT and Laya's two
-decision-head transformer layers resident. It is intentionally a lower-level
-API until padded batching and the scorer are resident too:
+expanded to F32 and match upstream Torch outputs at public precision. On an
+Intel GPU, use the same callable contract with a resident Level Zero agent:
+
+```clojure
+(def gpu-agent
+  (decision/load-decision :laya-english
+                          {:gpu? true :target :ze:0
+                           :gemm-precision :mixed-f16-f32}))
+
+(gpu-agent state questions)
+(.close ^java.io.Closeable gpu-agent)
+
+;; Automatic English/multilingual routing can use the same GPU option.
+(def gpu-router
+  (laya-router/router {:decision-opts {:gpu? true :target :ze:0
+                                        :gemm-precision :mixed-f16-f32}}))
+(gpu-router state questions)
+(.close ^java.io.Closeable gpu-router)
+```
+
+The GPU path packs multiple questions into one encoder/head pass, masks
+attention between them, and caches compiled graphs by 32-token bucket.
+Token lookup, the small option scorer, and response formatting currently run
+on CPU. The default cap is 512 packed tokens per pass; larger requests are
+split into passes, and `:max-packed-tokens` can raise the cap on GPUs with
+enough memory. `:max-cached-shapes` defaults to 2. Mixed F16/F32 is faster on
+Intel Arc but may change probabilities in the fourth decimal place; use the
+CPU path when exact Torch-rounding parity matters. First-use graph compilation
+can take minutes, so reuse and close the agent instead of creating one per
+request.
+
+The lower-level fixed-shape API is also available when inspecting the resident
+ModernBERT and decision-head graph:
 
 ```clojure
 (require '[pretrained.decision.laya :as laya]
@@ -222,10 +252,8 @@ API until padded batching and the scorer are resident too:
 (laya-gpu/close! resident)
 ```
 
-Mixed F16/F32 is the useful policy on Intel Arc; callers can select a different
-Raster precision schedule for other GPUs. Cold graph instantiation remains
-expensive, so compiled shapes should be cached and replayed rather than created
-per request.
+Callers can select a different Raster precision schedule for other GPUs, but
+the public GPU route has only been validated on Intel Arc so far.
 
 Downloads are sha-pinned and resume into `~/.cache/raster/models`. `HF_TOKEN` is
 honoured. Passing a local directory skips download.
@@ -253,6 +281,17 @@ timed prediction is stable, and emit the runtime, loading time, first-call time,
 warmups, individual steady samples, median, p90, and prediction. For GPU Torch
 baselines use `--device xpu` or `--device cuda`; the runner synchronizes the
 device around every measurement.
+
+For the same four-question fixture through the public Intel GPU path, run:
+
+```bash
+MKL_NUM_THREADS=4 OMP_NUM_THREADS=4 \
+clojure -M:examples:valhalla -m pretrained.laya-gpu-benchmark \
+  ~/.cache/raster/models/convaiinnovations--laya 7 2
+```
+
+Its first-call time includes resident graph compilation. Compare the steady
+median with the Python runner using `--device xpu` under low contention.
 
 ## Serve a local model
 
