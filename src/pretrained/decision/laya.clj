@@ -42,6 +42,9 @@
 (defn- getk [m k]
   (if (contains? m k) (get m k) (get m (keyword k))))
 
+(defn- hask? [m k]
+  (or (contains? m k) (contains? m (keyword k))))
+
 (declare python-json)
 
 (defn- json-key [x]
@@ -65,6 +68,11 @@
 (defn- rendered [x]
   (if (string? x) x (python-json x)))
 
+(defn- score-criteria [criteria]
+  (if (map? criteria)
+    (mapv #(if (keyword? %) (name %) %) (keys criteria))
+    criteria))
+
 (defn render-options
   "Render external or internal question definitions in stable option order."
   [question]
@@ -80,7 +88,7 @@
             (if (map? criteria) criteria (map vector criteria (repeat nil))))
       "score"
       (mapv (fn [i criterion] (str "level " i ": " (rendered criterion)))
-            (range) criteria)
+            (range) (score-criteria criteria))
       "noul"
       (let [criteria (or criteria {})
             f (getk criteria "false")
@@ -447,7 +455,7 @@
          :confidence conf :action action})
 
       "score"
-      (let [criteria (vec (getk question "criteria"))]
+      (let [criteria (vec (score-criteria (getk question "criteria")))]
         {:type :score
          :score (round4 (reduce + (map-indexed #(* %1 %2) probabilities)))
          :legend (into (array-map) (map-indexed #(vector (str %1) %2) criteria))
@@ -467,6 +475,24 @@
   [agent state questions]
   (when (empty? questions)
     (throw (ex-info "Laya requires at least one question" {})))
+  (doseq [[id question] questions]
+    (when-not (map? question)
+      (throw (ex-info "Laya question must be a map" {:id id :question question})))
+    (let [type (getk question "type")
+          type (if (keyword? type) (name type) type)]
+      (when-not (contains? question-types type)
+        (throw (ex-info "unknown Laya question type"
+                        {:id id :type type})))
+      (when-not (hask? question "instructions")
+        (throw (ex-info "Laya question requires instructions" {:id id})))
+      (when (#{"choice" "score"} type)
+        (let [criteria (getk question "criteria")
+              valid-criteria? (or (map? criteria) (sequential? criteria))
+              options (when valid-criteria?
+                        (count criteria))]
+          (when (or (nil? options) (< options 2))
+            (throw (ex-info "Laya choice and score questions require at least two options"
+                            {:id id :type type :options options})))))))
   (let [cfg (:config agent)
         entries (vec questions)
         items (mapv (fn [[id question]]

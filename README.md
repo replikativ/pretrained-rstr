@@ -41,10 +41,10 @@ transport. See [Numerical memory beyond LLM inference](doc/numerical-memory.md).
 Use JDK 21 or newer and add a released library version to `deps.edn`:
 
 ```clojure
-{:deps {org.replikativ/pretrained-rstr {:mvn/version "0.1.48"}}}
+{:deps {org.replikativ/pretrained-rstr {:mvn/version "0.1.52"}}}
 ```
 
-Raster is pinned in `deps.edn`. OpenBLAS is required for
+Raster is pinned in `deps.edn`. Intel MKL or OpenBLAS is required for
 floating-point GEMM paths. ffmpeg is optional for non-WAV audio. GPU execution
 requires Level Zero on Intel or a compatible OpenCL ICD on Intel, NVIDIA, or AMD.
 
@@ -139,6 +139,12 @@ of an existing agent, unloading, and bounded LRU residency. For example:
 (laya-router/predict router hindi-state questions {:lang :hi})
 (laya-router/unload! router)
 ```
+
+Choice option order affects the model's prediction. Use a vector of labels, or
+an ordered map such as `sorted-map` when descriptions are needed (`array-map`
+also works for small fixed sets). An ordinary hash map does not preserve
+insertion order. Every question needs
+`instructions`, and choice/score questions need at least two options.
 
 Like Python's `agent.predict(state, questions)`, both forms execute entirely in
 the current process. No Python runtime, subprocess, HTTP service, or JSON

@@ -1,5 +1,8 @@
 (ns pretrained.laya-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.data.json :as json]
+            [clojure.java.io :as io]
+            [clojure.test :refer [deftest is]]
+            [clojure.string :as str]
             [pretrained.decision :as decision]
             [pretrained.decision.laya :as laya]))
 
@@ -35,6 +38,9 @@
   (is (= ["level 0: low" "level 1: {\"risk\": \"high\"}"]
          (laya/render-options
           {:type :score :criteria ["low" {:risk "high"}]})))
+  (is (= ["level 0: low" "level 1: high"]
+         (laya/render-options
+          {:type :score :criteria (array-map :low "ignored" :high "ignored")})))
   (is (= ["false: no, the statement does not hold"
           "true: yes, the statement holds"]
          (laya/render-options {:type :noul})))
@@ -81,6 +87,19 @@
     (is (<= (count (:ids res)) 64))
     (is (every? #(= 103 (nth (:ids res) %)) (:markers res)))))
 
+(deftest public-prediction-rejects-incomplete-questions-before-running-the-model
+  (doseq [[question message]
+          [[{:type :noul} "requires instructions"]
+           [{:type :choice :instructions "Choose" :criteria [:only]}
+            "require at least two options"]
+           [{:type :score :instructions "Rate" :criteria []}
+            "require at least two options"]]]
+    (let [error (try (laya/predict nil "state" {:question question})
+                     (catch clojure.lang.ExceptionInfo error error))]
+      (is (instance? clojure.lang.ExceptionInfo error))
+      (is (str/includes? (.getMessage error) message))
+      (is (= :question (:id (ex-data error)))))))
+
 (deftest ^:anchors english-checkpoint-reference-anchor
   (let [dir (str (System/getProperty "user.home")
                  "/.cache/raster/models/convaiinnovations--laya")]
@@ -109,3 +128,32 @@
                (:probabilities answer)))
         (is (= 0.571 (:confidence answer)))
         (is (= {:input-tokens 74 :output-tokens 0} (:usage result)))))))
+
+(deftest ^:anchors multilingual-and-typed-checkpoint-reference-anchor
+  (let [{:keys [state questions]}
+        (with-open [source (io/reader (io/resource "pretrained/laya_benchmark_case.json"))]
+          (json/read source :key-fn keyword))
+        root (str (System/getProperty "user.home")
+                  "/.cache/raster/models/convaiinnovations--laya")
+        anchors [[:laya-multilingual "multilingual"
+                  {:billing 1.0 :urgency 1.8557 :churn 0.0580 :refund 0.9827}]
+                 [:laya-typed-decisions "typed-decisions"
+                  {:billing 0.8038 :urgency 1.6375 :churn 0.7063 :refund 0.6679}]]]
+    (doseq [[checkpoint subdir expected] anchors]
+      (let [dir (str root "/" subdir)]
+        (if-not (.exists (java.io.File. dir "model.safetensors"))
+          (println "SKIP Laya anchor" checkpoint "(checkpoint not present)")
+          (let [model (decision/load-decision checkpoint dir)
+                result (model state questions)
+                near? (fn [actual target]
+                        (<= (Math/abs (- (double actual) (double target))) 2.0e-4))]
+            (is (= {:input-tokens 348 :output-tokens 0} (:usage result)))
+            (is (= :billing (get-in result [:answers :department :choice])))
+            (is (near? (get-in result [:answers :department :probabilities :billing])
+                       (:billing expected)))
+            (is (near? (get-in result [:answers :urgency :score])
+                       (:urgency expected)))
+            (is (near? (get-in result [:answers :churn_risk :noul])
+                       (:churn expected)))
+            (is (near? (get-in result [:answers :refund_requested :noul])
+                       (:refund expected)))))))))
