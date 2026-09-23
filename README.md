@@ -41,7 +41,7 @@ transport. See [Numerical memory beyond LLM inference](doc/numerical-memory.md).
 Use JDK 21 or newer and add a released library version to `deps.edn`:
 
 ```clojure
-{:deps {org.replikativ/pretrained-rstr {:mvn/version "0.1.45"}}}
+{:deps {org.replikativ/pretrained-rstr {:mvn/version "0.1.48"}}}
 ```
 
 Raster is pinned in `deps.edn`. OpenBLAS is required for
@@ -178,6 +178,30 @@ per request.
 
 Downloads are sha-pinned and resume into `~/.cache/raster/models`. `HF_TOKEN` is
 honoured. Passing a local directory skips download.
+
+#### Reproducible Laya benchmark
+
+The checked-in benchmark fixture drives the same four typed questions through
+the public Clojure API and upstream Torch implementation. Pin the thread count,
+report cold loading and first prediction separately, and compare the steady
+medians in the emitted JSON:
+
+```bash
+MKL_NUM_THREADS=4 OMP_NUM_THREADS=4 \
+clojure -M:examples:valhalla -m pretrained.laya-cpu-benchmark \
+  ~/.cache/raster/models/convaiinnovations--laya 7 2
+
+python dev/pretrained/laya_reference_benchmark.py \
+  --laya-source /path/to/laya \
+  --model-dir ~/.cache/raster/models/convaiinnovations--laya \
+  --device cpu --threads 4 --rounds 7 --warmup 2
+```
+
+Both runners use `dev/pretrained/laya_benchmark_case.json`, verify that every
+timed prediction is stable, and emit the runtime, loading time, first-call time,
+warmups, individual steady samples, median, p90, and prediction. For GPU Torch
+baselines use `--device xpu` or `--device cuda`; the runner synchronizes the
+device around every measurement.
 
 ## Serve a local model
 
