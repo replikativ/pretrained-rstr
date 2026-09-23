@@ -231,27 +231,31 @@
 
 (defn attention-strided!
   "Attention over Q/K/V fields embedded in independently strided row-major
-  sources. Packing remains a generic layout map and both contractions remain
-  true strided-batch BLAS calls."
+  sources. BLAS consumes those views directly: Q/K need no head packing, and
+  the second contraction writes interleaved output heads without unpacking."
   ^floats [^floats q ^floats k ^floats v ^floats scores ^floats out
            nrows heads head-dim scale window
            q-row-stride q-column-offset
            k-row-stride k-column-offset
            v-row-stride v-column-offset]
-  (let [qh (pack-heads-strided q nrows heads head-dim q-row-stride q-column-offset)
-        kh (pack-heads-strided k nrows heads head-dim k-row-stride k-column-offset)
-        vh (pack-heads-strided v nrows heads head-dim v-row-stride v-column-offset)
-        context-h (float-array (* (long heads) (long nrows) (long head-dim)))]
-    (blas/batched-gemm-nt! qh kh scores (long heads) (long nrows)
-                           (long head-dim) (long nrows) (float scale))
+  (let [nrows (long nrows)
+        heads (long heads)
+        head-dim (long head-dim)
+        output-row-stride (* heads head-dim)
+        score-stride (* nrows nrows)]
+    (blas/batched-gemm-nt-layout!
+     q k scores heads nrows head-dim nrows (float scale)
+     (long q-column-offset) (long q-row-stride) head-dim
+     (long k-column-offset) (long k-row-stride) head-dim
+     0 nrows score-stride)
     (when (pos? (long window))
-      (@native-window-mask scores (long nrows) (long heads)
-                           (long window) (long window)))
-    (@native-softmax scores (long nrows) (long heads))
-    (blas/batched-gemm-nn! scores vh context-h (long heads) (long nrows)
-                           (long nrows) (long head-dim) (float 1.0))
-    (let [context (unpack-heads context-h nrows heads head-dim)]
-      (System/arraycopy context 0 out 0 (alength out))))
+      (@native-window-mask scores nrows heads (long window) (long window)))
+    (@native-softmax scores nrows heads)
+    (blas/batched-gemm-nn-layout!
+     scores v out heads nrows nrows head-dim (float 1.0)
+     0 nrows score-stride
+     (long v-column-offset) (long v-row-stride) head-dim
+     0 output-row-stride head-dim))
   out)
 
 (defn attention-segmented-strided!
