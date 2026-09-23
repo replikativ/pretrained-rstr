@@ -265,19 +265,18 @@
                        (weight agent (str prefix "self_attn.in_proj_weight"))
                        (weight agent (str prefix "self_attn.in_proj_bias"))
                        rows d (* 3 d))
-        q (ops/slice-strided-2d qkv rows (* 3 d) 0 d)
-        k (ops/slice-strided-2d qkv rows (* 3 d) d d)
-        v (ops/slice-strided-2d qkv rows (* 3 d) (* 2 d) d)
         context (float-array (* rows d))]
     (doseq [b (range batch)]
       (let [len (long (nth lengths b))
             row0 (* b max-len)
-            qb (copy-rows q row0 len d)
-            kb (copy-rows k row0 len d)
-            vb (copy-rows v row0 len d)
+            source-row0 (* row0 (* 3 d))
             scores (float-array (* len heads len))
             out (float-array (* len d))
-            _ (modernbert/attention! qb kb vb scores out len heads 64 (/ 1.0 8.0) 0)]
+            _ (modernbert/attention-strided!
+               qkv qkv qkv scores out len heads 64 (/ 1.0 8.0) 0
+               (* 3 d) source-row0
+               (* 3 d) (+ source-row0 d)
+               (* 3 d) (+ source-row0 (* 2 d)))]
         (System/arraycopy out 0 context (* row0 d) (* len d))))
     (nn/linear context
                (weight agent (str prefix "self_attn.out_proj.weight"))

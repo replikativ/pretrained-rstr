@@ -132,7 +132,13 @@
         @v))))
 
 (def ^:private native-gelu (native-kernel #'nn/gelu-erf!))
+(def ^:private native-gelu-mul-strided
+  (native-kernel #'nn/gelu-erf-mul-strided!))
 (def ^:private native-relu (native-kernel #'nn/leaky-relu!))
+(def ^:private native-rope-strided
+  (native-kernel #'attn/rope-prefill-strided!))
+(def ^:private native-pack-heads-strided
+  (native-kernel #'ops/pack-heads-strided))
 (def ^:private native-softmax (native-kernel #'attn/attn-prefill-softmax!))
 
 (defn- window-mask-fallback!
@@ -162,16 +168,38 @@
   (@native-relu x out (long n) (float 0.0))
   out)
 
-(defn attention!
-  "Compute one full or symmetric-window attention into caller-owned `out`.
-  Heads are packed once, then QK^T and probabilities@V use Raster's true
-  strided-batch BLAS primitives. The exact softmax stays in native scalar C;
-  this avoids oversubscribing MKL's worker pool with a second OpenMP runtime."
+(defn gelu-erf-mul-strided!
+  ^floats [^floats src ^floats out rows row-stride left-offset right-offset width]
+  (@native-gelu-mul-strided src out (long rows) (long row-stride)
+                           (long left-offset) (long right-offset) (long width))
+  out)
+
+(defn rope-strided!
+  ^floats [^floats src ^floats out nrows heads head-dim theta row-stride column-offset]
+  (@native-rope-strided src out (long nrows) (long heads) (long head-dim)
+                        (double theta) (long row-stride) (long column-offset))
+  out)
+
+(defn- pack-heads-strided
+  ^floats [^floats src nrows heads head-dim row-stride column-offset]
+  ;; AOT value functions reuse their result workspace. Clone because attention
+  ;; retains Q, K, and V packs simultaneously for the two BLAS contractions.
+  (aclone ^floats (@native-pack-heads-strided
+                   src (long nrows) (long heads) (long head-dim)
+                   (long row-stride) (long column-offset))))
+
+(defn attention-strided!
+  "Attention over Q/K/V fields embedded in independently strided row-major
+  sources. Packing remains a generic layout map and both contractions remain
+  true strided-batch BLAS calls."
   ^floats [^floats q ^floats k ^floats v ^floats scores ^floats out
-           nrows heads head-dim scale window]
-  (let [qh (ops/pack-heads q nrows heads head-dim)
-        kh (ops/pack-heads k nrows heads head-dim)
-        vh (ops/pack-heads v nrows heads head-dim)
+           nrows heads head-dim scale window
+           q-row-stride q-column-offset
+           k-row-stride k-column-offset
+           v-row-stride v-column-offset]
+  (let [qh (pack-heads-strided q nrows heads head-dim q-row-stride q-column-offset)
+        kh (pack-heads-strided k nrows heads head-dim k-row-stride k-column-offset)
+        vh (pack-heads-strided v nrows heads head-dim v-row-stride v-column-offset)
         context-h (float-array (* (long heads) (long nrows) (long head-dim)))]
     (blas/batched-gemm-nt! qh kh scores (long heads) (long nrows)
                            (long head-dim) (long nrows) (float scale))
@@ -184,6 +212,17 @@
     (let [context (ops/unpack-heads context-h nrows heads head-dim)]
       (System/arraycopy context 0 out 0 (alength out))))
   out)
+
+(defn attention!
+  "Compute one full or symmetric-window attention into caller-owned `out`.
+  Heads are packed once, then QK^T and probabilities@V use Raster's true
+  strided-batch BLAS primitives. The exact softmax stays in native scalar C;
+  this avoids oversubscribing MKL's worker pool with a second OpenMP runtime."
+  ^floats [^floats q ^floats k ^floats v ^floats scores ^floats out
+           nrows heads head-dim scale window]
+  (let [width (* (long heads) (long head-dim))]
+    (attention-strided! q k v scores out nrows heads head-dim scale window
+                        width 0 width 0 width 0)))
 
 (def ^:private compiled-block
   (delay
@@ -335,12 +374,6 @@
            (when observe (observe :final n-layers out))
            out))))))
 
-(defn- copy-prefix
-  ^floats [^floats src src-row rows width]
-  (let [out (float-array (* rows width))]
-    (System/arraycopy src (* src-row width) out 0 (* rows width))
-    out))
-
 (defn- attention-batch
   ^floats [model ^floats x batch max-len lengths layer]
   (let [{:keys [d-model n-heads head-dim global-every local-attention]} model
@@ -352,9 +385,6 @@
                                (weight model (str prefix "attn_norm.weight"))))
         qkv (nn/linear-nb input (weight model (str prefix "attn.Wqkv.weight"))
                           rows d-model (* 3 d-model))
-        q (ops/slice-strided-2d qkv rows (* 3 d-model) 0 d-model)
-        k (ops/slice-strided-2d qkv rows (* 3 d-model) d-model d-model)
-        v (ops/slice-strided-2d qkv rows (* 3 d-model) (* 2 d-model) d-model)
         global? (zero? (mod layer global-every))
         theta (if global? (:global-theta model) (:local-theta model))
         scale (/ 1.0 (Math/sqrt (double head-dim)))
@@ -365,15 +395,19 @@
     (doseq [b (range batch)]
       (let [len (long (nth lengths b))
             row0 (* b max-len)
-            qb (attn/rope-pos (copy-prefix q row0 len d-model)
-                              len n-heads head-dim theta 0)
-            kb (attn/rope-pos (copy-prefix k row0 len d-model)
-                              len n-heads head-dim theta 0)
-            vb (copy-prefix v row0 len d-model)
+            source-row0 (* row0 (* 3 d-model))
+            qb (float-array (* len d-model))
+            kb (float-array (* len d-model))
+            _ (rope-strided! qkv qb len n-heads head-dim theta
+                             (* 3 d-model) source-row0)
+            _ (rope-strided! qkv kb len n-heads head-dim theta
+                             (* 3 d-model) (+ source-row0 d-model))
             scores (float-array (* len n-heads len))
             out (float-array (* len d-model))
-            _ (attention! qb kb vb scores out len n-heads head-dim scale
-                          (if global? 0 (inc (quot local-attention 2))))]
+            _ (attention-strided!
+               qb kb qkv scores out len n-heads head-dim scale
+               (if global? 0 (inc (quot local-attention 2)))
+               d-model 0 d-model 0 (* 3 d-model) (+ source-row0 (* 2 d-model)))]
         (System/arraycopy out 0 context (* row0 d-model) (* len d-model))))
     (residual x (nn/linear-nb context (weight model (str prefix "attn.Wo.weight"))
                               rows d-model d-model))))
@@ -385,10 +419,8 @@
         input (layer-norm-nb model x rows (weight model (str prefix "mlp_norm.weight")))
         fused (nn/linear-nb input (weight model (str prefix "mlp.Wi.weight"))
                             rows d-model (* 2 d-ff))
-        activated (ops/slice-strided-2d fused rows (* 2 d-ff) 0 d-ff)
-        gate (ops/slice-strided-2d fused rows (* 2 d-ff) d-ff d-ff)
-        _ (gelu-erf! activated activated (* rows d-ff))
-        hidden (nn/hadamard activated gate (* rows d-ff))]
+        hidden (float-array (* rows d-ff))
+        _ (gelu-erf-mul-strided! fused hidden rows (* 2 d-ff) 0 d-ff d-ff)]
     (residual x (nn/linear-nb hidden (weight model (str prefix "mlp.Wo.weight"))
                               rows d-ff d-model))))
 
