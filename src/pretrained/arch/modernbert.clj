@@ -132,6 +132,8 @@
         @v))))
 
 (def ^:private native-gelu (native-kernel #'nn/gelu-erf!))
+(def ^:private native-layer-norm
+  (native-kernel #'nn/layer-norm-reassociated!))
 (def ^:private native-gelu-mul-strided
   (native-kernel #'nn/gelu-erf-mul-strided!))
 (def ^:private native-relu (native-kernel #'nn/leaky-relu!))
@@ -164,6 +166,15 @@
   ^floats [^floats x ^floats out n]
   (@native-gelu x out (long n))
   out)
+
+(defn layer-norm
+  "Compiled float LayerNorm into caller-independent storage. Raster's
+  reassociation contract permits the backend to schedule each row's reductions
+  while retaining the centered two-pass formula."
+  ^floats [^floats x ^floats gamma ^floats beta rows features eps]
+  (let [out (float-array (* (long rows) (long features)))]
+    (@native-layer-norm x gamma beta out (long rows) (long features) (double eps))
+    out))
 
 (defn relu!
   ^floats [^floats x ^floats out n]
@@ -299,7 +310,7 @@
                       {:tensor name :dir (:dir model)}))))
 
 (defn- layer-norm-nb ^floats [model ^floats x rows ^floats gamma]
-  (nn/layer-norm x gamma (:zero-bias model) rows (:d-model model) (:eps model)))
+  (layer-norm x gamma (:zero-bias model) rows (:d-model model) (:eps model)))
 
 (defn- residual ^floats [^floats a ^floats b]
   (nn/residual-add a b (long (alength a))))

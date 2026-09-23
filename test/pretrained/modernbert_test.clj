@@ -15,6 +15,14 @@
   (reduce max 0.0 (map #(Math/abs (double (- %1 %2))) a b)))
 
 (deftest strided-projection-fields-preserve-dense-results
+  (testing "compiled reassociated LayerNorm matches the reference"
+    (let [rows 3 width 7
+          x (random-floats (* rows width) 10)
+          gamma (random-floats width 11)
+          beta (random-floats width 12)
+          expected (nn/layer-norm x gamma beta rows width 1.0e-5)
+          actual (mb/layer-norm x gamma beta rows width 1.0e-5)]
+      (is (< (max-error expected actual) 2.0e-6))))
   (testing "Q/K/V fields embedded in one projection match dense attention"
     (let [nrows 3 heads 2 head-dim 2 width (* heads head-dim)
           stride 15 q-offset 1 k-offset 6 v-offset 11
