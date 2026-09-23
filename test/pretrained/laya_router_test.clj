@@ -17,6 +17,31 @@
     (is (= :english (:model (router/route "हिन्दी" questions {:model :english}))))
     (is (= :multilingual (:model (router/route "hello" questions {:lang :de}))))))
 
+(deftest language-guess-precedence-and-abstention
+  (let [questions {:department {:type :choice}}
+        calls (atom 0)
+        guess (fn [_] (swap! calls inc) "pt_BR.UTF-8")]
+    (is (= :multilingual (:model (router/route "Please refund this" questions
+                                               {:lang-guess guess}))))
+    (is (= 1 @calls))
+    (is (= :english (:model (router/route "Please refund this" questions
+                                          {:lang-guess :en_US}))))
+    (is (= :multilingual (:model (router/route "Please refund this" questions
+                                               {:lang-guess (constantly nil)
+                                                :fallback-lang-guess "fr"}))))
+    (is (= :english (:model (router/route "Please refund this" questions
+                                          {:lang-guess (constantly " ")}))))
+    (is (= :english (:model (router/route "Please refund this" questions
+                                          {:model :english :lang-guess guess}))))
+    (is (= 1 @calls))
+    (let [r (router/router {:lang-guess "de"
+                            :loader (constantly {:checkpoint :laya-multilingual})})]
+      (with-redefs [decision/predict (fn [_ _ _] {})]
+        (is (= :multilingual (get-in (r "Please refund this" questions)
+                                     [:routing :model])))
+        (is (= :english (get-in (r "Please refund this" questions
+                                  {:lang-guess "en-US"}) [:routing :model])))))))
+
 (deftest typed-workflow-detection-is-exact-and-opt-in
   (let [questions (zipmap [:action :needs_review :outcome :risk :urgency] (repeat {}))]
     (is (= :agent-trace-observability (router/match-typed-workflow questions)))
@@ -56,3 +81,22 @@
         (is (= :english (get-in result [:routing :model])))))
     (.close ^java.io.Closeable r)
     (is (empty? (router/loaded r)))))
+
+(deftest default-router-keeps-two-language-checkpoints
+  (let [r (router/router {:loader (fn [checkpoint] {:checkpoint checkpoint})})]
+    (router/load! r :english)
+    (router/load! r :multilingual)
+    (is (= [:english :multilingual] (router/loaded r)))))
+
+(deftest concurrent-loads-share-an-agent
+  (let [loads (atom 0)
+        start (promise)
+        r (router/router {:loader (fn [checkpoint]
+                                    (swap! loads inc)
+                                    (Thread/sleep 25)
+                                    {:checkpoint checkpoint})})
+        workers (doall (repeatedly 8 #(future @start (router/load! r :english))))]
+    (deliver start true)
+    (is (apply = (map deref workers)))
+    (is (= 1 @loads))
+    (is (= [:english] (router/loaded r)))))
