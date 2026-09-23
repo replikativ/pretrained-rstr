@@ -150,6 +150,8 @@
 (def ^:private native-segmented-mask
   (native-kernel #'attn/attn-prefill-mask-segmented-head-major!))
 (def ^:private native-softmax (native-kernel #'attn/attn-prefill-softmax!))
+(def ^:private native-windowed-softmax
+  (native-kernel #'attn/attn-prefill-softmax-windowed-head-major!))
 
 (defn- window-mask-fallback!
   [^floats scores nrows heads left right]
@@ -248,9 +250,9 @@
      (long q-column-offset) (long q-row-stride) head-dim
      (long k-column-offset) (long k-row-stride) head-dim
      0 nrows score-stride)
-    (when (pos? (long window))
-      (@native-window-mask scores nrows heads (long window) (long window)))
-    (@native-softmax scores nrows heads)
+    (if (pos? (long window))
+      (@native-windowed-softmax scores nrows heads (long window) (long window))
+      (@native-softmax scores nrows heads))
     (blas/batched-gemm-nn-layout!
      scores v out heads nrows nrows head-dim (float 1.0)
      0 nrows score-stride
