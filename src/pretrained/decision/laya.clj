@@ -162,7 +162,7 @@
   (modernbert/weight (:encoder agent) name))
 
 (defn- residual ^floats [^floats a ^floats b]
-  (nn/residual-add a b (long (alength a))))
+  (modernbert/residual-add a b))
 
 (defn- add-question-type
   ^floats [agent ^floats hidden seq-len question-type]

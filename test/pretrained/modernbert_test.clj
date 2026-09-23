@@ -23,6 +23,11 @@
           expected (nn/layer-norm x gamma beta rows width 1.0e-5)
           actual (mb/layer-norm x gamma beta rows width 1.0e-5)]
       (is (< (max-error expected actual) 2.0e-6))))
+  (testing "compiled residual addition matches the reference"
+    (let [a (random-floats 37 8)
+          b (random-floats 37 9)]
+      (is (< (max-error (nn/residual-add a b 37) (mb/residual-add a b))
+             1.0e-7))))
   (testing "Q/K/V fields embedded in one projection match dense attention"
     (let [nrows 3 heads 2 head-dim 2 width (* heads head-dim)
           stride 15 q-offset 1 k-offset 6 v-offset 11

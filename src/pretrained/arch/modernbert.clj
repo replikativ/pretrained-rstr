@@ -134,6 +134,8 @@
 (def ^:private native-gelu (native-kernel #'nn/gelu-erf!))
 (def ^:private native-layer-norm
   (native-kernel #'nn/layer-norm-reassociated!))
+(def ^:private native-residual
+  (native-kernel #'nn/residual-add!))
 (def ^:private native-gelu-mul-strided
   (native-kernel #'nn/gelu-erf-mul-strided!))
 (def ^:private native-relu (native-kernel #'nn/leaky-relu!))
@@ -176,6 +178,14 @@
   ^floats [^floats x ^floats gamma ^floats beta rows features eps]
   (let [out (float-array (* (long rows) (long features)))]
     (@native-layer-norm x gamma beta out (long rows) (long features) (double eps))
+    out))
+
+(defn residual-add
+  "Compiled elementwise residual addition into fresh caller-owned storage."
+  ^floats [^floats a ^floats b]
+  (let [n (long (alength a))
+        out (float-array n)]
+    (@native-residual a b out n)
     out))
 
 (defn relu!
@@ -347,7 +357,7 @@
   (layer-norm x gamma (:zero-bias model) rows (:d-model model) (:eps model)))
 
 (defn- residual ^floats [^floats a ^floats b]
-  (nn/residual-add a b (long (alength a))))
+  (residual-add a b))
 
 (defn- attention
   ^floats [model ^floats x seq-len layer]
