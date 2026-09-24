@@ -173,7 +173,8 @@
   `:physical-pages`, `:chunk-size`, `:iterations`, `:warmups`,
   `:decode-tokens`, `:checkpoint-overlap-decode-tokens`,
   `:attention-schedule`, `:history-tile-size`, and the fingerprint options
-  accepted by `fingerprint`. `:cache-tier` names the measured lower tier for
+  accepted by `fingerprint`; the execution variant defaults to `:gpu-q4k-paged`,
+  because paged FP16 chunks cannot share a fingerprint with FP32 ones. `:cache-tier` names the measured lower tier for
   scheduler calibration and defaults to `:ssd`. Overlap measurement needs GPU
   pages for two prompt routes plus generated tokens. `:device-id` defaults to
   Raster's `:ze:0` and may select an OpenCL device such as `:ocl:0`.
@@ -191,7 +192,7 @@
                 prefill-T cache-tier]
          :or {page-size 16 iterations 5 warmups 1 decode-tokens 4
               device-id :ze:0 cache-tier :ssd}} opts
-        model-fingerprint (fingerprint model opts)
+        model-fingerprint (fingerprint model (merge {:execution-variant :gpu-q4k-paged} opts))
         _ (when-not (and (integer? max-position) (pos? max-position))
             (throw (ex-info "Paged benchmark requires a positive :max-position"
                             {:max-position max-position})))

@@ -432,7 +432,7 @@
                               [:attention-state :dtype] :float16)}
         payload (short-array (* 2 2 20 2))]
     (with-redefs [block-transfer/open!
-                  (fn [_ _ _ _ _ nblocks]
+                  (fn [_ _ _ _ _ nblocks _members]
                     (let [engine {:nblocks nblocks}]
                       (swap! opened conj engine)
                       engine))
@@ -476,8 +476,9 @@
       (is (= [[5 :scatter] [5 :gather]] @runs))
       (is (= [[:upload 5] [:upload 1] [:download 4]]
              (mapv (juxt :direction (comp count :entries)) @submissions)))
-      (is (= #{5}
-             (set (keys (:block-transfer-engines @(:state pool)))))))))
+      (is (= #{[:attention-state 5]}
+             (set (keys (:block-transfer-engines @(:state pool)))))
+          "engines are keyed by retention group and page count"))))
 
 (deftest resident-pages-gather-into-the-portable-durable-chunk-layout
   (let [downloads (atom nil)

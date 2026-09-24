@@ -17,6 +17,11 @@
 
 (def ^:private durability-receipt-key ::durability-receipt)
 
+(def content-algorithm
+  "Names the digest `content-id` computes: Hasch over the domain-tagged chunk
+  value, including its descriptor and payload."
+  :hasch/attention-chunk-v3)
+
 (defn content-id
   "Return the Hasch identity for a tensor chunk and its logical prefix.
 

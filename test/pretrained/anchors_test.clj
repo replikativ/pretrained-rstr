@@ -277,6 +277,130 @@
               (java.nio.file.Files/deleteIfExists path)))
           (java.nio.file.Files/deleteIfExists directory))))))
 
+(deftest ^:anchors ^:gpu gemma-paged-window-restore-anchor
+  ;; A paged restore through Gemma's 512-token sliding window loads the global
+  ;; layers' rows for the whole prefix but the sliding layers' rows only from
+  ;; the window floor. The source route is released and every page is filled
+  ;; with NaN before restoring, so generation equals the uninterrupted route
+  ;; only if the restore wrote every row the model reads and the sliding
+  ;; layers never read below the floor. The free list is fragmented so the
+  ;; per-group block scatter carries the restore.
+  (if-not (and (have? "gemma-3-270m-it") (gpu-up?))
+    (println "SKIP Gemma paged window restore anchor (weights or GPU not present)")
+    (let [from (requiring-resolve 'pretrained.loader/from-pretrained)
+          bind (requiring-resolve 'pretrained.decoder-gpu/bind-decode!)
+          open-paged (requiring-resolve 'pretrained.continuation.paged-decoder/open!)
+          prime (requiring-resolve 'pretrained.continuation.paged-decoder/prime-prompt!)
+          generate (requiring-resolve 'pretrained.continuation.paged-decoder/generate!)
+          close-paged (requiring-resolve 'pretrained.continuation.paged-decoder/close!)
+          close-engines (requiring-resolve 'pretrained.continuation.page-pool/close-transfer-engines!)
+          route (requiring-resolve 'pretrained.continuation.page-pool/route)
+          allocate (requiring-resolve 'pretrained.continuation.page-pool/allocate-route!)
+          release (requiring-resolve 'pretrained.continuation.page-pool/release-route!)
+          fork-allowed? (requiring-resolve 'pretrained.continuation.page-pool/fork-allowed?)
+          fork (requiring-resolve 'pretrained.continuation.page-pool/fork-route!)
+          restore-blocks (requiring-resolve 'pretrained.continuation.page-pool/restore-blocks!)
+          upload-ranges (requiring-resolve 'raster.gpu.core/upload-ranges!)
+          close-session (requiring-resolve 'raster.gpu.core/close-session!)
+          open-manager (requiring-resolve 'pretrained.continuation.manager/open-manager)
+          checkpoint (requiring-resolve 'pretrained.continuation.manager/checkpoint-paged-chunks-async!)
+          restore (requiring-resolve 'pretrained.continuation.manager/restore-paged-prefix!)
+          restore-overlapped (requiring-resolve 'pretrained.continuation.manager/restore-paged-prefix-overlapped!)
+          stats (requiring-resolve 'pretrained.continuation.manager/stats)
+          chunk-plan (requiring-resolve 'pretrained.continuation.chunk/plan)
+          certified-manifest (requiring-resolve 'pretrained.continuation.manifest/continuation-manifest)
+          load-plan (requiring-resolve 'pretrained.continuation.manifest/load-plan)
+          delete-db (requiring-resolve 'datahike.api/delete-database)
+          g (from (mdir "gemma-3-270m-it"))
+          {:keys [tok encode]} (:tokenizer g)
+          text (apply str (repeat 120 "The river carries silt to the delta every spring. "))
+          ;; b = 894: the token at 894 attends rows 383..893, and row 383 is
+          ;; the last row of chunk [256, 384), so the floor sits on a chunk edge.
+          prompt (vec (take 895 (encode tok text)))
+          boundary 894
+          chunk-size 128
+          fingerprint "gemma-3-270m-it-window-anchor"
+          config {:store {:backend :memory :id (random-uuid)}
+                  :schema-flexibility :write :keep-history? false :value-caps :default}
+          directory (java.nio.file.Files/createTempDirectory
+                     "pretrained-window-anchor-"
+                     (make-array java.nio.file.attribute.FileAttribute 0))
+          cache (open-manager config directory {:chunk-size chunk-size})
+          dstate (volatile! nil)
+          decoder (volatile! nil)]
+      (try
+        (is (= 895 (count prompt)) "the prompt is long enough to leave the window")
+        (vreset! dstate (bind g :maxpos 1024 :cache-mode :paged))
+        (vreset! decoder (open-paged @dstate :page-size 16 :physical-pages 320))
+        (let [pool (:pool @decoder)
+              page-size 16
+              restored-bytes (fn [f]
+                               (let [before (:restored-bytes (stats cache))
+                                     result (f)]
+                                 [result (- (:restored-bytes (stats cache)) before)]))]
+          ;; Hold every odd page of the first 200, so routes get isolated pages.
+          (doseq [page (range 200)]
+            (allocate pool [:hole page] page-size))
+          (doseq [page (range 0 200 2)]
+            (release pool [:hole page]))
+          (prime @decoder :source prompt)
+          @(:published (checkpoint cache pool :source fingerprint prompt))
+          (let [uninterrupted (generate @decoder :source prompt 8)
+                _ (release pool :source)
+                _ (upload-ranges
+                   (:session pool)
+                   (for [[[slab _] buffer-key] (:buffer-keys pool)
+                         :let [per-token (:elements-per-token
+                                          (some #(when (= slab (:name %)) %)
+                                                (:slabs (:layout pool))))
+                               elements (* (:physical-pages pool) page-size per-token)]]
+                     [buffer-key
+                      (short-array elements (unchecked-short 0x7E00))
+                      {:elements elements}]))
+                tail-hash (:chunk/prefix-hash (peek (chunk-plan prompt boundary chunk-size)))
+                planned (load-plan (certified-manifest @(:connection cache) fingerprint tail-hash))
+                planned-bytes (reduce + (map :bytes (:parts planned)))
+                full-bytes (* boundary 18 2 256 2)
+                scatters (atom 0)
+                original-blocks @restore-blocks
+                [result bytes]
+                (with-redefs-fn {restore-blocks (fn [& args]
+                                                  (swap! scatters inc)
+                                                  (apply original-blocks args))}
+                  #(restored-bytes (fn [] (restore cache pool :restored fingerprint prompt))))
+                resumed (generate @decoder :restored prompt 8)]
+            (is (= boundary (:cached-token-count result)))
+            (is (= {:window-512 256} (:window-floors (route pool :restored)))
+                "the token at 894 attends rows 383 and later of the sliding layers")
+            (is (pos? @scatters) "the fragmented restore used the block scatter")
+            (is (= planned-bytes bytes) "restore loaded exactly the manifest's load plan")
+            (is (< bytes full-bytes) "the sliding layers' rows below the floor were not loaded")
+            (is (= uninterrupted resumed) "restoring through the window is token-exact")
+            (testing "the overlapped restore selects the same parts"
+              (let [[result bytes]
+                    (restored-bytes #(restore-overlapped cache pool :overlapped fingerprint prompt))]
+                (is (= boundary (:cached-token-count result)))
+                (is (= planned-bytes bytes))
+                (is (= {:window-512 256} (:window-floors (route pool :overlapped))))
+                (is (= uninterrupted (generate @decoder :overlapped prompt 8)))))
+            (testing "forks respect the floor"
+              (is (not (fork-allowed? pool :restored 700))
+                  "the token at 700 attends row 189, which was never restored")
+              (is (fork-allowed? pool :restored 768))
+              (fork pool :restored :fork 768)
+              (is (= {:window-512 256} (:window-floors (route pool :fork))))
+              (let [short-prompt (subvec prompt 0 769)]
+                (is (= (generate @decoder :reference short-prompt 4)
+                       (generate @decoder :fork short-prompt 4))
+                    "a fork above the floor continues like a fresh route")))))
+        (finally
+          (when-let [d @decoder]
+            (close-paged d)
+            (close-engines (:pool d)))
+          (when-let [s @dstate] (close-session (:sess s)))
+          (.close ^java.io.Closeable cache)
+          (delete-db config))))))
+
 (deftest ^:anchors ^:gpu gpu-embedder-anchor
   ;; GPU prefill embedders (bind-embed!/embed-gpu — a DIFFERENT path than decode).
   ;; Same retrieval structure the torch-validated CPU anchor asserts.

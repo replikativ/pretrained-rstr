@@ -23,6 +23,7 @@
             [pretrained.continuation.gpu :as continuation-gpu]
             [pretrained.continuation.manager :as manager]
             [pretrained.continuation.paged-decoder :as paged-decoder]
+            [pretrained.continuation.parts :as parts]
             [pretrained.continuation.placement :as placement]
             [pretrained.continuation.replica :as replica]
             [superv.async :refer [<?? S]])
@@ -337,7 +338,7 @@
             (mapv (fn [entry]
                     (chunk-store/with-mmap-payload
                      (manager/local-chunk-store (:cache restarted))
-                     (:kv/store-key entry)
+                     (:store-key (first (parts/entry-parts entry)))
                      :element-count))
                   (:matched lookup))
             warm-done (System/nanoTime)]

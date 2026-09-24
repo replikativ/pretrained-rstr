@@ -164,15 +164,27 @@
          (or (zero? (rem end page-size))
              (= end (:token-count resident-route))))))
 
+(defn- chunk-group
+  "Return the retention group a chunk descriptor holds rows for."
+  [pool descriptor]
+  (attention-state/group (:layout pool)
+                         (or (:chunk/group descriptor)
+                             attention-state/implicit-group-id)))
+
 (defn- block-engine!
-  [pool nblocks]
-  (locking pool
-    (or (get-in @(:state pool) [:block-transfer-engines nblocks])
-        (let [engine (block-transfer/open!
-                      (:session pool) (:layout pool) (:page-size pool)
-                      (:physical-pages pool) (:buffer-keys pool) nblocks)]
-          (swap! (:state pool) assoc-in [:block-transfer-engines nblocks] engine)
-          engine))))
+  "Return the block engine for `group` and `nblocks`, compiling it once.
+
+  Engines are per group, so a scatter writes only that group's rows."
+  [pool group nblocks]
+  (let [engine-key [(:id group) nblocks]]
+    (locking pool
+      (or (get-in @(:state pool) [:block-transfer-engines engine-key])
+          (let [engine (block-transfer/open!
+                        (:session pool) (:layout pool) (:page-size pool)
+                        (:physical-pages pool) (:buffer-keys pool) nblocks
+                        (:members group))]
+            (swap! (:state pool) assoc-in [:block-transfer-engines engine-key] engine)
+            engine)))))
 
 (defn- block-page-indices
   [resident-route start token-count page-size]
@@ -182,9 +194,9 @@
                        first-page (+ first-page nblocks)))))
 
 (defn- restore-blocks!
-  [pool resident-route start token-count plan source]
+  [pool group resident-route start token-count plan source]
   (let [nblocks (page-count token-count (:page-size pool))
-        engine (block-engine! pool nblocks)
+        engine (block-engine! pool group nblocks)
         indices (block-page-indices resident-route start token-count
                                     (:page-size pool))
         slab-by-name (into {} (map (juxt :name identity)) (:slabs (:layout pool)))
@@ -205,9 +217,9 @@
       (block-transfer/run! engine :scatter))))
 
 (defn- export-blocks!
-  [pool resident-route start token-count plan destination]
+  [pool group resident-route start token-count plan destination]
   (let [nblocks (page-count token-count (:page-size pool))
-        engine (block-engine! pool nblocks)
+        engine (block-engine! pool group nblocks)
         indices (block-page-indices resident-route start token-count
                                     (:page-size pool))
         slab-by-name (into {} (map (juxt :name identity)) (:slabs (:layout pool)))]
@@ -460,9 +472,10 @@
   "Prepare shared FP16 gather/scatter staging for `token-count` tokens.
 
   This moves one-time Raster graph compilation and staging allocation out of a
-  latency-sensitive fragmented restore or checkpoint. Engines are reused by
-  page count, so repeated calls for token counts in the same page-count bucket
-  do not reserve more memory. Returns the prepared page and workspace capacity.
+  latency-sensitive fragmented restore or checkpoint. Engines are reused per
+  retention group and page count, so repeated calls for token counts in the same
+  page-count bucket do not reserve more memory. Returns the prepared page and
+  workspace capacity.
 
   Throws when `pool` is not FP16, `token-count` is not positive, or the requested
   staging extent exceeds the physical page pool."
@@ -479,7 +492,8 @@
                       {:token-count token-count
                        :page-blocks nblocks
                        :physical-pages (:physical-pages pool)})))
-    (block-engine! pool nblocks)
+    (doseq [group (attention-state/groups (:layout pool))]
+      (block-engine! pool group nblocks))
     (let [elements-per-page
           (reduce + 0
                   (map #(* (long (:count %))
@@ -637,10 +651,13 @@
 
   Pages are initially uninitialized; callers normally follow this with
   `restore-chunk!` or token appends. `:start-position` defaults to zero and
-  records the absolute position of routed token zero."
+  records the absolute position of routed token zero. `:window-floors` records,
+  per window group, the first row a restore will write, so the route is never
+  observable without them."
   ([pool continuation-id token-count]
    (allocate-route! pool continuation-id token-count {}))
-  ([pool continuation-id token-count {:keys [start-position policy capacity-reservation]
+  ([pool continuation-id token-count {:keys [start-position policy capacity-reservation
+                                             window-floors]
                                       :or {start-position 0 policy {}}}]
    (let [token-count (long token-count)
          start-position (long start-position)]
@@ -671,10 +688,46 @@
                                        :pages pages
                                        :token-count token-count
                                        :start-position start-position}
-                                (seq policy) (assoc :cache/policy policy))]
+                                (seq policy) (assoc :cache/policy policy)
+                                (seq window-floors) (assoc :window-floors window-floors))]
            (reset! (:state pool)
                    (assoc-in next-state [:routes continuation-id] resident-route))
            resident-route))))))
+
+(defn set-window-floors!
+  "Record, per window group, the first row a restored route holds.
+
+  Rows below a floor were never loaded; forks and captures that would read
+  them are refused. Returns the updated route."
+  [pool continuation-id floors]
+  (locking pool
+    (let [route (get-in @(:state pool) [:routes continuation-id])]
+      (when-not route
+        (throw (ex-info "Continuation is not resident" {:continuation-id continuation-id})))
+      (let [updated (update route :window-floors merge floors)]
+        (swap! (:state pool) assoc-in [:routes continuation-id] updated)
+        updated))))
+
+(defn- window-violations
+  "Return window groups whose floor exceeds the first row a token at
+  `boundary` attends to, for a route with `floors`."
+  [pool floors boundary]
+  (vec
+   (for [group (attention-state/groups (:layout pool))
+         :let [floor (long (get floors (:id group) 0))
+               first-row (attention-state/first-attended-row group boundary)]
+         :when (> floor first-row)]
+     {:group (:id group) :window-floor floor :first-attended-row first-row})))
+
+(defn fork-allowed?
+  "Return true when a continuation forked from `source-id` at `token-count`
+  attends only to rows the source route holds."
+  [pool source-id token-count]
+  (let [route (route pool source-id)]
+    (boolean
+     (and route
+          (<= (long token-count) (long (:token-count route)))
+          (empty? (window-violations pool (:window-floors route) token-count))))))
 
 (defn fork-route!
   "Create `target-id` as a page-sharing snapshot of `source-id`.
@@ -709,6 +762,12 @@
                                  {:continuation-id source-id
                                   :token-count token-count
                                   :source-token-count (:token-count source)})))
+             violations (window-violations pool (:window-floors source) token-count)
+             _ (when (seq violations)
+                 (throw (ex-info "Fork would attend to rows below a window floor"
+                                 {:continuation-id source-id
+                                  :token-count token-count
+                                  :violations violations})))
              pages (vec (take (page-count token-count (:page-size pool))
                               (:pages source)))
              target (assoc source
@@ -1117,7 +1176,8 @@
         source-layout (:chunk/layout descriptor)
         source-attention-layout (:attention-state source-layout)
         source-dtype (or (:dtype source-attention-layout) (:dtype source-layout))
-        plan (attention-state/payload-plan (:layout pool) token-count)
+        group (chunk-group pool descriptor)
+        plan (attention-state/group-payload-plan (:layout pool) group token-count)
         expected-elements (reduce + 0 (map :elements plan))]
     (when-not resident-route
       (throw (ex-info "Cannot restore into a nonresident continuation"
@@ -1130,14 +1190,15 @@
       (throw (ex-info "Chunk range is outside the resident continuation"
                       {:start start :token-count token-count
                        :resident-tokens (:token-count resident-route)})))
-    (when-not (= (select-keys source-attention-layout [:kind :token-axis :slabs])
-                 (select-keys (:layout pool) [:kind :token-axis :slabs]))
+    (when-not (= (select-keys source-attention-layout [:kind :token-axis :slabs :groups])
+                 (select-keys (:layout pool) [:kind :token-axis :slabs :groups]))
       (throw (ex-info "Chunk attention-state layout differs from the device pool"
                       {:source source-attention-layout :pool (:layout pool)})))
     (when-not (= :half (:dtype pool))
       (throw (ex-info "Chunk restore conversion currently targets FP16 device pools"
                       {:pool-dtype (:dtype pool)})))
     {:resident-route resident-route
+     :group group
      :start start
      :token-count token-count
      :plan plan
@@ -1216,10 +1277,10 @@
   dense FP16 staging plus one composed Raster block-scatter graph. FP16 mmap
   segments require no intermediate JVM array. Returns the resident route."
   [pool continuation-id descriptor payload]
-  (let [{:keys [resident-route start token-count plan source runs] :as transfer}
+  (let [{:keys [resident-route group start token-count plan source runs] :as transfer}
         (restore-chunk-plan pool continuation-id descriptor payload)]
     (if (block-transfer-eligible? pool resident-route start token-count runs)
-      (restore-blocks! pool resident-route start token-count plan source)
+      (restore-blocks! pool group resident-route start token-count plan source)
       (transfer-ranges-measured!
        pool :upload (direct-restore-entries pool transfer)))
     resident-route))
@@ -1239,9 +1300,21 @@
       (throw (ex-info "Chunk range is outside the resident continuation"
                       {:start start :token-count token-count
                        :resident-tokens (:token-count resident-route)})))
-    (let [plan (attention-state/payload-plan (:layout pool) token-count)
+    (let [group (chunk-group pool descriptor)
+          floor (long (get (:window-floors resident-route) (:id group) 0))
+          _ (when (< start floor)
+              ;; A restore left this group's rows below `floor` unwritten. A
+              ;; chunk missing from the catalog at capture starts at or after the
+              ;; restored boundary's chunk, so reaching this means the catalog
+              ;; lost a chunk after restore; the optional checkpoint is rejected.
+              (throw (ex-info "Chunk rows below the route's window floor were never restored"
+                              {:reason :below-window-floor
+                               :continuation-id continuation-id
+                               :group (:id group) :start start :window-floor floor})))
+          plan (attention-state/group-payload-plan (:layout pool) group token-count)
           payload-elements (reduce + 0 (map :elements plan))]
       {:resident-route resident-route
+       :group group
        :start start
        :token-count token-count
        :plan plan
@@ -1268,22 +1341,32 @@
            runs)))
       plan))))
 
+(defn durable-layout
+  "Return the `:chunk/layout` of chunks exported from `pool`."
+  [pool]
+  {:dtype :float16
+   :byte-order :little-endian
+   :attention-state (assoc (:layout pool)
+                           :dtype :float16
+                           :byte-order :little-endian)})
+
 (defn- exported-chunk
   [pool model-fingerprint descriptor plan payload]
-  (let [durable-layout (assoc (:layout pool)
-                              :dtype :float16
-                              :byte-order :little-endian)]
-    (cond->
-     (merge descriptor
-            {:chunk/version 3
-             :chunk/model-fingerprint model-fingerprint
-             :chunk/layout {:dtype :float16
-                            :byte-order :little-endian
-                            :attention-state durable-layout}
-             :chunk/slabs plan
-             :chunk/payload payload})
-      (apply = (map :elements plan))
-      (assoc :chunk/elements-per-slab (:elements (first plan))))))
+  (cond->
+   (merge descriptor
+          {:chunk/version 3
+           :chunk/model-fingerprint model-fingerprint
+           :chunk/layout (durable-layout pool)
+           :chunk/slabs plan
+           :chunk/payload payload})
+    ;; Only layouts with several groups name the group, keeping single-group
+    ;; blobs and their content ids unchanged.
+    (:groups (:layout pool))
+    (assoc :chunk/group (or (:chunk/group descriptor)
+                            (throw (ex-info "A multi-group export must name its group"
+                                            {:descriptor descriptor}))))
+    (apply = (map :elements plan))
+    (assoc :chunk/elements-per-slab (:elements (first plan)))))
 
 (defn submit-export-chunk!
   "Submit an immutable route range download without waiting for completion.
@@ -1363,10 +1446,10 @@
                     {:pool-dtype (:dtype pool)})))
   (let [lease (acquire-lease! pool [continuation-id])]
     (try
-      (let [{:keys [resident-route start token-count plan payload runs] :as export-plan}
+      (let [{:keys [resident-route group start token-count plan payload runs] :as export-plan}
             (export-chunk-plan pool lease continuation-id descriptor)]
         (if (block-transfer-eligible? pool resident-route start token-count runs)
-          (export-blocks! pool resident-route start token-count plan payload)
+          (export-blocks! pool group resident-route start token-count plan payload)
           (transfer-ranges-measured!
            pool :download (direct-export-entries pool export-plan)))
         (exported-chunk pool model-fingerprint descriptor plan payload))

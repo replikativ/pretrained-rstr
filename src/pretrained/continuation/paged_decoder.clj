@@ -154,26 +154,12 @@
             (reduce-kv #(if (contains? %1 %2) %1 (assoc %1 %2 %3)) result values))
           {} maps))
 
-(defn- global-layer?
-  [model layer]
-  (let [flags (get-in model [:desc :flags])]
-    (cond
-      (:global-layers flags) (contains? (:global-layers flags) layer)
-      (:global-layer-pattern flags)
-      (zero? (mod (inc (long layer)) (long (:global-layer-pattern flags))))
-      :else true)))
-
 (defn- layer-visibility
   [model layer]
-  (if-let [window (and (not (global-layer? model layer))
-                       (get-in model [:desc :flags :sliding-window :size]))]
-    (do
-      (when-not (and (integer? window) (pos? window))
-        (throw (ex-info "Sliding attention window must contain at least one token"
-                        {:layer layer :window window})))
-      ;; Raster windows are inclusive distances. A model window of N tokens
-      ;; therefore admits q-(N-1) through q.
-      (attention/visibility {:causal? true :window-left (dec (long window))}))
+  (if-let [window (attention-state/layer-window model layer)]
+    ;; Raster windows are inclusive distances. A model window of N tokens
+    ;; therefore admits q-(N-1) through q.
+    (attention/visibility {:causal? true :window-left (dec (long window))})
     (attention/visibility {:causal? true})))
 
 (defn- linked-paged-executable!

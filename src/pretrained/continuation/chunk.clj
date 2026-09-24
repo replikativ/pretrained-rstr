@@ -94,16 +94,64 @@
       :logical-token-count (count tokens)
       :tail-hash (:chunk/prefix-hash (peek chunks))})))
 
+(defn- cpu-group-chunk
+  "Copy one retention group's rows for `descriptor` out of a CPU continuation."
+  [state descriptor layout group]
+  (let [tensor-groups (into {} (map (fn [[slab tensors]] [(:name slab) [slab tensors]])
+                                    (attention-state/tensor-groups state)))
+        slabs (attention-state/group-payload-plan layout group (:chunk/token-count descriptor))
+        payload (float-array (reduce + 0 (map :elements slabs)))]
+    (doseq [{:keys [slab layer element-offset elements]} slabs
+            :let [[slab-layout tensors] (get tensor-groups slab)
+                  source-offset (* (long (:chunk/start descriptor))
+                                   (:elements-per-token slab-layout))
+                  source ^floats (nth tensors layer)]]
+      (System/arraycopy source (int source-offset) payload
+                        (int element-offset) (int elements)))
+    (merge descriptor
+           {:chunk/version 2
+            :chunk/model-fingerprint (:continuation/model-fingerprint state)
+            :chunk/layout (:continuation/layout state)
+            :chunk/group (:id group)
+            :chunk/slabs slabs
+            ;; A group's members share one row width.
+            :chunk/elements-per-slab (:elements (first slabs))
+            :chunk/payload payload})))
+
+(declare cpu-tensor-chunk)
+
+(defn cpu-tensor-chunks
+  "Copy one token-range descriptor out of a CPU continuation, one part per group.
+
+  A layout with one retention group returns exactly `[(cpu-tensor-chunk ...)]`,
+  so its stored blobs and content ids are unchanged. A layout with several
+  groups returns one chunk per group carrying `:chunk/group` and only that
+  group's rows."
+  [state descriptor]
+  (let [layout (get-in state [:continuation/layout :attention-state])]
+    (if (:groups layout)
+      (do
+        (when-not (= :cpu (:continuation/backend state))
+          (throw (ex-info "cpu-tensor-chunks requires a CPU continuation"
+                          {:backend (:continuation/backend state)})))
+        (mapv #(cpu-group-chunk state descriptor layout %) (:groups layout)))
+      [(cpu-tensor-chunk state descriptor)])))
+
 (defn cpu-tensor-chunk
   "Copy one token-range descriptor out of a CPU continuation.
 
   The returned value is a standalone immutable Boring-friendly chunk with one
   contiguous float payload in declared slab/layer order. A loader can mmap it
-  once and slice it into transfers. Only the described token range is copied."
+  once and slice it into transfers. Only the described token range is copied.
+  Layouts with several retention groups use `cpu-tensor-chunks`."
   [state descriptor]
   (when-not (= :cpu (:continuation/backend state))
     (throw (ex-info "cpu-tensor-chunk requires a CPU continuation"
                     {:backend (:continuation/backend state)})))
+  (when (get-in state [:continuation/layout :attention-state :groups])
+    (throw (ex-info "A layout with several retention groups is stored per group"
+                    {:groups (mapv :id (get-in state [:continuation/layout
+                                                     :attention-state :groups]))})))
   (let [layout (get-in state [:continuation/layout :attention-state])
         tensor-groups (into {} (map (fn [[slab tensors]] [(:name slab) [slab tensors]])
                                     (attention-state/tensor-groups state)))

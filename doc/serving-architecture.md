@@ -157,8 +157,9 @@ quiesced.
 
 Attention state is a set of physical slab pools described by
 `pretrained.attention-state/layout`. Standard GQA has key and value pools;
-sliding-window models add per-layer retention metadata; MLA can describe latent
-and rotary slabs. Kernels receive page geometry and slab bindings rather than
+sliding-window models split their layers into retention groups, a token group
+for global layers and a window group for sliding layers; MLA can describe
+latent and rotary slabs. Kernels receive page geometry and slab bindings rather than
 assuming contiguous `kcN`/`vcN` arrays.
 
 The pretrained adapter binds FP16 query and output `ResidentBufferView`s
@@ -284,8 +285,10 @@ These are not implemented. The docs above do not depend on them.
   measured outcome in Datahike for offline replay.
 - A fixed-shape multi-sequence prefill graph; multi-lane prefill shares the
   decode graph one row per lane.
-- Layout adapters and oracle tests for sliding/global attention retention and
-  MLA latent slabs in the paged path.
+- Layout adapters and oracle tests for MLA latent slabs in the paged path.
+  Sliding-window retention is implemented as retention groups; per-sequence
+  recurrent state for hybrid linear-attention models is not representable
+  yet. See [hybrid-state-design.md](hybrid-state-design.md).
 - Measured multi-process throughput and interference numbers. The library
   makes exactness claims, not throughput claims.
 
